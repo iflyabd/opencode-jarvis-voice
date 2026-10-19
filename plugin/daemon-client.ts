@@ -147,7 +147,13 @@ export async function ensureDaemon(opts: { start?: boolean; waitMs?: number } = 
   const { start = true, waitMs = 30000 } = opts
 
   const existing = readRuntime()
-  if (existing && (await ping(existing))) return existing
+  if (existing) {
+    if (await ping(existing)) return existing
+    // A dropped keep-alive connection can fail one ping while the daemon is
+    // perfectly healthy; one quick retry avoids spurious "daemon gone" paths.
+    await new Promise((r) => setTimeout(r, 120))
+    if (await ping(existing)) return existing
+  }
 
   if (!start) return null
   if (spawnPromise) return spawnPromise

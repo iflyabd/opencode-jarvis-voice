@@ -196,7 +196,7 @@ VOICE_PREFERENCES = [
     v.strip()
     for v in os.environ.get(
         "JARVIS_VOICE_PREFERENCES",
-        "jarvis,jarvis-tts,en_GB-alan,en_GB-northern_english_male,alan,northern_english_male,en_US-ryan,ryan,en_GB-alba",
+        "jarvis-medium,jarvis,jarvis-tts,en_GB-alan,en_GB-northern_english_male,alan,northern_english_male,en_US-ryan,ryan,en_GB-alba",
     ).split(",")
     if v.strip()
 ]

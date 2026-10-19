@@ -264,7 +264,9 @@ def remember(path: str | Path) -> dict:
 # ----------------------------------------------------------------------------
 
 CATALOG = {
-    # name -> (path under the piper-voices repo, sample rate)
+    # name -> (path under the voice repo, sample rate[, base URL])
+    # Entries without a base URL come from the rhasspy/piper-voices repo.
+    "jarvis-medium": ("en/en_GB/jarvis/medium/jarvis-medium", 22050, "https://huggingface.co/jgkawell/jarvis/resolve/main"),
     "en_GB-alan-medium": ("en/en_GB/alan/medium/en_GB-alan-medium", 22050),
     "en_GB-alan-low": ("en/en_GB/alan/low/en_GB-alan-low", 16000),
     "en_GB-northern_english_male-medium": (
@@ -278,21 +280,23 @@ CATALOG = {
 
 
 def fetch(name: str, dest_dir: Path | None = None, quiet: bool = False) -> str:
-    """Download a voice from the public rhasspy/piper-voices repo. Returns the model path."""
+    """Download a voice from its public repository. Returns the model path."""
     if name not in CATALOG:
         raise SystemExit(
             f"unknown voice '{name}'. Known: {', '.join(sorted(CATALOG))}\n"
             "Or point at your own file:  voice use /path/to/voice.onnx"
         )
-    rel, _sr = CATALOG[name]
+    entry = CATALOG[name]
+    rel, _sr = entry[0], entry[1]
+    base = entry[2] if len(entry) > 2 else cfg.VOICE_CATALOG_URL
     dest = Path(dest_dir) if dest_dir else (cfg.CONFIG_DIR / "voices")
     dest.mkdir(parents=True, exist_ok=True)
     model_path = dest / f"{name}.onnx"
     config_path = dest / f"{name}.onnx.json"
 
     for url, out in (
-        (f"{cfg.VOICE_CATALOG_URL}/{rel}.onnx?download=true", model_path),
-        (f"{cfg.VOICE_CATALOG_URL}/{rel}.onnx.json?download=true", config_path),
+        (f"{base}/{rel}.onnx?download=true", model_path),
+        (f"{base}/{rel}.onnx.json?download=true", config_path),
     ):
         if out.exists() and out.stat().st_size > 0:
             if not quiet:
@@ -321,7 +325,7 @@ def _main(argv: list[str]) -> int:
         if not voices:
             print("No Piper voices found.")
             print("Point the daemon at yours:  voice use /path/to/voice.onnx")
-            print("Or download one:            voice fetch en_GB-alan-medium")
+            print("Or download one:            voice fetch jarvis-medium")
             return 1
         best = resolve()
         for v in sorted(voices, key=_score):
@@ -350,7 +354,7 @@ def _main(argv: list[str]) -> int:
         print(f"registered: {v.model}")
         return 0
     if cmd == "fetch":
-        fetch(argv[2] if len(argv) > 2 else "en_GB-alan-medium")
+        fetch(argv[2] if len(argv) > 2 else "jarvis-medium")
         return 0
     if cmd == "where":
         print("Search locations:")
@@ -359,8 +363,11 @@ def _main(argv: list[str]) -> int:
         print(f"registry: {cfg.VOICE_REGISTRY}")
         return 0
     if cmd == "known":
-        for k, (rel, sr) in sorted(CATALOG.items()):
-            print(f"  {k:<42} {sr} Hz")
+        for k in sorted(CATALOG):
+            entry = CATALOG[k]
+            rel, sr = entry[0], entry[1]
+            home = "rhasspy" if len(entry) <= 2 else "jarvis"
+            print(f"  {k:<42} {sr} Hz  ({home})")
         return 0
     print("usage: jv_voices.py [list|path|json|use <file>|fetch <name>|where|known]", flush=True)
     return 2

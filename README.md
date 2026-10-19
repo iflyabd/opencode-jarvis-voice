@@ -64,7 +64,7 @@ Flags: `--with-voice NAME`, `--no-voice`, `--no-register`, `--no-daemon`.
 
 ```bash
 ./bin/voice install            # Python environment (numpy, sounddevice, faster-whisper, piper)
-./bin/voice voice fetch en_GB-alan-medium    # a JARVIS-style British voice (~60 MB, one time)
+./bin/voice voice fetch jarvis-medium        # the JARVIS voice (~64 MB, one time, default)
 ./bin/voice doctor             # check everything, with fixes for whatever is broken
 ./bin/voice up                 # start the daemon
 ```
@@ -129,16 +129,21 @@ Two ways to run on Android:
 
 ### Use your own Piper voice
 
-Any `.onnx` plus `.onnx.json` pair works, wherever it lives:
+`jarvis-medium` (the JARVIS voice) is the default: the installer offers it, and
+`voice fetch jarvis-medium` gets it whenever you want it. Any other `.onnx`
+plus `.onnx.json` pair works too, wherever it lives:
 
 ```bash
-./bin/voice voice use /path/to/jarvis.onnx      # remember it
+./bin/voice voice fetch jarvis-medium           # the JARVIS voice (~64 MB)
+./bin/voice voice fetch en_GB-alan-medium       # a lighter British alternative
+./bin/voice voice use /path/to/jarvis.onnx      # remember any local voice
 ./bin/voice voice list                          # see what was found, * = selected
 ./bin/voice voice where                         # every location that gets scanned
 ```
 
-A voice literally named `jarvis` is preferred automatically. You can also point
-at it directly:
+A voice named `jarvis-medium` (then `jarvis`) is preferred automatically; after
+that the preference order is `en_GB-alan`, `northern_english_male`, `ryan`,
+`alba`. You can also point at one directly:
 
 ```bash
 export JARVIS_VOICE_PIPER_VOICE=/path/to/jarvis.onnx
@@ -186,14 +191,20 @@ Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 
 | Button | Where | Click |
 |---|---|---|
-| `🎙 mic` / `● listening` | bottom-right of the prompt box | start listening; click again to stop and send |
-| `🔊 read` / `⏸ pause` / `▶ resume` | top-right, above the text box | read the last answer; pause and resume it in place |
+| `🎙 mic` / `● listening` / `◌ transcribing` | bottom-right of the prompt box | start listening; click again to stop and send |
+| `🔊 read` / `⏸ pause` / `▶ resume` | top-right of the composer, right under the message list | read the last answer; pause and resume it in place |
 
 Both are theme-aware (colours come from the active theme's action and feedback
 tokens, with hover states) and drive the same state as the keybindings — a
-click and `ctrl+alt+v` flip the same switch. Pause is a real pause: the player
-process is suspended with `SIGSTOP` and continued with `SIGCONT`, so nothing is
-re-synthesized and the voice continues exactly where it stopped.
+click and `ctrl+alt+v` flip the same switch. They also update **live**: the
+label changes the moment the state does, including changes that happen in the
+background (the end of playback, a transcription finishing). Pause is a real
+pause: the player process is suspended with `SIGSTOP` and continued with
+`SIGCONT`, so nothing is re-synthesized and the voice continues exactly where
+it stopped.
+
+> OpenCode's TUI (v2.0.32) has no per-message slot for plugins, so the reading
+> control lives in the composer strip directly beneath the message list.
 
 Reading rules — the button reads **only the final answer**:
 
@@ -342,6 +353,9 @@ Nothing runs unless you use it:
   stopped and the daemon leaves too. The next voice action starts it again.
 * **No background polling** — the TUI watches speech only while speech is
   actually playing (600 ms; 3 s while paused) and stops the moment it ends.
+  A dropped health check is retried a couple of times before the button
+  believes the daemon is gone, so a paused playback is never mistaken for
+  silence.
 
 Measured on the reference Android/Parrot setup: idle daemon **~56 MB RSS**,
 zero wake-ups beyond a 2 s shutdown check; with the `tiny` model loaded

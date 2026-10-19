@@ -138,6 +138,57 @@ export function createVoiceController(context: any) {
   const [mic, setMic] = createSignal<MicState>("idle")
   const [speech, setSpeech] = createSignal<SpeechState>("idle")
 
+  /**
+   * State changes here repaint the on-screen buttons directly.
+   *
+   * The buttons' text nodes subscribe with `addRepaint`. The host's renderer
+   * only processes reactive updates during its own repaint passes, so a state
+   * written from a background continuation (the speech watcher noticing the
+   * end of playback, the mic turn ending) could otherwise sit unnoticed and
+   * leave the button showing a stale label until the next unrelated redraw.
+   * Writing the nodes and requesting a frame always lands.
+   */
+  type Repaint = () => void
+  const repaints = new Set<Repaint>()
+
+  function addRepaint(fn: Repaint): void {
+    repaints.add(fn)
+    try {
+      fn()
+    } catch {
+      /* one broken subscriber must not break the rest */
+    }
+  }
+
+  function removeRepaint(fn: Repaint): void {
+    repaints.delete(fn)
+  }
+
+  function repaint(): void {
+    for (const fn of repaints) {
+      try {
+        fn()
+      } catch {
+        /* isolated: a failed paint is not a reason to skip the others */
+      }
+    }
+    try {
+      context?.renderer?.requestRender?.()
+    } catch {
+      /* a missing renderer only means one late frame */
+    }
+  }
+
+  function setSpeechState(value: SpeechState): void {
+    setSpeech(value)
+    repaint()
+  }
+
+  function setMicState(value: MicState): void {
+    setMic(value)
+    repaint()
+  }
+
   let autoSpeak = context.options?.autoSpeak !== false
   let micBusy = false // guards double-starts while the first start is in flight
   let micCancelled = false // set by cancel() so the listen loop stays quiet
@@ -174,8 +225,15 @@ export function createVoiceController(context: any) {
   // over the chain stops completely - the TUI never wakes the CPU for nothing.
   const SPEECH_POLL_PLAYING_MS = 600
   const SPEECH_POLL_PAUSED_MS = 3000
+  const SPEECH_POLL_RETRY_MS = 700
+  // A single failed health check is not proof the daemon is gone: a dropped
+  // keep-alive connection used to flip the button to idle and abandon the
+  // watch while audio was still playing. Give it a few polls first.
+  const SPEECH_MAX_MISSES = 3
+  let speechMisses = 0
 
   function stopSpeechWatch(): void {
+    speechMisses = 0
     if (speechTimer !== null) {
       clearTimeout(speechTimer)
       speechTimer = null
@@ -196,19 +254,30 @@ export function createVoiceController(context: any) {
     try {
       const info = await daemon(false)
       if (!info) {
-        setSpeech("idle")
+        speechMisses += 1
+        if (speechMisses < SPEECH_MAX_MISSES) {
+          scheduleSpeechPoll(SPEECH_POLL_RETRY_MS)
+          return
+        }
+        setSpeechState("idle")
         stopSpeechWatch()
         return
       }
       const st = await api.speech(info)
+      speechMisses = 0
       const next = st.active ? (st.paused ? "paused" : "playing") : "idle"
-      setSpeech(next)
+      setSpeechState(next)
       if (next === "idle") stopSpeechWatch()
       else scheduleSpeechPoll(next === "paused" ? SPEECH_POLL_PAUSED_MS : SPEECH_POLL_PLAYING_MS)
     } catch {
       // A restarting daemon is not an error the user must see; the watcher
-      // simply stops and a later action restarts it.
-      setSpeech("idle")
+      // keeps polling quietly for a moment and only then gives up.
+      speechMisses += 1
+      if (speechMisses < SPEECH_MAX_MISSES) {
+        scheduleSpeechPoll(SPEECH_POLL_RETRY_MS)
+        return
+      }
+      setSpeechState("idle")
       stopSpeechWatch()
     } finally {
       speechPolling = false
@@ -216,6 +285,7 @@ export function createVoiceController(context: any) {
   }
 
   function watchSpeech(): void {
+    speechMisses = 0
     scheduleSpeechPoll(SPEECH_POLL_PLAYING_MS)
   }
 
@@ -226,7 +296,7 @@ export function createVoiceController(context: any) {
     if (!info) return false
     try {
       await api.speak(info, text, { async: true })
-      setSpeech("playing")
+      setSpeechState("playing")
       watchSpeech()
       toast(title ?? `🔊 ${text.slice(0, 80)}${text.length > 80 ? "…" : ""}`)
       return true
@@ -254,7 +324,7 @@ export function createVoiceController(context: any) {
       const info = await daemonOrToast()
       if (!info) return
       await api.speak(info, text, { async: true })
-      setSpeech("playing")
+      setSpeechState("playing")
       watchSpeech()
       toast("🔊 Reading the last reply")
     } catch (e) {
@@ -274,12 +344,12 @@ export function createVoiceController(context: any) {
     try {
       if (state === "playing") {
         await api.pause(info)
-        setSpeech("paused")
+        setSpeechState("paused")
         watchSpeech()
         toast("⏸ Paused")
       } else {
         await api.resume(info)
-        setSpeech("playing")
+        setSpeechState("playing")
         watchSpeech()
         toast("▶ Resumed")
       }
@@ -353,7 +423,7 @@ export function createVoiceController(context: any) {
     if (!toSay) return
     try {
       await api.speak(info, toSay, { async: true })
-      setSpeech("playing")
+      setSpeechState("playing")
       watchSpeech()
     } catch (e) {
       toast(`Could not speak the reply: ${errorText(e)}`, "error")
@@ -382,7 +452,7 @@ export function createVoiceController(context: any) {
 
     micBusy = true
     micCancelled = false
-    setMic("listening")
+    setMicState("listening")
     try {
       const info = await daemonOrToast()
       if (!info) return
@@ -394,11 +464,11 @@ export function createVoiceController(context: any) {
         await sleep(250)
         const state = await api.pttState(info).catch(() => null)
         const st = state?.ptt?.state
-        if (st === "transcribing") setMic("transcribing")
+        if (st === "transcribing") setMicState("transcribing")
         if (!st || (st !== "listening" && st !== "transcribing")) break
       }
 
-      setMic("transcribing")
+      setMicState("transcribing")
       const res = await api.pttStop(info, 60000).catch((e: unknown) => {
         toast(errorText(e), "error")
         return null
@@ -417,7 +487,7 @@ export function createVoiceController(context: any) {
       toast(errorText(e), "error")
     } finally {
       micBusy = false
-      setMic("idle")
+      setMicState("idle")
     }
   }
 
@@ -429,7 +499,7 @@ export function createVoiceController(context: any) {
       const info = await daemonOrToast()
       if (!info) return
       await api.interrupt(info)
-      setSpeech("idle")
+      setSpeechState("idle")
       stopSpeechWatch()
       toast("Stopped.")
     } catch (e) {
@@ -464,6 +534,9 @@ export function createVoiceController(context: any) {
   return {
     mic: mic as Accessor<MicState>,
     speech: speech as Accessor<SpeechState>,
+    /** Buttons register their text nodes here; every state change repaints. */
+    addRepaint,
+    removeRepaint,
     autoSpeak: () => autoSpeak,
     speakText,
     speakLast,

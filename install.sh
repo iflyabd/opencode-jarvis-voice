@@ -7,13 +7,13 @@
 #
 # What it does, in order:
 #   1. Python environment            (.venv + requirements.txt)
-#   2. A local JARVIS-style voice    (Piper, ~60 MB, optional prompt)
+#   2. A local JARVIS-style voice    (Piper, ~64 MB, optional prompt)
 #   3. OpenCode plugin registration  (adds this folder to cli.json)
 #   4. A quick verification          (voice doctor)
 #
 # Flags:
 #   --with-voice NAME   download this Piper voice without asking
-#                       (default suggestion: en_GB-alan-medium)
+#                       (default suggestion: jarvis-medium)
 #   --no-voice          never download a voice
 #   --no-register       only set up Python + voice, do not touch OpenCode config
 #   --no-daemon         do not start the daemon at the end
@@ -89,14 +89,14 @@ elif [ -n "$FETCH_VOICE" ]; then
 elif have_voice; then
   ok "a voice is already installed"
 elif [ "$ALLOW_VOICE_PROMPT" = 1 ] && [ -t 0 ]; then
-  printf '  No Piper voice installed yet. Download en_GB-alan-medium (~60 MB)? [Y/n] '
+  printf '  No Piper voice installed yet. Download the JARVIS voice jarvis-medium (~64 MB)? [Y/n] '
   read -r reply
   case "$reply" in
-    n|N|no|NO) warn "skipped; run 'bin/voice voice fetch en_GB-alan-medium' later" ;;
-    *) bash "$VOICE" voice fetch en_GB-alan-medium && ok "voice ready" || warn "voice download failed; retry: voice voice fetch en_GB-alan-medium" ;;
+    n|N|no|NO) warn "skipped; run 'bin/voice voice fetch jarvis-medium' later" ;;
+    *) bash "$VOICE" voice fetch jarvis-medium && ok "voice ready" || warn "voice download failed; retry: voice voice fetch jarvis-medium" ;;
   esac
 else
-  warn "no voice installed — run: bin/voice voice fetch en_GB-alan-medium"
+  warn "no voice installed — run: bin/voice voice fetch jarvis-medium"
 fi
 
 # --- 3. OpenCode plugin registration ----------------------------------------

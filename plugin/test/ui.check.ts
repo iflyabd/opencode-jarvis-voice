@@ -9,11 +9,20 @@
  *   bun run test:ui
  */
 
-import { ensurePluginRuntime, provides } from "@opencode/plugin/runtime"
-import { Plugin, PluginContextProvider, usePlugin } from "@opencode/plugin/tui"
-import { ensureRuntimePluginSupport } from "@opentui/solid/runtime-plugin-support/configure"
+import path from "node:path"
 
+// Bun resolves bare `solid-js` to Solid's inert SSR build (the "node" export
+// condition); the real TUI bundles the live build. Register OpenTUI's
+// server.js -> solid.js patch before the first solid-js import so this process
+// runs the same live runtime the host uses.
+const solidEntry = Bun.resolveSync("@opentui/solid", import.meta.dir)
+const { ensureSolidTransformPlugin } = await import(path.join(path.dirname(solidEntry), "scripts/solid-plugin.js"))
+ensureSolidTransformPlugin()
+
+const { ensurePluginRuntime, provides } = await import("@opencode/plugin/runtime")
 ensurePluginRuntime()
+const { Plugin, PluginContextProvider, usePlugin } = await import("@opencode/plugin/tui")
+const { ensureRuntimePluginSupport } = await import("@opentui/solid/runtime-plugin-support/configure")
 ensureRuntimePluginSupport({
   additional: { "@opencode/plugin/tui": { Plugin, PluginContextProvider, usePlugin } },
   preserve: provides,
@@ -22,6 +31,9 @@ ensureRuntimePluginSupport({
 const { testRender } = await import("@opentui/solid")
 const { MicButton, SpeakButton } = await import("../ui.tsx")
 const plugin = await import("../tui.tsx")
+// The same Solid runtime the components use; the live-update checks below
+// exercise the real signal path instead of re-mounting with a fixed state.
+const solid = await import("solid-js")
 
 /* ------------------------------------------------------------- assertions */
 
@@ -62,12 +74,28 @@ type FakeVoice = {
 }
 
 function fakeVoice(mic = "idle", speech = "idle"): FakeVoice {
-  let micState = mic
-  let speechState = speech
+  // Real signals, exactly like the controller: the buttons read them when the
+  // controller repaints them. The repaint registry mirrors the controller's:
+  // a state change must repaint the registered text nodes, which is what
+  // proves the buttons update LIVE instead of only at mount.
+  const { createSignal } = solid
+  const [micState, setMicState] = createSignal(mic)
+  const [speechState, setSpeechState] = createSignal(speech)
+  const repaints = new Set<() => void>()
+  const repaint = () => {
+    for (const fn of repaints) fn()
+  }
   const calls: string[] = []
   const voice = {
-    mic: () => micState,
-    speech: () => speechState,
+    mic: micState,
+    speech: speechState,
+    addRepaint: (fn: () => void) => {
+      repaints.add(fn)
+      fn()
+    },
+    removeRepaint: (fn: () => void) => {
+      repaints.delete(fn)
+    },
     autoSpeak: () => true,
     speakText: async () => true,
     speakLast: async () => {},
@@ -87,10 +115,12 @@ function fakeVoice(mic = "idle", speech = "idle"): FakeVoice {
     calls,
     voice,
     setMic: (state: string) => {
-      micState = state
+      setMicState(() => state)
+      repaint()
     },
     setSpeech: (state: string) => {
-      speechState = state
+      setSpeechState(() => state)
+      repaint()
     },
   }
 }
@@ -111,6 +141,20 @@ async function mount(render: () => unknown, width = 40, height = 3) {
   await s.mockMouse.click(2, 0)
   await s.renderOnce()
   check("mic click calls toggleMic with the slot's session", f.calls.includes("toggleMic:ses_abc"), f.calls.join(","))
+
+  // LIVE updates: same mounted component, state changes underneath it. This is
+  // what a fresh-mount test cannot catch and what the buttons must survive in
+  // the real TUI.
+  f.setMic("listening")
+  await s.renderOnce()
+  check("mic label updates live to listening", s.captureCharFrame().includes("listening"), JSON.stringify(s.captureCharFrame()))
+  f.setMic("transcribing")
+  await s.renderOnce()
+  check("mic label updates live to transcribing", s.captureCharFrame().includes("transcribing"), JSON.stringify(s.captureCharFrame()))
+  f.setMic("idle")
+  await s.renderOnce()
+  const back = s.captureCharFrame()
+  check("mic label returns live to idle", back.includes("mic") && !back.includes("listening"), JSON.stringify(back))
   s.renderer.destroy()
 }
 
@@ -141,6 +185,17 @@ async function mount(render: () => unknown, width = 40, height = 3) {
   await s.mockMouse.click(34, 0)
   await s.renderOnce()
   check("speak click calls pauseResume with the slot's session", f.calls.includes("pauseResume:ses_xyz"), f.calls.join(","))
+
+  // LIVE updates on the same mounted button: read -> pause -> resume -> read.
+  f.setSpeech("playing")
+  await s.renderOnce()
+  check("speak label updates live to pause", s.captureCharFrame().includes("pause"), JSON.stringify(s.captureCharFrame()))
+  f.setSpeech("paused")
+  await s.renderOnce()
+  check("speak label updates live to resume", s.captureCharFrame().includes("resume"), JSON.stringify(s.captureCharFrame()))
+  f.setSpeech("idle")
+  await s.renderOnce()
+  check("speak label returns live to read", s.captureCharFrame().includes("read"), JSON.stringify(s.captureCharFrame()))
   s.renderer.destroy()
 }
 
