@@ -53,7 +53,22 @@ def _espeak_bin() -> str | None:
     return shutil.which("espeak-ng") or shutil.which("espeak")
 
 
+_AVAIL_TTL = 15.0   # importing piper pulls in onnxruntime; don't redo it per status poll
+_avail_cache: tuple[float, list[dict]] | None = None
+
+
 def available_backends() -> list[dict]:
+    """Which TTS backends work (memoised ~15 s)."""
+    global _avail_cache
+    now = time.time()
+    if _avail_cache and now - _avail_cache[0] < _AVAIL_TTL:
+        return [dict(b) for b in _avail_cache[1]]
+    out = _probe_backends()
+    _avail_cache = (now, [dict(b) for b in out])
+    return out
+
+
+def _probe_backends() -> list[dict]:
     ok_py, why_py = _piper_python_available()
     v = voices.resolve()
     out = [

@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-DAEMON_VERSION = "1.0.0"
+DAEMON_VERSION = "1.0.1"
 
 # ----------------------------------------------------------------------------
 # Paths
@@ -150,6 +150,9 @@ STT_BACKEND = os.environ.get("JARVIS_VOICE_STT", "auto").strip().lower()   # aut
 WHISPER_MODEL = os.environ.get("JARVIS_VOICE_WHISPER_MODEL", "tiny")       # tiny|base|small|medium|large-v3
 WHISPER_DEVICE = os.environ.get("JARVIS_VOICE_WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.environ.get("JARVIS_VOICE_WHISPER_COMPUTE", "int8")
+# Cap Whisper's CPU threads (0 = library default). On a phone set 2: a little
+# slower per utterance, but lower peaks - the phone stays cool.
+WHISPER_THREADS = int(os.environ.get("JARVIS_VOICE_WHISPER_THREADS", "0") or 0)
 WHISPER_LANGUAGE = os.environ.get("JARVIS_VOICE_LANGUAGE", "")             # "" = auto-detect
 WHISPER_BEAM = int(os.environ.get("JARVIS_VOICE_WHISPER_BEAM", "1"))
 # Explicit local model directory (offline use, e.g. a downloaded faster-whisper model).
@@ -159,6 +162,26 @@ WHISPER_LOCAL_HINTS = (
     Path.home() / ".cache" / "huggingface" / "hub",
     Path.home() / ".cache" / "whisper",
 )
+
+
+# ----------------------------------------------------------------------------
+# On-demand / battery ("keep the phone cold")
+# ----------------------------------------------------------------------------
+
+# Exit after this many seconds without real activity (a request that does
+# something, an active push-to-talk session, or playing speech). Status polls
+# from the UI do not count. The plugin starts the daemon again on the next
+# voice action, so exiting costs nothing and gives idle CPU ~0 plus the RAM
+# back. 0 = stay resident.
+IDLE_EXIT_S = int(os.environ.get("JARVIS_VOICE_IDLE_EXIT_S", "300") or 0)
+# off | lazy | boot.
+#   lazy (default): load the STT model in the background when push-to-talk
+#     starts - a transcription is coming anyway, so the CPU works while the
+#     user speaks and never while the daemon sits idle.
+#   boot: warm everything at daemon start (old behaviour, hot first answer,
+#     costs a few seconds of CPU whenever the daemon starts).
+#   off: never preload; the model loads on the first transcription.
+WARMUP_MODE = (os.environ.get("JARVIS_VOICE_WARMUP", "lazy") or "off").strip().lower()
 
 
 # ----------------------------------------------------------------------------
@@ -292,4 +315,9 @@ def describe() -> dict:
         "cache_dir": str(CACHE_DIR),
         "sample_rate": SAMPLE_RATE,
         "auth_required": AUTH_REQUIRED,
+        "on_demand": {
+            "idle_exit_s": IDLE_EXIT_S,
+            "warmup": WARMUP_MODE,
+            "whisper_threads": WHISPER_THREADS,
+        },
     }

@@ -11,6 +11,10 @@ Two mouse buttons do the same: a **🎙 mic** at the bottom-right of the prompt
 box and a **🔊 read / ⏸ pause / ▶ resume** button above the text box, both
 drawn with your OpenCode theme.
 
+It is built to keep a phone cold: the daemon starts **only when you use voice**,
+warms the model **while you speak** (never at boot), and **exits when idle**, so
+idle CPU is zero and its memory goes back to the system.
+
 Works the same on **Parrot OS**, **Termux / Android**, and a **normal PC**
 (Linux, macOS, Windows).
 
@@ -314,10 +318,43 @@ Everything is an environment variable, read at daemon start:
 | `JARVIS_VOICE_VAD_THRESHOLD` | `0.012` | raise it in a noisy room |
 | `JARVIS_VOICE_VAD_SILENCE_MS` | `900` | silence that ends a turn |
 | `JARVIS_VOICE_LENGTH_SCALE` | `1.0` | Piper speed; `1.1` is a touch slower |
+| `JARVIS_VOICE_IDLE_EXIT_S` | `300` | exit after this long with nothing to do; `0` stays resident |
+| `JARVIS_VOICE_WARMUP` | `lazy` | `lazy` \| `boot` \| `off` — when the STT model is loaded |
+| `JARVIS_VOICE_WHISPER_THREADS` | `0` (auto) | cap Whisper's CPU threads; `2` keeps a phone cooler |
 
 The daemon writes `~/.cache/jarvis-voice/daemon.json` (URL + token, mode 600).
 Requests are authenticated with that token, so other local processes cannot
 drive your microphone.
+
+### Battery & resources
+
+Nothing runs unless you use it:
+
+* **Starts on demand** — when you press push-to-talk, click a button, or the
+  agent calls a voice tool. Opening OpenCode does not start it.
+* **Cheap boot** — under a second, no model loading. The STT model is warmed
+  in the background when push-to-talk starts (a transcription is coming
+  anyway), so CPU work happens while you speak, never while it sits idle.
+* **Exits when idle** — after `JARVIS_VOICE_IDLE_EXIT_S` seconds (default
+  300) with no real activity it stops on its own, returning the loaded
+  model's memory to the system. Status polls (`/speech`, `/ptt/state`,
+  `/ping`) do not count as activity, so a paused-and-abandoned playback is
+  stopped and the daemon leaves too. The next voice action starts it again.
+* **No background polling** — the TUI watches speech only while speech is
+  actually playing (600 ms; 3 s while paused) and stops the moment it ends.
+
+Measured on the reference Android/Parrot setup: idle daemon **~56 MB RSS**,
+zero wake-ups beyond a 2 s shutdown check; with the `tiny` model loaded
+**~210 MB** until the idle exit frees it.
+
+Tuning:
+
+| Situation | Setting |
+|---|---|
+| Plugged in, want it always resident | `JARVIS_VOICE_IDLE_EXIT_S=0` |
+| Very aggressive on battery | `JARVIS_VOICE_IDLE_EXIT_S=60` |
+| Phone warms during long dictations | `JARVIS_VOICE_WHISPER_THREADS=2` |
+| Want the hot first answer back | `JARVIS_VOICE_WARMUP=boot` |
 
 ### Plugin options
 
@@ -420,4 +457,6 @@ optional accelerants that the daemon reports on and degrades without.
 | The buttons are missing | restart OpenCode; `opencode plugin list` should show this folder |
 | `⏸ pause` does nothing | the daemon is older than the plugin — `./bin/voice restart` |
 | It reads the wrong text | it reads only the last answer's final text part; if a turn is still running, wait for it to finish |
+| First voice action after a quiet spell takes ~1 s | that is the daemon starting again — normal on battery; `JARVIS_VOICE_IDLE_EXIT_S=0` avoids it |
+| Keep it resident for a long session | `JARVIS_VOICE_IDLE_EXIT_S=0 ./bin/voice restart` |
 | Nothing at all | `./bin/voice doctor` — it names the broken part and the fix |

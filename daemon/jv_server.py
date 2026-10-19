@@ -24,6 +24,12 @@ Endpoints (JSON unless noted):
   POST /shutdown          stop the daemon
 
 Auth: `Authorization: Bearer <token>` (token in ~/.cache/jarvis-voice/daemon.json).
+
+On-demand by design (battery): nothing heavy happens at startup. In the default
+`lazy` warmup mode the STT model loads in the background when push-to-talk
+starts (while the user is speaking anyway), and the daemon exits after
+JARVIS_VOICE_IDLE_EXIT_S seconds without real activity - status polls from the
+UI do not count, playing speech does. The plugin starts it again on demand.
 """
 
 from __future__ import annotations
@@ -232,9 +238,43 @@ _state = {
     "last_error": None,
     "requests": 0,
     "boot": time.time(),
+    # Battery: when something real last happened. Idle status polls do not
+    # refresh it, so the daemon can exit even while the UI keeps looking.
+    "last_activity": time.time(),
+    "warm": False,        # lazy STT warmup already kicked off (once per life)
     # What the speakers last said, so /speech can describe it while it plays.
     "speech": {"text": "", "backend": None, "started_at": 0.0},
 }
+
+# Read-only routes the UI polls (read/pause button heartbeat). They must never
+# keep an otherwise idle daemon alive.
+_LIGHT_PATHS = {"/", "/health", "/ping", "/ptt/state", "/speech"}
+
+
+def _touch(path: str) -> None:
+    """Record real activity; polling endpoints are deliberately excluded."""
+    if path not in _LIGHT_PATHS:
+        _state["last_activity"] = time.time()
+
+
+def _maybe_warm_stt() -> None:
+    """lazy mode: load the STT model while the user is already speaking.
+
+    Push-to-talk means a transcription is coming anyway, so the CPU work
+    overlaps with the recording and the daemon never preloads while idle.
+    """
+    if cfg.WARMUP_MODE != "lazy" or _state["warm"]:
+        return
+    _state["warm"] = True
+
+    def run() -> None:
+        try:
+            st = stt.warmup()
+            print(f"[jarvis-voice] stt warm (lazy): {st}", flush=True)
+        except Exception as e:
+            print(f"[jarvis-voice] stt warmup failed: {e}", flush=True)
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def speech_status() -> dict:
@@ -359,6 +399,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized(q):
             return self._send(401, {"error": "unauthorized"})
         path = u.path.rstrip("/") or "/"
+        _touch(path)
         try:
             if path in ("/health", "/"):
                 return self._send(200, health(deep=(q.get("deep", ["0"])[0] in ("1", "true", "yes"))))
@@ -385,12 +426,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(401, {"error": "unauthorized"})
         path = u.path.rstrip("/") or "/"
         _state["requests"] += 1
+        _touch(path)
         try:
             if path == "/ptt/start":
                 body = self._json_body()
                 if _state["ptt"] and _state["ptt"].state in ("listening", "transcribing"):
                     _state["ptt"].cancel()
                 _state["ptt"] = PttSession(max_ms=body.get("max_ms") or body.get("maxMs"))
+                _maybe_warm_stt()
                 return self._send(200, {"ok": True, "ptt": _state["ptt"].snapshot()})
 
             if path == "/ptt/stop":
@@ -519,8 +562,13 @@ def serve(host: str, port: int, probe: bool = True) -> int:
     print(f"[jarvis-voice] daemon {cfg.DAEMON_VERSION} on http://{host}:{bound_port}  ({cfg.PLATFORM_TAG})", flush=True)
     print(f"[jarvis-voice] token: {cfg.TOKEN}", flush=True)
     print(f"[jarvis-voice] runtime file: {cfg.RUNTIME_FILE}", flush=True)
+    if cfg.WARMUP_MODE != "boot" or cfg.IDLE_EXIT_S > 0:
+        print(f"[jarvis-voice] on-demand: warmup={cfg.WARMUP_MODE}, "
+              f"idle-exit={cfg.IDLE_EXIT_S or 'off'}s", flush=True)
 
-    if probe:
+    # Only "boot" mode pays for warming at startup. "lazy" (default) waits for
+    # push-to-talk, "off" lets the first transcription load the model.
+    if probe and cfg.WARMUP_MODE == "boot":
         def _warm():
             try:
                 cap = audio.probe_capture()
@@ -546,6 +594,36 @@ def serve(host: str, port: int, probe: bool = True) -> int:
 
         threading.Thread(target=_warm, daemon=True).start()
 
+    # On-demand exit: after a quiet stretch with nothing real happening, the
+    # daemon stops playback (if paused) and leaves. The plugin starts it again
+    # on the next voice action, so idle CPU is exactly zero and the models'
+    # RAM goes back to the system.
+    if cfg.IDLE_EXIT_S > 0:
+        def _idle_watchdog():
+            idle = cfg.IDLE_EXIT_S
+            while True:
+                time.sleep(min(30.0, max(5.0, idle / 5.0)))
+                sess = _state["ptt"]
+                if sess and sess.state in ("listening", "transcribing"):
+                    continue
+                if time.time() - _state["last_activity"] < idle:
+                    continue
+                sp = audio.playback_status()
+                if sp.get("playing") and not sp.get("paused"):
+                    continue
+                if sp.get("playing") or sp.get("paused"):
+                    audio.stop_playback()
+                print(f"[jarvis-voice] idle for {int(idle)}s - exiting "
+                      f"(on-demand; JARVIS_VOICE_IDLE_EXIT_S=0 stays resident)", flush=True)
+                cfg.clear_runtime()
+                try:
+                    httpd.shutdown()
+                except Exception:
+                    pass
+                return
+
+        threading.Thread(target=_idle_watchdog, daemon=True).start()
+
     def _bye(*_a):
         cfg.clear_runtime()
         try:
@@ -560,7 +638,9 @@ def serve(host: str, port: int, probe: bool = True) -> int:
             pass
 
     try:
-        httpd.serve_forever(poll_interval=0.3)
+        # 2 s poll: the shutdown check wakes the CPU ~6x less often than 0.3 s,
+        # which is the point on battery. Incoming requests still wake it at once.
+        httpd.serve_forever(poll_interval=2.0)
     finally:
         cfg.clear_runtime()
     return 0

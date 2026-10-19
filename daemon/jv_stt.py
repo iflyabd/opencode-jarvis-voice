@@ -9,6 +9,7 @@ Speech-to-text. 100% local. Picks the best backend that is actually installed.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import tempfile
@@ -55,12 +56,16 @@ def _pcm_to_float(pcm: bytes):
 # ----------------------------------------------------------------------------
 
 def _faster_whisper_available() -> tuple[bool, str]:
-    try:
-        import faster_whisper  # noqa: F401
-
-        return True, "ok"
-    except Exception as e:
-        return False, str(e)
+    # find_spec only: importing the package loads ctranslate2/tokenizers, which
+    # costs real CPU. Status checks must stay cheap on battery; the real import
+    # happens once at transcription time.
+    for mod in ("faster_whisper", "ctranslate2", "tokenizers"):
+        try:
+            if importlib.util.find_spec(mod) is None:
+                return False, f"{mod} not installed (pip install faster-whisper)"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+    return True, "ok"
 
 
 def _resolve_model_ref() -> str:
@@ -94,14 +99,17 @@ def transcribe_faster_whisper(pcm: bytes, sr: int = cfg.SAMPLE_RATE) -> dict:
         model = _loaded.get(key)
         if model is None:
             local_only = bool(cfg.WHISPER_MODEL_DIR) or os.environ.get("HF_HUB_OFFLINE") == "1"
+            load: dict = {"device": cfg.WHISPER_DEVICE, "compute_type": cfg.WHISPER_COMPUTE}
+            if cfg.WHISPER_THREADS > 0:
+                # Lower peak heat on phones; single utterance takes a bit longer.
+                load["cpu_threads"] = cfg.WHISPER_THREADS
             try:
-                model = WhisperModel(ref, device=cfg.WHISPER_DEVICE, compute_type=cfg.WHISPER_COMPUTE,
-                                     local_files_only=local_only)
+                model = WhisperModel(ref, local_files_only=local_only, **load)
             except Exception as e:
                 if not local_only:
                     # Retry pinned to the local cache so a flaky network does not break voice.
                     os.environ["HF_HUB_OFFLINE"] = "1"
-                    model = WhisperModel(ref, device=cfg.WHISPER_DEVICE, compute_type=cfg.WHISPER_COMPUTE)
+                    model = WhisperModel(ref, **load)
                 else:
                     raise SttError(
                         f"cannot load faster-whisper model '{ref}': {e}. "
@@ -207,8 +215,22 @@ def transcribe_vosk(pcm: bytes, sr: int = cfg.SAMPLE_RATE) -> dict:
 
 _ORDER = ["faster-whisper", "whisper", "whispercpp", "vosk"]
 
+_AVAIL_TTL = 15.0   # probing is cheap now, but status pages can poll; keep it free
+_avail_cache: tuple[float, list[dict]] | None = None
+
 
 def available_backends() -> list[dict]:
+    """Which STT backends are installed (memoised ~15 s)."""
+    global _avail_cache
+    now = time.time()
+    if _avail_cache and now - _avail_cache[0] < _AVAIL_TTL:
+        return [dict(b) for b in _avail_cache[1]]
+    out = _probe_backends()
+    _avail_cache = (now, [dict(b) for b in out])
+    return out
+
+
+def _probe_backends() -> list[dict]:
     out = []
     for name in _ORDER:
         if name == "faster-whisper":
@@ -217,9 +239,8 @@ def available_backends() -> list[dict]:
             out.append({"backend": name, "ok": ok, "reason": why, "model": ref})
         elif name == "whisper":
             try:
-                import whisper  # noqa: F401
-
-                out.append({"backend": name, "ok": True, "model": cfg.WHISPER_MODEL})
+                ok = importlib.util.find_spec("whisper") is not None
+                out.append({"backend": name, "ok": ok, "reason": "" if ok else "not installed"})
             except Exception as e:
                 out.append({"backend": name, "ok": False, "reason": str(e)})
         elif name == "whispercpp":

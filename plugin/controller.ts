@@ -141,7 +141,7 @@ export function createVoiceController(context: any) {
   let autoSpeak = context.options?.autoSpeak !== false
   let micBusy = false // guards double-starts while the first start is in flight
   let micCancelled = false // set by cancel() so the listen loop stays quiet
-  let speechTimer: ReturnType<typeof setInterval> | null = null
+  let speechTimer: ReturnType<typeof setTimeout> | null = null
   let speechPolling = false
 
   function toast(message: string, variant: "info" | "success" | "warning" | "error" = "info") {
@@ -168,11 +168,26 @@ export function createVoiceController(context: any) {
 
   /* ------------------------------------------------------------ speech state */
 
+  // While the daemon is speaking we poll its state so the button follows along
+  // (playing -> pause icon, paused -> resume icon). Deliberately light on
+  // battery: 600 ms while playing, 3 s while paused, and the moment speech is
+  // over the chain stops completely - the TUI never wakes the CPU for nothing.
+  const SPEECH_POLL_PLAYING_MS = 600
+  const SPEECH_POLL_PAUSED_MS = 3000
+
   function stopSpeechWatch(): void {
     if (speechTimer !== null) {
-      clearInterval(speechTimer)
+      clearTimeout(speechTimer)
       speechTimer = null
     }
+  }
+
+  function scheduleSpeechPoll(ms: number): void {
+    if (speechTimer !== null) return
+    speechTimer = setTimeout(() => {
+      speechTimer = null
+      void refreshSpeech()
+    }, ms)
   }
 
   async function refreshSpeech(): Promise<void> {
@@ -186,8 +201,10 @@ export function createVoiceController(context: any) {
         return
       }
       const st = await api.speech(info)
-      setSpeech(st.active ? (st.paused ? "paused" : "playing") : "idle")
-      if (!st.active) stopSpeechWatch()
+      const next = st.active ? (st.paused ? "paused" : "playing") : "idle"
+      setSpeech(next)
+      if (next === "idle") stopSpeechWatch()
+      else scheduleSpeechPoll(next === "paused" ? SPEECH_POLL_PAUSED_MS : SPEECH_POLL_PLAYING_MS)
     } catch {
       // A restarting daemon is not an error the user must see; the watcher
       // simply stops and a later action restarts it.
@@ -199,10 +216,7 @@ export function createVoiceController(context: any) {
   }
 
   function watchSpeech(): void {
-    if (speechTimer !== null) return
-    speechTimer = setInterval(() => {
-      void refreshSpeech()
-    }, 600)
+    scheduleSpeechPoll(SPEECH_POLL_PLAYING_MS)
   }
 
   /* -------------------------------------------------------------- speak text */
