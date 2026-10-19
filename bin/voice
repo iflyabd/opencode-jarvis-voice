@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# Jarvis Voice - one entry point for the daemon, the voice library and diagnostics.
+#
+#   voice up            start the daemon in the background (idempotent)
+#   voice down          stop it
+#   voice restart
+#   voice status        is it running, and what is it using?
+#   voice doctor        full audio / STT / TTS report with fixes
+#   voice logs          follow the daemon log
+#   voice say "..."     speak locally
+#   voice listen        capture one utterance and print the text
+#   voice voice list    show installed Piper voices      (aliases: vlist)
+#   voice voice use F   register your own Piper voice file
+#   voice voice fetch N download a JARVIS-style voice
+#   voice install       set up the Python environment
+#   voice pulse         check the PulseAudio bridge (Termux/Android)
+#
+# Everything is resolved at runtime, so the same script works on Parrot,
+# Termux, a normal Linux box, and macOS.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$(cd "$HERE/.." && pwd)"
+DAEMON_DIR="$APP_DIR/daemon"
+export JARVIS_VOICE_HOME="${JARVIS_VOICE_HOME:-$APP_DIR}"
+
+CACHE_DIR="${JARVIS_VOICE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/jarvis-voice}"
+LOG_FILE="$CACHE_DIR/daemon.log"
+RUNTIME_FILE="$CACHE_DIR/daemon.json"
+mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+C_OK="\033[32m"; C_WARN="\033[33m"; C_ERR="\033[31m"; C_DIM="\033[2m"; C_OFF="\033[0m"
+[ -t 1 ] || { C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_OFF=""; }
+
+ok()   { printf "${C_OK}  ok  ${C_OFF}%s\n" "$*"; }
+warn() { printf "${C_WARN} warn ${C_OFF}%s\n" "$*"; }
+bad()  { printf "${C_ERR} fail ${C_OFF}%s\n" "$*"; }
+dim()  { printf "${C_DIM}      %s${C_OFF}\n" "$*"; }
+head_() { printf "\n${C_DIM}%s${C_OFF}\n" "$*"; }
+
+# ---------------------------------------------------------------- interpreter
+
+find_python() {
+  if [ -n "${JARVIS_VOICE_PYTHON:-}" ] && [ -x "${JARVIS_VOICE_PYTHON}" ]; then
+    echo "$JARVIS_VOICE_PYTHON"; return 0
+  fi
+  for candidate in \
+      "$APP_DIR/.venv/bin/python" \
+      "$APP_DIR/venv/bin/python" \
+      "/root/jarvis/venv/bin/python" \
+      "$HOME/jarvis/venv/bin/python" \
+      "${PREFIX:-}/bin/python3" ; do
+    [ -x "$candidate" ] || continue
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import importlib.util, sys
+mods = ["numpy"]
+sys.exit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)
+PY
+    then echo "$candidate"; return 0; fi
+  done
+  for candidate in python3 python; do
+    command -v "$candidate" >/dev/null 2>&1 && { command -v "$candidate"; return 0; }
+  done
+  return 1
+}
+
+ensure_runtime_deps() {
+  local py="$1"
+  "$py" - <<'PY' >/dev/null 2>&1
+import importlib.util, sys
+need = ["numpy"]
+sys.exit(0 if all(importlib.util.find_spec(m) for m in need) else 1)
+PY
+}
+
+PYTHON="$(find_python || true)"
+
+have_stt() {
+  local py="$1"
+  "$py" - <<'PY' >/dev/null 2>&1
+import importlib.util, sys
+sys.exit(0 if importlib.util.find_spec("faster_whisper") else 1)
+PY
+}
+
+have_tts() {
+  local py="$1"
+  "$py" - <<'PY' >/dev/null 2>&1
+import importlib.util, sys
+sys.exit(0 if (importlib.util.find_spec("piper") or importlib.util.find_spec("espeakng")) else 1)
+PY
+}
+
+# --------------------------------------------------------------------- daemon
+
+daemon_url() {
+  [ -f "$RUNTIME_FILE" ] || return 1
+  local py="${PYTHON:-python3}"
+  "$py" - "$RUNTIME_FILE" <<'PY' 2>/dev/null
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print(d.get("url",""), d.get("token",""), d.get("pid",0))
+except Exception:
+    sys.exit(1)
+PY
+}
+
+is_healthy() {
+  local info; info="$(daemon_url)" || return 1
+  set -- $info
+  local url="$1" token="$2"
+  [ -n "$url" ] || return 1
+  case "$url" in *:0) return 1;; esac   # a placeholder port is not a live daemon
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS -m 3 -H "Authorization: Bearer $token" "$url/ping" >/dev/null 2>&1 && return 0
+  fi
+  [ -n "${PYTHON:-}" ] || return 1
+  "$PYTHON" - "$url" "$token" <<'PY' >/dev/null 2>&1
+import json,sys,urllib.request
+url,token=sys.argv[1],sys.argv[2]
+req=urllib.request.Request(url+"/ping", headers={"Authorization":"Bearer "+token})
+try:
+    json.load(urllib.request.urlopen(req, timeout=3))
+except Exception:
+    sys.exit(1)
+PY
+}
+
+# Every daemon process started from this install. Matching on the interpreter
+# path plus the script name keeps the running script itself out of the list.
+daemon_pids() {
+  local p exe
+  for p in $(pgrep -f "jv_server\.py" 2>/dev/null); do
+    case "$p" in ""|"$$"|"$PPID") continue;; esac
+    exe="$(readlink -f "/proc/$p/exe" 2>/dev/null || true)"
+    case "$exe" in
+      *python*) grep -qa "jv_server\.py" "/proc/$p/cmdline" 2>/dev/null && echo "$p" ;;
+    esac
+  done
+}
+
+kill_stale_daemons() {
+  local pids; pids="$(daemon_pids | tr '\n' ' ')"
+  [ -z "${pids// /}" ] && return 0
+  dim "stopping stale daemon(s): $pids"
+  for p in $pids; do kill "$p" 2>/dev/null; done
+  for _ in 1 2 3 4 5 6 7 8; do
+    sleep 0.25
+    pids="$(daemon_pids | tr '\n' ' ')"
+    [ -z "${pids// /}" ] && return 0
+  done
+  for p in $pids; do kill -9 "$p" 2>/dev/null; done
+  sleep 0.3
+  return 0
+}
+
+cmd_up() {
+  if is_healthy; then
+    dim "daemon already running"
+    cmd_status_short
+    return 0
+  fi
+  # A daemon we cannot reach is a leftover: it holds a port and answers nothing.
+  kill_stale_daemons
+  rm -f "$RUNTIME_FILE"
+  [ -n "$PYTHON" ] || { bad "no python interpreter found"; return 1; }
+  ensure_runtime_deps "$PYTHON" || {
+    warn "numpy missing - running: voice install"
+    cmd_install || return 1
+    PYTHON="$(find_python)" || return 1
+  }
+  mkdir -p "$CACHE_DIR"
+  # Detach completely so the TUI plugin can start the daemon and walk away.
+  ( cd "$DAEMON_DIR" && setsid nohup "$PYTHON" jv_server.py "$@" >>"$LOG_FILE" 2>&1 </dev/null & ) 2>/dev/null \
+    || ( cd "$DAEMON_DIR" && nohup "$PYTHON" jv_server.py "$@" >>"$LOG_FILE" 2>&1 </dev/null & )
+  for _ in $(seq 1 80); do
+    sleep 0.25
+    if is_healthy; then
+      cmd_status_short
+      return 0
+    fi
+  done
+  bad "daemon did not come up in 20s - see $LOG_FILE"
+  tail -20 "$LOG_FILE" 2>/dev/null
+  return 1
+}
+
+cmd_down() {
+  local info; info="$(daemon_url 2>/dev/null || true)"
+  local had_pids; had_pids="$(daemon_pids | tr '\n' ' ')"
+  if [ -n "$info" ]; then
+    set -- $info
+    if [ -n "${PYTHON:-}" ]; then
+      "$PYTHON" - "$1" "$2" <<'PY' >/dev/null 2>&1 || true
+import sys,urllib.request
+req=urllib.request.Request(sys.argv[1]+"/shutdown", data=b"{}", headers={"Authorization":"Bearer "+sys.argv[2],"Content-Type":"application/json"})
+try: urllib.request.urlopen(req, timeout=4)
+except Exception: pass
+PY
+    fi
+  fi
+  kill_stale_daemons
+  rm -f "$RUNTIME_FILE"
+  # Bye-bye to any speech still playing, so a muted assistant is not left talking.
+  if command -v termux-media-player >/dev/null 2>&1; then termux-media-player stop >/dev/null 2>&1 || true; fi
+  if [ -n "$info" ] || [ -n "${had_pids// /}" ]; then dim "stopped"; else dim "not running"; fi
+}
+
+cmd_status_short() {
+  local info; info="$(daemon_url)" || return 0
+  set -- $info
+  [ -n "${PYTHON:-}" ] || return 0
+  "$PYTHON" - "$1" "$2" <<'PY' 2>/dev/null
+import json,sys,urllib.request
+url,token=sys.argv[1],sys.argv[2]
+def get(p):
+    req=urllib.request.Request(url+p, headers={"Authorization":"Bearer "+token})
+    return json.load(urllib.request.urlopen(req, timeout=8))
+h=get("/health")
+cap=h["audio"].get("capture") or {}
+print(f"      daemon   : {url}  ({h['daemon']['platform']}, v{h['daemon']['version']})")
+print(f"      mic      : {cap.get('backend') or 'UNAVAILABLE'}")
+print(f"      stt      : {h['stt']['picked'] or 'none'}  {h['stt'].get('backends') and ''}")
+v=h.get('tts',{}).get('voice') or {}
+print(f"      tts      : {h['tts']['picked'] or 'none'}" + (f"  voice={v.get('name')}" if v.get('name') else ""))
+PY
+}
+
+cmd_status() {
+  head_ "Jarvis Voice status"
+  echo "  app dir     : $APP_DIR"
+  echo "  python      : ${PYTHON:-NOT FOUND}"
+  local pids; pids="$(daemon_pids | tr '\n' ' ')"
+  if is_healthy; then
+    ok "daemon running"
+    cmd_status_short
+  else
+    warn "daemon not running  (start it with: voice up)"
+  fi
+  local count; count="$(printf '%s' "$pids" | wc -w | tr -d ' ')"
+  [ "$count" -gt 1 ] && warn "$count daemon processes exist; extra ones are leftovers (voice down clears them)"
+  printf "\n  log         : %s\n  runtime     : %s\n" "$LOG_FILE" "$RUNTIME_FILE"
+}
+
+cmd_doctor() {
+  head_ "1. environment"
+  echo "  app dir        : $APP_DIR"
+  echo "  python         : ${PYTHON:-NOT FOUND}"
+  echo "  platform       : $(uname -s) $(uname -m)"
+  echo "  PULSE_SERVER   : ${PULSE_SERVER:-<unset>}"
+  echo "  TERMUX_VERSION : ${TERMUX_VERSION:-<unset>}"
+
+  head_ "2. tools"
+  for t in parec pactl pulseaudio arecord rec sox ffmpeg espeak-ng piper termux-microphone-record termux-media-player curl; do
+    if command -v "$t" >/dev/null 2>&1; then ok "$t -> $(command -v "$t")"; else dim "$t (absent)"; fi
+  done
+
+  if [ -n "$PYTHON" ]; then
+    head_ "3. python packages"
+    "$PYTHON" - <<'PY'
+import importlib.util as u
+for name, why in [("numpy","core"),("sounddevice","mic via PortAudio"),("faster_whisper","local STT (recommended)"),
+                  ("whisper","local STT (alt)"),("piper","local TTS (recommended)"),("onnxruntime","Piper runtime"),
+                  ("vosk","local STT (alt)")]:
+    spec = u.find_spec(name)
+    print(f"  {'ok  ' if spec else '--  '} {name:<16} {why}")
+PY
+    head_ "3b. what will actually be used"
+    local stt_json
+    stt_json="$( cd "$DAEMON_DIR" && "$PYTHON" jv_stt.py info 2>/dev/null )"
+    if [ -n "$stt_json" ]; then
+      "$PYTHON" - "$stt_json" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+print("  stt   :", d.get("picked") or "NONE")
+for b in d.get("backends", []):
+    mark = "ok  " if b.get("ok") else "--  "
+    print(f"    {mark} {b['backend']:<14} {b.get('reason') or b.get('model') or ''}")
+PY
+    fi
+    head_ "4. piper voices"
+    ( cd "$DAEMON_DIR" && "$PYTHON" jv_voices.py list ) || true
+  fi
+
+  head_ "5. audio capture"
+  if is_healthy; then
+    [ -n "$PYTHON" ] && "$PYTHON" - "$(daemon_url)" <<'PY'
+import json,sys,urllib.request
+parts=sys.argv[1].split()
+url,token=parts[0],parts[1]
+req=urllib.request.Request(url+"/health?deep=1", headers={"Authorization":"Bearer "+token})
+h=json.load(urllib.request.urlopen(req, timeout=90))
+a=h["audio"]; cap=a.get("capture") or {}
+if cap.get("backend"): print(f"  ok   capture backend: {cap['backend']} (rms={cap.get('rms')})")
+else:
+    print(f"  fail no capture backend: {cap.get('reason')}")
+    for h_ in cap.get("hints",[]): print(f"       hint: {h_}")
+for t in cap.get("tried",[]):
+    mark = "ok  " if t.get("ok") else "--  "
+    print(f"    {mark} {t['backend']:<12} {t.get('reason') or t.get('rms')}")
+p=a.get("pulse",{})
+print(f"  {'ok  ' if p.get('reachable') else 'fail'} pulse: {p.get('detail')}  server={p.get('server')!r}")
+PY
+  else
+    warn "daemon not running - start it with: voice up"
+  fi
+
+  head_ "6. verdict"
+  local problems=0
+  if [ -z "$PYTHON" ]; then bad "no python"; problems=$((problems+1));
+  elif ! ensure_runtime_deps "$PYTHON"; then bad "python deps missing - run: voice install"; problems=$((problems+1)); fi
+  if [ -n "$PYTHON" ] && ! have_stt "$PYTHON"; then bad "no local STT - run: voice install"; problems=$((problems+1)); fi
+  if [ -n "$PYTHON" ] && ! have_tts "$PYTHON"; then warn "no piper python package - espeak will be used"; fi
+  if command -v parec >/dev/null 2>&1 && [ "${PULSE_SERVER:-}" != "" ]; then
+    if ! pactl info >/dev/null 2>&1; then
+      warn "PulseAudio not reachable at $PULSE_SERVER"
+      dim "On Android/Parrot:  bash $HERE/termux-pulse   (run inside Termux)"
+    fi
+  fi
+  [ "$problems" -eq 0 ] && ok "configuration looks good" || warn "$problems blocking problem(s) above"
+  return 0
+}
+
+cmd_install() {
+  head_ "installing the Python environment"
+  local base="${PYTHON:-}"
+  local venv="$APP_DIR/.venv"
+  if [ ! -x "$venv/bin/python" ]; then
+    if [ -z "$base" ]; then
+      for c in python3 python; do command -v "$c" >/dev/null 2>&1 && { base="$(command -v "$c")"; break; }; done
+    fi
+    [ -n "$base" ] || { bad "no python3 found"; return 1; }
+    dim "creating $venv"
+    "$base" -m venv "$venv" 2>/dev/null || { bad "python3 -m venv failed (install python3-venv)"; return 1; }
+  fi
+  PYTHON="$venv/bin/python"
+  dim "upgrading pip"
+  "$PYTHON" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
+  local req="$APP_DIR/requirements.txt"
+  [ -f "$req" ] && { dim "installing $req"; "$PYTHON" -m pip install -r "$req" || return 1; }
+  ok "environment ready: $venv"
+  dim "start the daemon again with: voice up"
+}
+
+cmd_logs() { touch "$LOG_FILE"; tail -f "$LOG_FILE"; }
+
+cmd_say() {
+  [ -n "$PYTHON" ] || { bad "no python"; return 1; }
+  ( cd "$DAEMON_DIR" && "$PYTHON" jv_tts.py say "$@" )
+}
+
+cmd_listen() {
+  [ -n "$PYTHON" ] || { bad "no python"; return 1; }
+  local secs="${1:-5}"
+  ( cd "$DAEMON_DIR" && "$PYTHON" - "$secs" <<'PY'
+import sys, json
+sys.path.insert(0, ".")
+import jv_server, jv_audio
+utt = jv_server.record_utterance(max_ms=int(float(sys.argv[1])*1000))
+print(json.dumps(utt.stats, indent=2))
+if utt.pcm:
+    import jv_stt
+    print(json.dumps(jv_stt.transcribe(utt.pcm, utt.sr), indent=2))
+PY
+  )
+}
+
+cmd_voices() {  # voice voice <sub>
+  [ -n "$PYTHON" ] || { bad "no python"; return 1; }
+  local sub="${1:-list}"; shift || true
+  ( cd "$DAEMON_DIR" && "$PYTHON" jv_voices.py "$sub" "$@" )
+}
+
+cmd_stt() {
+  [ -n "$PYTHON" ] || { bad "no python"; return 1; }
+  ( cd "$DAEMON_DIR" && "$PYTHON" jv_stt.py "${1:-info}" "${2:-}" )
+}
+
+cmd_tts() {
+  [ -n "$PYTHON" ] || { bad "no python"; return 1; }
+  ( cd "$DAEMON_DIR" && "$PYTHON" jv_tts.py "${1:-info}" "${2:-}" )
+}
+
+cmd_audio() {
+  [ -n "$PYTHON" ] || { bad "no python"; return 1; }
+  ( cd "$DAEMON_DIR" && "$PYTHON" jv_audio.py "${1:-probe}" "${2:-}" "${3:-}" )
+}
+
+cmd_test() {
+  head_ "loopback test: synthesize -> play -> record -> transcribe"
+  local text="${1:-Jarvis, voice loopback test one two three}"
+  [ -n "$PYTHON" ] || { bad "no python"; return 1; }
+  ( cd "$DAEMON_DIR" && "$PYTHON" - "$text" <<'PY'
+import sys, json, time, subprocess
+sys.path.insert(0, ".")
+import jv_tts, jv_audio, jv_stt
+text = sys.argv[1]
+info = jv_tts.synthesize(text)
+print("synthesized:", info["backend"], info["path"], f"{info['ms']}ms")
+try:
+    print("playback:", jv_audio.play_wav(info["path"]))
+except Exception as e:
+    print("playback FAILED:", e)
+print("capture probe:", json.dumps(jv_audio.probe_capture(save=False), indent=2))
+PY
+  )
+}
+
+cmd_pulse() {
+  [ -n "$PYTHON" ] || { bad "no python"; return 1; }
+  ( cd "$DAEMON_DIR" && "$PYTHON" jv_audio.py pulse )
+}
+
+usage() {
+  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  up)        shift; cmd_up "$@" ;;
+  down|stop) cmd_down ;;
+  restart)   cmd_down; shift; cmd_up "$@" ;;
+  status)    cmd_status ;;
+  doctor|check) cmd_doctor ;;
+  install)   cmd_install ;;
+  logs)      cmd_logs ;;
+  say|speak) shift; cmd_say "$@" ;;
+  listen)    shift; cmd_listen "$@" ;;
+  voice|vlist|voices) shift; cmd_voices "${@:-list}" ;;
+  stt)       shift; cmd_stt "$@" ;;
+  tts)       shift; cmd_tts "$@" ;;
+  audio|probe) shift; cmd_audio "$@" ;;
+  test)      shift; cmd_test "$@" ;;
+  pulse)     cmd_pulse ;;
+  ""|help|-h|--help) usage ;;
+  *) bad "unknown command: $1"; echo; usage; exit 2 ;;
+esac

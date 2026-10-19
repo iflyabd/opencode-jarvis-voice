@@ -1,0 +1,28 @@
+{
+  "name": "opencode-jarvis-voice",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local voice chat for OpenCode: mic -> Whisper text, Piper voice back. Fully offline.",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.tsx"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.32"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.17",
+    "@opentui/solid": ">=0.5.17",
+    "solid-js": "^1.9.0"
+  },
+  "devDependencies": {
+    "@opencode/client": "2.0.32",
+    "@opencode/theme": "2.0.32",
+    "@opentui/core": "0.5.17",
+    "@opentui/solid": "0.5.17",
+    "@types/node": "^26.6.5",
+    "solid-js": "1.9.12",
+    "typescript": "^7.0.2"
+  }
+}

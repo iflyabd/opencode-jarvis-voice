@@ -1,0 +1,54 @@
+{
+  "name": "opencode-jarvis-voice",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "description": "Fully local voice for OpenCode: push-to-talk mic button, read-aloud with pause/resume, Whisper ears and a Piper voice. No cloud, no API keys.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iflyabd/opencode-jarvis-voice.git"
+  },
+  "homepage": "https://github.com/iflyabd/opencode-jarvis-voice#readme",
+  "bugs": {
+    "url": "https://github.com/iflyabd/opencode-jarvis-voice/issues"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "voice",
+    "push-to-talk",
+    "speech-to-text",
+    "text-to-speech",
+    "whisper",
+    "piper",
+    "jarvis",
+    "local",
+    "offline"
+  ],
+  "exports": {
+    ".": "./plugin/index.ts",
+    "./tui": "./plugin/tui.tsx"
+  },
+  "files": [
+    "plugin",
+    "daemon",
+    "bin",
+    "requirements.txt",
+    "install.sh",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "cd plugin && npx tsc --noEmit",
+    "test:ui": "cd plugin && bun test/ui.check.ts"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.0.32"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.17",
+    "@opentui/solid": ">=0.5.17",
+    "solid-js": "^1.9.0"
+  }
+}

@@ -1,0 +1,115 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Jarvis Voice - Android/Termux audio bridge.
+#
+# RUN THIS INSIDE TERMUX (not inside Parrot/proot).
+#
+# Android gives the microphone to one audio service at a time. Termux's
+# PulseAudio server is the usual way to share it: it talks to Android through
+# OpenSL ES and then exposes normal PulseAudio sources/sinks, including over
+# TCP so a chroot such as Parrot can record too.
+#
+# After this runs, PULSE_SERVER=tcp:127.0.0.1 inside Parrot finds a working mic.
+#
+# Start it automatically at boot with Termux:Boot - create
+#   ~/.termux/boot/jarvis-voice.sh
+# containing:
+#   #!/data/data/com.termux/files/usr/bin/sh
+#   termux-wake-lock
+#   sh /path/to/jarvis-voice/bin/termux-pulse
+
+set -u
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+PORT="${JARVIS_PULSE_TCP_PORT:-4713}"
+
+ok()   { printf "  ok   %s\n" "$*"; }
+warn() { printf " warn  %s\n" "$*"; }
+bad()  { printf " fail  %s\n" "$*"; }
+
+echo "Jarvis Voice - Termux audio bridge"
+echo "  PREFIX=$PREFIX"
+echo
+
+if [ ! -d "$PREFIX" ] || ! echo "$PREFIX" | grep -q termux; then
+  bad "this does not look like Termux (PREFIX=$PREFIX)"
+  echo "      Inside Parrot/proot start the bridge from Termux instead:"
+  echo "        termux-open --help >/dev/null 2>&1 && true"
+  echo "      Then in Parrot:  echo \$PULSE_SERVER   # should be tcp:127.0.0.1"
+  exit 1
+fi
+
+# ---------------------------------------------------------------- dependencies
+for bin in pulseaudio pactl; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    bad "$bin is missing"
+    echo "      fix:  pkg install pulseaudio"
+    exit 1
+  fi
+done
+ok "pulseaudio found ($(command -v pulseaudio))"
+
+# ------------------------------------------------------------------- start it
+if pactl info >/dev/null 2>&1; then
+  ok "PulseAudio is already running"
+else
+  echo "  ..   starting PulseAudio"
+  # --exit-idle-time=-1 keeps it alive while no client is connected.
+  pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pactl info >/dev/null 2>&1 && break
+    sleep 0.5
+  done
+  if pactl info >/dev/null 2>&1; then
+    ok "PulseAudio started"
+  else
+    bad "PulseAudio did not start"
+    echo "      try manually to see the error:  pulseaudio -vvv"
+    exit 1
+  fi
+fi
+
+# ------------------------------------------------------------------ android io
+# OpenSL ES bridge modules: give PulseAudio the real Android mic and speaker.
+for mod in module-sles-source module-sles-sink; do
+  if pactl load-module "$mod" >/dev/null 2>&1; then
+    ok "loaded $mod"
+  else
+    warn "$mod not available or already loaded"
+  fi
+done
+
+# ------------------------------------------------------------------- tcp port
+# Let a chroot (Parrot/proot) at 127.0.0.1 record and play.
+if pactl list short modules 2>/dev/null | grep -q "module-native-protocol-tcp"; then
+  ok "TCP module already loaded"
+else
+  if pactl load-module module-native-protocol-tcp \
+        "port=$PORT" "listen=127.0.0.1" "auth-anonymous=1" >/dev/null 2>&1; then
+    ok "TCP module loaded on 127.0.0.1:$PORT"
+  else
+    bad "could not load module-native-protocol-tcp"
+    echo "      you may need to run this as the Termux user (not root inside Parrot)"
+  fi
+fi
+
+# --------------------------------------------------------------------- report
+echo
+echo "Sources (what can be recorded):"
+pactl list short sources 2>/dev/null | sed 's/^/    /' || warn "pactl list short sources failed"
+echo
+echo "Sinks (where playback goes):"
+pactl list short sinks 2>/dev/null | sed 's/^/    /' || true
+echo
+
+DEFAULT_SRC="$(pactl get-default-source 2>/dev/null || true)"
+case "$DEFAULT_SRC" in
+  *monitor*) warn "the default source is a monitor (loopback), not the microphone";;
+  "")        warn "no default source reported";;
+  *)         ok "default source: $DEFAULT_SRC";;
+esac
+
+echo
+echo "Next steps:"
+echo "  in Parrot:   voice doctor     # should now show a mic backend"
+echo "  keep alive:  termux-wake-lock"
+echo "  at boot:     ~/.termux/boot/jarvis-voice.sh  calling this script"

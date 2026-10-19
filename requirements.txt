@@ -1,0 +1,26 @@
+# Jarvis Voice - Python runtime
+#
+# Install with:  voice install
+#
+# Only the first two are required. Everything else is an optional accelerant:
+# the daemon reports what it found and degrades gracefully.
+
+# ---- required -----------------------------------------------------------
+numpy>=1.24
+# Mic capture through PortAudio. Used on Windows/macOS/Linux and in Termux when
+# the portaudio package is installed (pkg install portaudio).
+sounddevice>=0.4.6
+
+# ---- speech to text (pick at least one) ---------------------------------
+# Recommended: fast on CPU, ships arm64 wheels, works fully offline.
+faster-whisper>=1.0
+# Alternative: the reference implementation (needs torch, much heavier).
+# openai-whisper>=20231117
+# Alternative: tiny footprint streaming recogniser.
+# vosk>=0.3.45
+
+# ---- text to speech ----------------------------------------------------
+# Local neural voices (Piper). Requires a voice file; see `voice voice list`.
+piper-tts>=1.2.0
+# onnxruntime is pulled in by piper-tts, pinned here for arm64 clarity.
+onnxruntime>=1.17
