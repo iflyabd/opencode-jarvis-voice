@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-DAEMON_VERSION = "1.0.3"
+DAEMON_VERSION = "1.0.4"
 
 # ----------------------------------------------------------------------------
 # Paths
@@ -121,6 +121,12 @@ REQUEST_TIMEOUT = float(os.environ.get("JARVIS_VOICE_REQUEST_TIMEOUT", "180"))
 
 SAMPLE_RATE = int(os.environ.get("JARVIS_VOICE_SR", "16000"))
 
+# Android/Termux exposes the real phone microphone through PulseAudio's
+# module-sles-source. The daemon preloads this source for push-to-talk and
+# releases it when the on-demand daemon exits, so it is not held forever.
+PULSE_SLES_SOURCE = os.environ.get("JARVIS_VOICE_SLES_SOURCE", "jarvis_mic")
+PULSE_SLES_DISABLE = os.environ.get("JARVIS_VOICE_SLES", "").strip().lower() in ("0", "false", "no", "off")
+
 # Voice-activity detection
 VAD_THRESHOLD = float(os.environ.get("JARVIS_VOICE_VAD_THRESHOLD", "0.012"))
 VAD_SILENCE_MS = int(os.environ.get("JARVIS_VOICE_VAD_SILENCE_MS", "900"))
@@ -147,14 +153,21 @@ PULSE_SERVER = os.environ.get("PULSE_SERVER", "")
 # ----------------------------------------------------------------------------
 
 STT_BACKEND = os.environ.get("JARVIS_VOICE_STT", "auto").strip().lower()   # auto|faster-whisper|whisper|whispercpp|vosk|none
-WHISPER_MODEL = os.environ.get("JARVIS_VOICE_WHISPER_MODEL", "tiny")       # tiny|base|small|medium|large-v3
+# tiny.en is noticeably faster and more accurate than multilingual tiny for
+# English. Set JARVIS_VOICE_WHISPER_MODEL=tiny (or auto) for other languages.
+WHISPER_MODEL = os.environ.get("JARVIS_VOICE_WHISPER_MODEL", "tiny.en")     # tiny.en|tiny|base|small|medium|large-v3
+WHISPER_MODEL_EXPLICIT = "JARVIS_VOICE_WHISPER_MODEL" in os.environ
 WHISPER_DEVICE = os.environ.get("JARVIS_VOICE_WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE = os.environ.get("JARVIS_VOICE_WHISPER_COMPUTE", "int8")
-# Cap Whisper's CPU threads (0 = library default). On a phone set 2: a little
-# slower per utterance, but lower peaks - the phone stays cool.
-WHISPER_THREADS = int(os.environ.get("JARVIS_VOICE_WHISPER_THREADS", "0") or 0)
+# Cap Whisper's CPU threads (0 = library default). Four keeps phones responsive
+# while the model loads during speech; use 2 for a cooler device.
+WHISPER_THREADS = int(os.environ.get("JARVIS_VOICE_WHISPER_THREADS", "4" if IS_ANDROID else "0") or 0)
 WHISPER_LANGUAGE = os.environ.get("JARVIS_VOICE_LANGUAGE", "")             # "" = auto-detect
 WHISPER_BEAM = int(os.environ.get("JARVIS_VOICE_WHISPER_BEAM", "1"))
+# Reject near-digital-silence before touching the model. This is only a guard
+# against dead/muted sources and Whisper's "thank you" hallucinations on
+# silence; normal quiet speech is far above this (-66 dBFS).
+STT_MIN_RMS = float(os.environ.get("JARVIS_VOICE_STT_MIN_RMS", "0.0005"))
 # Explicit local model directory (offline use, e.g. a downloaded faster-whisper model).
 WHISPER_MODEL_DIR = os.environ.get("JARVIS_VOICE_WHISPER_DIR", "")
 # Models already on this machine, best first - avoids a download when offline.
@@ -204,6 +217,17 @@ TTS_LENGTH_SCALE = float(os.environ.get("JARVIS_VOICE_LENGTH_SCALE", "1.0"))
 TTS_NOISE_SCALE = float(os.environ.get("JARVIS_VOICE_NOISE_SCALE", "0.667"))
 TTS_NOISE_W = float(os.environ.get("JARVIS_VOICE_NOISE_W", "0.8"))
 TTS_SPEAKER = os.environ.get("JARVIS_VOICE_SPEAKER", "")
+
+# Optional cloud voice. The TUI passes these per /speak request so the API key
+# never has to live in the daemon environment. They are also accepted from the
+# environment for CLI use. Setting a Fish backend sends the spoken text to
+# api.fish.audio; local Piper remains the default and works offline.
+FISH_API_KEY = os.environ.get("JARVIS_VOICE_FISH_KEY") or os.environ.get("FISH_API_KEY", "")
+FISH_VOICE_ID = os.environ.get("JARVIS_VOICE_FISH_VOICE") or os.environ.get("FISH_VOICE_ID", "")
+FISH_MODEL = os.environ.get("JARVIS_VOICE_FISH_MODEL", "s2.1-pro-free")
+FISH_LATENCY = os.environ.get("JARVIS_VOICE_FISH_LATENCY", "balanced")
+FISH_TIMEOUT = float(os.environ.get("JARVIS_VOICE_FISH_TIMEOUT", "60"))
+FISH_API_URL = os.environ.get("JARVIS_VOICE_FISH_URL", "https://api.fish.audio/v1/tts")
 
 # Where we look for Piper voices, in priority order.
 VOICE_SEARCH_DIRS = [

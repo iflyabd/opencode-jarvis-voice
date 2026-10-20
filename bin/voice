@@ -9,6 +9,7 @@
 #   voice logs          follow the daemon log
 #   voice say "..."     speak locally
 #   voice listen        capture one utterance and print the text
+#   voice fetch-model N download an STT model (default: tiny.en)
 #   voice voice list    show installed Piper voices      (aliases: vlist)
 #   voice voice use F   register your own Piper voice file
 #   voice voice fetch N download a JARVIS-style voice
@@ -378,6 +379,11 @@ cmd_stt() {
   ( cd "$DAEMON_DIR" && "$PYTHON" jv_stt.py "${1:-info}" "${2:-}" )
 }
 
+cmd_fetch_model() {
+  [ -n "$PYTHON" ] || { bad "no python"; return 1; }
+  ( cd "$DAEMON_DIR" && "$PYTHON" jv_stt.py fetch "${1:-}" )
+}
+
 cmd_tts() {
   [ -n "$PYTHON" ] || { bad "no python"; return 1; }
   ( cd "$DAEMON_DIR" && "$PYTHON" jv_tts.py "${1:-info}" "${2:-}" )
@@ -429,6 +435,7 @@ case "${1:-}" in
   listen)    shift; cmd_listen "$@" ;;
   voice|vlist|voices) shift; cmd_voices "${@:-list}" ;;
   stt)       shift; cmd_stt "$@" ;;
+  fetch-model|fetch) shift; cmd_fetch_model "$@" ;;
   tts)       shift; cmd_tts "$@" ;;
   audio|probe) shift; cmd_audio "$@" ;;
   test)      shift; cmd_test "$@" ;;

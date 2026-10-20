@@ -6,8 +6,10 @@
  *   voice_speak   - say text out loud through the local Piper voice
  *   voice_status  - report the audio / STT / TTS pipeline
  *
- * Everything runs on the device: Whisper (or Vosk / whisper.cpp) for speech to
- * text, Piper for the voice. No cloud calls, no API keys.
+ * Everything runs on the device by default: Whisper (or Vosk / whisper.cpp) for
+ * speech to text, Piper for the voice. No cloud calls, no API keys. The TUI
+ * settings can optionally send spoken replies to Fish Audio; these agent tools
+ * keep using the local voice.
  *
  * The heavy lifting lives in a small local daemon (see ./daemon) so this plugin
  * never needs a native audio stack.

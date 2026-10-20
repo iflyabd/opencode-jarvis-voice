@@ -68,29 +68,50 @@ def _faster_whisper_available() -> tuple[bool, str]:
     return True, "ok"
 
 
+def _cached_model(name: str) -> str | None:
+    hub = Path.home() / ".cache" / "huggingface" / "hub" / f"models--Systran--faster-whisper-{name}"
+    snaps = hub / "snapshots"
+    if snaps.exists():
+        try:
+            cand = sorted([d for d in snaps.iterdir() if d.is_dir()], key=lambda d: d.stat().st_mtime, reverse=True)
+            for c in cand:
+                # A snapshot needs model.bin to be usable offline.
+                if (c / "model.bin").exists():
+                    return str(c)
+        except Exception:
+            pass
+    return None
+
+
 def _resolve_model_ref() -> str:
     """Prefer an explicit local dir, then an already-cached HF snapshot, then the name."""
     if cfg.WHISPER_MODEL_DIR:
         p = Path(cfg.WHISPER_MODEL_DIR).expanduser()
         if p.exists():
             return str(p)
-    name = cfg.WHISPER_MODEL
-    hub = Path.home() / ".cache" / "huggingface" / "hub" / f"models--Systran--faster-whisper-{name}"
-    snaps = hub / "snapshots"
-    if snaps.exists():
-        try:
-            cand = sorted([d for d in snaps.iterdir() if d.is_dir()], key=lambda d: d.stat().st_mtime, reverse=True)
-            if cand:
-                # A snapshot needs model.bin to be usable offline.
-                for c in cand:
-                    if (c / "model.bin").exists():
-                        return str(c)
-        except Exception:
-            pass
+    name = (cfg.WHISPER_MODEL or "auto").strip()
+    if name in ("auto", "default"):
+        # Fast English model when it is already present, multilingual tiny
+        # otherwise. Never download just because the user asked for auto.
+        for candidate in ("tiny.en", "tiny", "base.en", "base"):
+            hit = _cached_model(candidate)
+            if hit:
+                return hit
+        name = "tiny.en"
+    hit = _cached_model(name)
+    if hit:
+        return hit
+    if name == "tiny.en" and not getattr(cfg, "WHISPER_MODEL_EXPLICIT", False):
+        # Keep upgrades offline-friendly: if the old multilingual tiny is
+        # cached but tiny.en is not, use tiny rather than downloading silently.
+        # Running `voice fetch-model tiny.en` (or setting the env var) opts in
+        # to the faster English model.
+        return _cached_model("tiny") or name
     return name
 
 
-def transcribe_faster_whisper(pcm: bytes, sr: int = cfg.SAMPLE_RATE) -> dict:
+def _get_faster_whisper_model():
+    """Load (once) and return (model, resolved_ref)."""
     from faster_whisper import WhisperModel
 
     ref = _resolve_model_ref()
@@ -101,7 +122,7 @@ def transcribe_faster_whisper(pcm: bytes, sr: int = cfg.SAMPLE_RATE) -> dict:
             local_only = bool(cfg.WHISPER_MODEL_DIR) or os.environ.get("HF_HUB_OFFLINE") == "1"
             load: dict = {"device": cfg.WHISPER_DEVICE, "compute_type": cfg.WHISPER_COMPUTE}
             if cfg.WHISPER_THREADS > 0:
-                # Lower peak heat on phones; single utterance takes a bit longer.
+                # Cap heat on phones; four threads keeps load + inference fast.
                 load["cpu_threads"] = cfg.WHISPER_THREADS
             try:
                 model = WhisperModel(ref, local_files_only=local_only, **load)
@@ -117,6 +138,11 @@ def transcribe_faster_whisper(pcm: bytes, sr: int = cfg.SAMPLE_RATE) -> dict:
                     )
             _loaded.clear()
             _loaded[key] = model
+    return model, ref
+
+
+def transcribe_faster_whisper(pcm: bytes, sr: int = cfg.SAMPLE_RATE) -> dict:
+    model, ref = _get_faster_whisper_model()
 
     audio = _pcm_to_float(_norm(pcm, sr))
     if audio.size == 0:
@@ -127,6 +153,7 @@ def transcribe_faster_whisper(pcm: bytes, sr: int = cfg.SAMPLE_RATE) -> dict:
         beam_size=cfg.WHISPER_BEAM,
         vad_filter=False,
         condition_on_previous_text=False,
+        without_timestamps=True,
     )
     text = " ".join(s.text.strip() for s in segments).strip()
     return {
@@ -261,11 +288,29 @@ def pick_backend() -> str | None:
     return None
 
 
+def _pcm_rms(pcm: bytes) -> float | None:
+    """Normalised RMS, or None when numpy is unavailable."""
+    try:
+        import numpy as np
+
+        a = np.frombuffer(pcm, dtype="<i2")
+        if a.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(a.astype("float32") ** 2)) / 32768.0)
+    except Exception:
+        return None
+
+
 def transcribe(pcm: bytes, sr: int = cfg.SAMPLE_RATE, backend: str | None = None) -> dict:
     """Transcribe 16-bit mono PCM. Returns {text, backend, model, ms}."""
     backend = backend or pick_backend()
     if not backend:
         raise SttError("no local STT backend available. Install one:  pip install faster-whisper")
+
+    level = _pcm_rms(pcm)
+    if not pcm or (level is not None and level < cfg.STT_MIN_RMS):
+        return {"text": "", "backend": backend, "empty": True, "ms": 0,
+                "rms": round(level or 0.0, 6), "duration_s": round(len(pcm) / 2 / sr, 2)}
 
     t0 = time.time()
     fn = {
@@ -291,8 +336,13 @@ def warmup() -> dict:
         return {"ok": False, "reason": "no backend"}
     t0 = time.time()
     try:
-        # ~0.25 s of silence is enough to force the model to load.
-        transcribe(b"\x00\x00" * (cfg.SAMPLE_RATE // 4), cfg.SAMPLE_RATE, backend=b)
+        if b in ("faster-whisper", "faster_whisper"):
+            # Load the weights only. A dummy transcription would spend another
+            # second decoding silence (and often hallucinate "thank you").
+            _get_faster_whisper_model()
+        else:
+            # Other backends have no separate loader.
+            transcribe(b"\x00\x00" * (cfg.SAMPLE_RATE // 4), cfg.SAMPLE_RATE, backend=b)
         return {"ok": True, "backend": b, "ms": int((time.time() - t0) * 1000)}
     except Exception as e:
         return {"ok": False, "backend": b, "reason": str(e)[:300]}
@@ -308,13 +358,24 @@ def _main(argv: list[str]) -> int:
     if cmd == "warmup":
         print(json.dumps(warmup(), indent=2, default=str))
         return 0
+    if cmd == "fetch":
+        name = argv[2].strip() if len(argv) > 2 and argv[2].strip() else cfg.WHISPER_MODEL
+        cfg.WHISPER_MODEL = name
+        cfg.WHISPER_MODEL_EXPLICIT = True
+        try:
+            _model, ref = _get_faster_whisper_model()
+            print(json.dumps({"ok": True, "model": name, "path": ref}, indent=2, default=str))
+            return 0
+        except Exception as e:
+            print(json.dumps({"ok": False, "model": name, "error": str(e)}, indent=2, default=str))
+            return 1
     if cmd == "file" and len(argv) > 2:
         import jv_audio as audio
 
         pcm, sr, _ = audio.read_wav(argv[2])
         print(json.dumps(transcribe(pcm, sr), indent=2, default=str))
         return 0
-    print("usage: jv_stt.py [info|warmup|file <wav>]", flush=True)
+    print("usage: jv_stt.py [info|warmup|fetch [model]|file <wav>]", flush=True)
     return 2
 
 

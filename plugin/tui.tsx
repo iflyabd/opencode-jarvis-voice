@@ -127,6 +127,25 @@ export default Plugin.define({
           },
         },
         {
+          id: "voice.settings",
+          title: "Voice: settings (Fish Audio / microphone)",
+          group: "Jarvis Voice",
+          palette: true,
+          slash: { name: "voice-settings" },
+          run: async () => {
+            await voice.openSettings()
+          },
+        },
+        {
+          id: "voice.preload",
+          title: "Voice: preload the speech model",
+          group: "Jarvis Voice",
+          palette: true,
+          run: async () => {
+            await voice.preload()
+          },
+        },
+        {
           id: "voice.toggleAutoSpeak",
           title: "Voice: toggle speaking replies",
           group: "Jarvis Voice",

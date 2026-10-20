@@ -4,6 +4,7 @@ Cross-platform audio capture and playback.
 Capture backends, tried in priority order until one actually produces samples:
 
   pulse        parec/pactl      - Parrot chroot + Termux + desktop PulseAudio/PipeWire (honours PULSE_SERVER)
+  pulse-sles   parec + SLES     - Android phone mic, loaded only while recording
   sounddevice  PortAudio        - Windows, macOS, Linux, Termux (if portaudio is installed)
   arecord      ALSA             - plain Linux
   sox          sox/rec          - anywhere sox exists
@@ -140,6 +141,114 @@ def pulse_sources() -> list[str]:
     return names
 
 
+def pulse_default_is_virtual() -> bool:
+    """True when the default source is a pipe/monitor, not real hardware.
+
+    The Termux parrot-audio bridge exposes `parrot_mic` as a module-pipe-source.
+    If its feeder is down, parec opens the pipe but never receives a byte, so
+    trying it first costs a full probe timeout. Prefer the direct SLES source
+    in that case.
+    """
+    default = pulse_default_source()
+    if not default:
+        return False
+    pactl = _which("pactl")
+    if not pactl:
+        return False
+    rc, out, _ = _run([pactl, "list", "short", "sources"], timeout=5)
+    if rc != 0:
+        return False
+    for line in out.decode("utf-8", "replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) > 2 and parts[1] == default:
+            driver = parts[2].lower()
+            return "module-pipe-source" in driver or "monitor" in parts[1].lower()
+    return False
+
+
+def _sles_supported() -> bool:
+    """True when this machine can expose the Android phone mic via SLES."""
+    if cfg.PULSE_SLES_DISABLE:
+        return False
+    if cfg.IS_ANDROID or cfg.IS_TERMUX:
+        return True
+    return os.environ.get("JARVIS_VOICE_SLES_ALLOW", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _sles_module_id(source_name: str) -> str | None:
+    """Module id of a module-sles-source for *source_name*, if one is loaded."""
+    pactl = _which("pactl")
+    if not pactl:
+        return None
+    rc, out, _ = _run([pactl, "list", "short", "modules"], timeout=5)
+    if rc != 0:
+        return None
+    for line in out.decode("utf-8", "replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[1] == "module-sles-source" and f"source_name={source_name}" in parts[2]:
+            return parts[0]
+    return None
+
+
+def _load_sles_module(source_name: str = "") -> str:
+    """Load a private module-sles-source and return its module id."""
+    pactl = _which("pactl")
+    if not pactl:
+        raise AudioError("pactl not installed")
+    name = source_name or cfg.PULSE_SLES_SOURCE
+    old = _sles_module_id(name)
+    if old:
+        _run([pactl, "unload-module", old], timeout=4)
+    rc, out, err = _run(
+        [pactl, "load-module", "module-sles-source", f"source_name={name}",
+         "format=s16le", "rate=48000", "channels=1"],
+        timeout=8,
+    )
+    mid = (out.decode("utf-8", "replace").strip().splitlines() or [""])[-1].strip()
+    if rc != 0 or not mid.isdigit():
+        detail = (err or out).decode("utf-8", "replace").strip().splitlines()
+        raise AudioError(f"module-sles-source failed: {detail[-1] if detail else f'rc={rc}'}")
+    return mid
+
+
+_sles_lock = threading.Lock()
+
+
+def prepare_sles() -> str | None:
+    """Load the phone mic ahead of recording, so pressing PTT is immediate.
+
+    The module stays loaded while the on-demand daemon is alive and is released
+    on daemon shutdown. This removes the ~1 s module-load gap from the start of
+    every utterance.
+    """
+    if not _sles_supported() or not _which("parec") or not _which("pactl"):
+        return None
+    ok, _ = pulse_reachable()
+    if not ok:
+        return None
+    with _sles_lock:
+        mid = _sles_module_id(cfg.PULSE_SLES_SOURCE)
+        if mid:
+            return mid
+        try:
+            return _load_sles_module(cfg.PULSE_SLES_SOURCE)
+        except AudioError:
+            return None
+
+
+def release_sles() -> None:
+    """Unload the phone-mic module loaded by prepare_sles()."""
+    if not _sles_supported():
+        return
+    pactl = _which("pactl")
+    if not pactl:
+        return
+    with _sles_lock:
+        mid = _sles_module_id(cfg.PULSE_SLES_SOURCE)
+        if mid:
+            _run([pactl, "unload-module", mid], timeout=4)
+
+
 # ----------------------------------------------------------------------------
 # Capture
 # ----------------------------------------------------------------------------
@@ -151,6 +260,10 @@ class Capture:
         self.name = name
         self.proc = proc
         self._q: "queue.Queue[bytes]" = queue.Queue(maxsize=96)
+        # Leftover bytes from a pipe chunk. A child writes large chunks, but
+        # callers ask for small VAD blocks; without this buffer most of the
+        # audio was silently discarded after every read.
+        self._buf = bytearray()
         self._err: list[str] = []
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
@@ -172,19 +285,26 @@ class Capture:
             self._err.append(str(e))
 
     def read(self, nbytes: int, timeout: float) -> bytes:
-        buf = bytearray()
+        # Start with whatever was left from the previous (larger) pipe chunk.
+        buf = self._buf
+        self._buf = bytearray()
         deadline = time.time() + timeout
         while len(buf) < nbytes:
             remain = deadline - time.time()
             if remain <= 0:
+                # Keep a partial block so a short hiccup does not lose samples.
+                self._buf = buf
                 raise AudioError(f"{self.name}: no audio within {timeout:.1f}s ({len(buf)}/{nbytes} bytes)")
             try:
                 buf.extend(self._q.get(timeout=min(remain, 0.4)))
             except queue.Empty:
                 if self.proc.poll() is not None:
+                    self._buf = buf
                     raise AudioError(f"{self.name}: {self._failure_detail()}")
                 continue
-        return bytes(buf[:nbytes])
+        out = bytes(buf[:nbytes])
+        self._buf = bytearray(buf[nbytes:])
+        return out
 
     def _failure_detail(self) -> str:
         detail = ""
@@ -226,6 +346,15 @@ def backend_available(name: str) -> tuple[bool, str]:
             return False, "parec not installed"
         ok, why = pulse_reachable()
         return (True, why) if ok else (False, f"pulse unreachable: {why}")
+    if name == "pulse-sles":
+        if not _sles_supported():
+            return False, "SLES phone-mic backend not enabled on this platform"
+        if not _which("parec"):
+            return False, "parec not installed"
+        if not _which("pactl"):
+            return False, "pactl not installed"
+        ok, why = pulse_reachable()
+        return (True, f"{why} (sles)") if ok else (False, f"pulse unreachable: {why}")
     if name == "sounddevice":
         try:
             import sounddevice  # noqa: F401
@@ -272,6 +401,9 @@ def backend_command(name: str, sr: int) -> list[str]:
         if dev:
             cmd.append(f"--device={dev}")
         return cmd
+    if name == "pulse-sles":
+        return [sys.executable, str(SELF), "stream", "--backend", "pulse-sles",
+                "--sr", str(sr), "--device", dev]
     if name == "arecord":
         cmd = [_which("arecord") or "arecord", "-q", "-f", "S16_LE", "-r", str(sr), "-c", "1", "-t", "raw"]
         if dev:
@@ -302,12 +434,16 @@ def backend_command(name: str, sr: int) -> list[str]:
 
 
 def capture_order() -> list[str]:
+    all_backends = ("pulse", "pulse-sles", "termux", "sounddevice", "arecord", "sox", "ffmpeg")
     if cfg.FORCE_CAPTURE_BACKEND:
-        return [cfg.FORCE_CAPTURE_BACKEND] + [b for b in ("pulse", "sounddevice", "arecord", "sox", "ffmpeg", "termux")
-                                              if b != cfg.FORCE_CAPTURE_BACKEND]
-    default = ["pulse", "sounddevice", "arecord", "sox", "ffmpeg", "termux"]
-    android = ["pulse", "termux", "sounddevice", "arecord", "sox", "ffmpeg"]
-    return list(android if cfg.IS_ANDROID else default)
+        return [cfg.FORCE_CAPTURE_BACKEND] + [b for b in all_backends if b != cfg.FORCE_CAPTURE_BACKEND]
+    # Respect a real default (Bluetooth/USB) first. If the default is the
+    # parrot-audio virtual pipe, open the phone mic directly first instead of
+    # waiting for a feeder that may not exist.
+    if cfg.IS_ANDROID or cfg.IS_TERMUX:
+        first = ["pulse-sles", "pulse"] if pulse_default_is_virtual() else ["pulse", "pulse-sles"]
+        return first + [b for b in all_backends if b not in first]
+    return ["pulse"] + [b for b in all_backends if b != "pulse"]
 
 
 def spawn_capture(name: str, sr: int) -> Capture:
@@ -358,13 +494,16 @@ def probe_backend_in_child(name: str, sr: int, timeout: float | None = None) -> 
 def probe_one(name: str, sr: int) -> dict:
     """In-process probe for a single backend. Only safe inside the child process."""
     block_bytes = max(1, int(sr * cfg.BLOCK_MS / 1000)) * 2
+    # A healthy microphone delivers its first block quickly. A dead virtual
+    # pipe returns nothing; cap its wait so probing falls through to SLES.
+    limit = 3.0 if name == "pulse" else cfg.PROBE_TIMEOUT
     cap = spawn_capture(name, sr)
     try:
         buf = bytearray()
-        deadline = time.time() + cfg.PROBE_TIMEOUT
+        deadline = time.time() + limit
         need = block_bytes * 4
         while len(buf) < need and time.time() < deadline:
-            buf.extend(cap.read(block_bytes, timeout=cfg.PROBE_TIMEOUT))
+            buf.extend(cap.read(block_bytes, timeout=limit))
         level = rms(bytes(buf[:need]))
         return {"backend": name, "ok": True, "rms": round(level, 5), "sr": sr, "device": cfg.INPUT_DEVICE}
     finally:
@@ -375,6 +514,7 @@ def probe_capture(sr: int | None = None, save: bool = True) -> dict:
     """Pick the first backend that really delivers samples. Safe to call from the daemon."""
     sr = sr or cfg.SAMPLE_RATE
     tried: list[dict] = []
+    fallback: tuple[str, str, dict] | None = None
     for name in capture_order():
         ok, why = backend_available(name)
         if not ok:
@@ -382,12 +522,27 @@ def probe_capture(sr: int | None = None, save: bool = True) -> dict:
             continue
         res = probe_backend_in_child(name, sr)
         tried.append(res)
-        if res.get("ok"):
+        if not res.get("ok"):
+            continue
+        # A backend can "work" while returning digital silence (e.g. a virtual
+        # pipe with no feeder). Prefer one with actual samples; keep the first
+        # successful backend as a last resort for a genuinely silent room.
+        if fallback is None:
+            fallback = (name, why, res)
+        if float(res.get("rms") or 0.0) > 1e-6:
             result = {"backend": name, "reason": why, "sr": sr, "rms": res.get("rms"),
                       "device": cfg.INPUT_DEVICE, "tried": tried}
             if save:
                 _save_backend(result)
             return result
+
+    if fallback is not None:
+        name, why, res = fallback
+        result = {"backend": name, "reason": why, "sr": sr, "rms": res.get("rms"),
+                  "silent": True, "device": cfg.INPUT_DEVICE, "tried": tried}
+        if save:
+            _save_backend(result)
+        return result
 
     pulse_ok, pulse_why = pulse_reachable()
     result = {
@@ -441,9 +596,14 @@ def open_capture(sr: int | None = None, prefer: str | None = None) -> Capture:
     order = capture_order()
     if prefer:
         order = [prefer] + [b for b in order if b != prefer]
-    elif cached_probe() and cached_probe().get("backend"):
-        best = cached_probe()["backend"]
-        order = [best] + [b for b in order if b != best]
+    else:
+        cached = cached_probe()
+        # Old cache files can point at a virtual source that only produced
+        # silence. Do not trust those; re-probe on the next real recording.
+        if cached and cached.get("backend") and not cached.get("silent") \
+                and float(cached.get("rms") or 0.0) > 1e-6:
+            best = cached["backend"]
+            order = [best] + [b for b in order if b != best]
 
     errors: list[str] = []
     block = max(1, int(sr * cfg.BLOCK_MS / 1000)) * 2
@@ -454,7 +614,20 @@ def open_capture(sr: int | None = None, prefer: str | None = None) -> Capture:
             errors.append(str(e))
             continue
         try:
-            cap.read(block, timeout=cfg.PROBE_TIMEOUT)
+            # Read a few blocks rather than one: a dead virtual source returns
+            # perfectly zero PCM immediately, while a real mic always has some
+            # noise floor. The ~120 ms head is kept for the caller, not dropped.
+            head = bytearray()
+            head_timeout = min(float(cfg.PROBE_TIMEOUT), 3.0)
+            for _ in range(4):
+                head.extend(cap.read(block, timeout=head_timeout))
+            if not any(head):
+                errors.append(f"{name}: silent (no samples)")
+                cap.close()
+                continue
+            # Keep the probe's audio for the actual recording: the caller
+            # normally starts speaking the instant it opens the mic.
+            cap._buf = head + cap._buf
             return cap
         except Exception as e:
             errors.append(f"{name}: {e}"[:200])
@@ -463,6 +636,64 @@ def open_capture(sr: int | None = None, prefer: str | None = None) -> Capture:
             except Exception:
                 pass
     raise AudioError("no capture backend works. " + " | ".join(errors))
+
+
+# A PTT turn opens the mic when the button is pressed, not when the recording
+# thread gets scheduled. Opening a real phone-mic stream can take ~0.7 s; keeping
+# the already-open stream (and the audio it buffered) avoids losing the first
+# word after the "Listening" cue.
+_warm_lock = threading.Lock()
+_warm_cap: Capture | None = None
+_warm_at = 0.0
+
+
+def warm_capture(sr: int | None = None) -> Capture:
+    """Open (or reuse) a capture stream and let it buffer until PTT consumes it."""
+    global _warm_cap, _warm_at
+    sr = sr or cfg.SAMPLE_RATE
+    with _warm_lock:
+        if (_warm_cap is not None and _warm_cap.proc.poll() is None
+                and time.time() - _warm_at < 30):
+            return _warm_cap
+        if _warm_cap is not None:
+            try:
+                _warm_cap.close()
+            except Exception:
+                pass
+            _warm_cap = None
+        _warm_cap = open_capture(sr)
+        _warm_at = time.time()
+        return _warm_cap
+
+
+def take_capture(sr: int | None = None) -> Capture:
+    """Consume the warm PTT stream, or open a fresh one for non-PTT capture."""
+    global _warm_cap
+    sr = sr or cfg.SAMPLE_RATE
+    with _warm_lock:
+        cap = _warm_cap
+        _warm_cap = None
+        if cap is not None and cap.proc.poll() is None:
+            return cap
+        if cap is not None:
+            try:
+                cap.close()
+            except Exception:
+                pass
+    return open_capture(sr)
+
+
+def drop_warm_capture() -> None:
+    """Close an unused warm stream (daemon shutdown / cancelled PTT)."""
+    global _warm_cap
+    with _warm_lock:
+        cap = _warm_cap
+        _warm_cap = None
+    if cap is not None:
+        try:
+            cap.close()
+        except Exception:
+            pass
 
 
 # ----------------------------------------------------------------------------
@@ -545,11 +776,99 @@ def _stream_termux(sr: int, device: str) -> int:
     return 0
 
 
+def _stream_pulse_sles(sr: int, device: str) -> int:
+    """Stream the Android phone mic via PulseAudio's module-sles-source.
+
+    This bypasses fragile virtual pipe sources (and their external feeder
+    daemons) entirely: module-sles-source reads the real phone microphone. The
+    parent daemon may preload the module for a PTT turn and keep it until it
+    exits; otherwise this helper loads the source and unloads it on close.
+    """
+    pactl = _which("pactl")
+    parec = _which("parec")
+    if not pactl or not parec:
+        raise AudioError("pactl and parec are required for the SLES backend")
+
+    name = (device or "").strip()
+    manage = False
+    if not name or name in ("auto", "default", "pulse"):
+        name = cfg.PULSE_SLES_SOURCE
+        manage = True
+    elif name == cfg.PULSE_SLES_SOURCE:
+        manage = True
+
+    module_id = ""
+    if manage:
+        # prepare_sles() may already have loaded the source for this PTT turn.
+        # In that case the parent owns it; do not unload it when this child exits.
+        if _sles_module_id(name):
+            manage = False
+        else:
+            try:
+                module_id = _load_sles_module(name)
+            except AudioError:
+                # The external parrot-audio helper may already hold the hardware
+                # source. Reuse it instead of failing the recording.
+                if "parrot_mic_hw" in pulse_sources():
+                    name = "parrot_mic_hw"
+                    manage = False
+                else:
+                    raise
+
+    cmd = [parec, f"--device={name}", "--format=s16le", f"--rate={sr}",
+           "--channels=1", "--latency-msec=20"]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        bufsize=0,
+    )
+
+    def _stop(_signum, _frame):
+        # Raise through the read loop so the finally block can unload the
+        # source even when the parent terminates this helper.
+        raise SystemExit(0)
+
+    old_term = signal.signal(signal.SIGTERM, _stop)
+    old_int = signal.signal(signal.SIGINT, _stop)
+    out = sys.stdout.buffer
+    try:
+        assert proc.stdout is not None
+        while True:
+            chunk = proc.stdout.read(8192)
+            if not chunk:
+                break
+            try:
+                out.write(chunk)
+                out.flush()
+            except (BrokenPipeError, OSError):
+                break
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if manage and module_id:
+            _run([pactl, "unload-module", module_id], timeout=4)
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGINT, old_int)
+    return 0
+
+
 def _stream(name: str, sr: int, device: str) -> int:
     if name == "sounddevice":
         return _stream_sounddevice(sr, device)
     if name == "termux":
         return _stream_termux(sr, device)
+    if name == "pulse-sles":
+        return _stream_pulse_sles(sr, device)
     raise AudioError(f"backend {name} has no child streamer")
 
 
@@ -790,8 +1109,17 @@ def resample_to(pcm: bytes, sr_from: int, sr_to: int) -> bytes:
 
 
 def list_input_devices() -> dict:
-    out: dict = {"pulse": {"sources": pulse_sources(), "default": pulse_default_source(),
-                           "server": cfg.PULSE_SERVER}}
+    out: dict = {
+        "capture": {
+            "order": capture_order(),
+            "cached": cached_probe(),
+            "input_device": cfg.INPUT_DEVICE,
+            "sles_source": cfg.PULSE_SLES_SOURCE,
+            "sles_available": backend_available("pulse-sles")[0],
+        },
+        "pulse": {"sources": pulse_sources(), "default": pulse_default_source(),
+                  "server": cfg.PULSE_SERVER},
+    }
     try:
         import sounddevice as sd
 

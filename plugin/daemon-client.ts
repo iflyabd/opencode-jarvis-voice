@@ -31,6 +31,13 @@ export type Transcript = {
   stats?: Record<string, unknown>
 }
 
+export type FishOptions = {
+  apiKey: string
+  voiceId: string
+  model?: string
+  latency?: string
+}
+
 export type SpeechStatus = {
   ok?: boolean
   /** True while a local player process is running. */
@@ -248,9 +255,11 @@ export const api = {
   pttCancel: (info: DaemonInfo) => request(info, "/ptt/cancel"),
   listen: (info: DaemonInfo, body: Record<string, unknown> = {}, timeoutMs = 190000) =>
     request<Transcript>(info, "/listen", { body, timeoutMs }),
-  speak: (info: DaemonInfo, text: string, opts: { async?: boolean; backend?: string; timeoutMs?: number } = {}) =>
+  speak: (info: DaemonInfo, text: string, opts: { async?: boolean; backend?: string; fish?: FishOptions; timeoutMs?: number } = {}) =>
     request(info, "/speak", { body: { text, ...opts }, timeoutMs: opts.timeoutMs ?? 190000 }),
-  synth: (info: DaemonInfo, text: string) => request<ArrayBuffer>(info, "/synth", { body: { text }, raw: true }),
+  synth: (info: DaemonInfo, text: string, fish?: FishOptions) =>
+    request<ArrayBuffer>(info, "/synth", { body: { text, fish }, raw: true }),
+  warmup: (info: DaemonInfo) => request(info, "/warmup", { body: {}, timeoutMs: 60000 }),
   speech: (info: DaemonInfo) => getJsonWithAuth<SpeechStatus>(info, "/speech", 4000),
   // These routes take no arguments: send no body so a keep-alive connection
   // never carries unread bytes into the next request on older daemons too.

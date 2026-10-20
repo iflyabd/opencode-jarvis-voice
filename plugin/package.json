@@ -1,9 +1,9 @@
 {
   "name": "opencode-jarvis-voice",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": true,
   "type": "module",
-  "description": "Local voice chat for OpenCode: mic -> Whisper text, Piper voice back. Fully offline.",
+  "description": "Voice chat for OpenCode: mic -> local Whisper text, local Piper voice, optional Fish Audio cloud voices.",
   "exports": {
     ".": "./index.ts",
     "./tui": "./tui.tsx"

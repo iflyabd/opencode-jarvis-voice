@@ -1,8 +1,9 @@
 # Jarvis Voice
 
 **Local voice chat for OpenCode.** Speak to it, it answers out loud — a Piper
-voice in your ear, Whisper ears on your machine. No cloud, no API keys, nothing
-leaves the device.
+voice in your ear, Whisper ears on your machine. Local by default: no cloud,
+no API keys, nothing leaves the device unless you explicitly turn on the
+optional Fish Audio voice.
 
 Press one key, talk, pause, and your words land in the prompt. The reply is
 spoken back in a JARVIS-style voice while it types.
@@ -42,6 +43,8 @@ The daemon owns all the native audio work, which is why the same plugin works
 everywhere. Each capture backend runs in its **own child process**, so a wedged
 ALSA node or a native crash can never take the assistant down — and every read
 has a hard timeout, so a dead device reports an error instead of hanging.
+Speech-to-text is always local. Text-to-speech is local Piper by default, with
+optional Fish Audio cloud voices selected explicitly in settings.
 
 ---
 
@@ -101,8 +104,9 @@ Two ways to run on Android:
 
 1. **Daemon in Parrot (or any Linux), audio from Termux** — what this install
    already does. Termux only has to provide the PulseAudio bridge
-   (`bin/termux-pulse`), and the daemon on the Parrot side uses the
-   `pulse` backend. Everything else (Whisper, Piper) runs in Parrot.
+   (`bin/termux-pulse`), and the daemon on the Parrot side uses the direct
+   `pulse-sles` backend (or `pulse` for a real default source). Everything else
+   (Whisper, Piper) runs in Parrot.
 
 2. **Daemon natively in Termux** — needs its own dependencies:
 
@@ -233,10 +237,38 @@ Reading rules:
 |---|---|
 | `Voice: push to talk` | record a turn (`ctrl+alt+v`) |
 | `Voice: read / pause / resume the reply` | one button for read, pause, resume (`ctrl+alt+p`) |
+| `Voice: settings (Fish Audio / microphone)` | choose the voice provider, API key, voice, and inspect mic/STT |
+| `Voice: preload the speech model` | load Whisper now so the next transcript is fast |
 | `Voice: status` | what mic, STT model, TTS voice are in use |
 | `Voice: cancel listening / stop speaking` | shut it up immediately |
 | `Voice: speak the last reply` | read the current answer out loud |
 | `Voice: toggle speaking replies` | auto-speak the assistant on/off |
+
+### Optional Fish Audio voices
+
+Piper stays the default and works offline. If you want a cloned or library
+voice, Fish Audio can be selected on demand:
+
+1. Open the command palette (`ctrl+p`) and run
+   **`Voice: settings (Fish Audio / microphone)`**, or type `/voice-settings`.
+2. Choose **Fish Audio API key** and paste a key from
+   [fish.audio](https://fish.audio) → API keys.
+3. Choose **Fish Audio voice** to list the voices in your account, search the
+   public Voice Library, or paste a model id directly.
+4. Optional: choose **Fish Audio model**. `s2.1-pro-free` is the default;
+   `s2-pro` is higher quality and uses paid credits.
+5. Choose **Use Fish Audio** (the first menu entry) to make it active.
+   Choose **Use local JARVIS voice** to switch back at any time.
+
+The key is kept in OpenCode's local plugin storage, is sent only to
+`api.fish.audio` over HTTPS, and is never written to the repo, logs, or a
+toast. When Fish is active the **spoken text** is sent to Fish Audio; the mic
+audio and Whisper transcription stay local. If the key or voice is missing,
+the plugin falls back to the local Piper voice rather than silently failing.
+
+Advanced/CLI use can set `JARVIS_VOICE_FISH_KEY`, `JARVIS_VOICE_FISH_VOICE`,
+and `JARVIS_VOICE_FISH_MODEL`; the settings dialog is preferred because it
+stores the key without putting it in a shell history or committed config.
 
 ### Let the agent use voice itself
 
@@ -274,6 +306,22 @@ That starts PulseAudio, bridges it to Android's audio hardware, and opens the
 TCP port so Parrot can record and play. It prints the sources it found and
 whether the default one is a real microphone.
 
+The daemon now opens the **real phone mic directly** through PulseAudio's
+`module-sles-source` over that TCP connection. It does not depend on the
+virtual `parrot_mic` pipe having a working feeder, so a broken `parrot-audio`
+bridge no longer means a silent microphone. The module is loaded when
+push-to-talk starts and released when the daemon exits; between turns the
+source sits idle.
+
+If you already run a `parrot-audio` bridge, leave it alone if it works: the
+daemon prefers a real default source (Bluetooth or USB) and only takes the
+direct phone-mic path when the default is a virtual pipe or produces silence.
+If an old bridge watchdog is rebuilding PulseAudio in a loop, stop the
+watchdog; the direct path keeps working without it.
+
+Then, from Parrot: `./bin/voice doctor` should show a microphone backend
+(`pulse-sles` on the reference setup).
+
 Keep it alive across reboots with Termux:Boot — create
 `~/.termux/boot/jarvis-voice.sh`:
 
@@ -283,7 +331,7 @@ termux-wake-lock
 sh /path/to/jarvis-voice/bin/termux-pulse
 ```
 
-Then, from Parrot: `./bin/voice doctor` should show a microphone backend.
+After rebooting, `./bin/voice doctor` should still show the phone mic.
 
 <details>
 <summary>How the audio backends are chosen</summary>
@@ -294,13 +342,20 @@ choice is cached in `~/.cache/jarvis-voice/backend.json`.
 | Backend | Where it applies |
 |---|---|
 | `pulse` | Parrot chroot, Termux, any PulseAudio/PipeWire desktop |
+| `pulse-sles` | Android phone mic via PulseAudio `module-sles-source`; loaded on demand |
 | `termux` | Android via Termux:API (`pkg install termux-api`) |
 | `sounddevice` | Windows, macOS, Linux, Termux with `pkg install portaudio` |
 | `arecord` | plain Linux (ALSA) |
 | `sox` | anywhere sox is installed |
 | `ffmpeg` | last resort; knows pulse, alsa, dshow, avfoundation |
 
-Force one with `JARVIS_VOICE_CAPTURE_BACKEND=pulse`, or re-probe with
+On Android a real default source (Bluetooth/USB) is tried first. If the
+default is a virtual pipe or produces only digital silence, the direct phone
+mic is tried next. A backend that "works" but returns silence is skipped
+instead of being cached as the microphone.
+
+Force one with `JARVIS_VOICE_CAPTURE_BACKEND=pulse` or
+`JARVIS_VOICE_CAPTURE_BACKEND=pulse-sles`, or re-probe with
 `./bin/voice audio probe`. Playback uses the same philosophy
 (`paplay` → `aplay` → `ffplay` → `play` → `sounddevice` → Android media player).
 
@@ -333,18 +388,24 @@ Everything is an environment variable, read at daemon start:
 | `JARVIS_VOICE_PORT` | `8765` | daemon port (auto-increments if taken) |
 | `JARVIS_VOICE_PYTHON` | auto-detected | interpreter to run the daemon with |
 | `JARVIS_VOICE_INPUT_DEVICE` | auto | device index, name, or pulse source |
-| `JARVIS_VOICE_CAPTURE_BACKEND` | auto | force `pulse`, `sounddevice`, `termux`, … |
-| `JARVIS_VOICE_WHISPER_MODEL` | `tiny` | `tiny`, `base`, `small`, `medium`, `large-v3` |
+| `JARVIS_VOICE_CAPTURE_BACKEND` | auto | force `pulse`, `pulse-sles`, `sounddevice`, `termux`, … |
+| `JARVIS_VOICE_SLES` | `1` | set `0` to disable the direct Android phone-mic backend |
+| `JARVIS_VOICE_SLES_SOURCE` | `jarvis_mic` | PulseAudio source name used for the direct phone mic |
+| `JARVIS_VOICE_WHISPER_MODEL` | `tiny.en` | `tiny.en`, `tiny` (multilingual), `base`, `small`, `medium`, `large-v3` |
 | `JARVIS_VOICE_WHISPER_DIR` | — | local model folder, for purely offline use |
 | `JARVIS_VOICE_LANGUAGE` | auto | e.g. `en` to skip detection |
 | `JARVIS_VOICE_PIPER_VOICE` | auto | explicit `.onnx` path or voice name |
 | `JARVIS_VOICE_TTS` | auto | `piper`, `piper-bin`, `espeak`, `none` |
+| `JARVIS_VOICE_FISH_KEY` | — | optional Fish Audio key; the settings dialog is preferred |
+| `JARVIS_VOICE_FISH_VOICE` | — | optional Fish Audio voice/model id |
+| `JARVIS_VOICE_FISH_MODEL` | `s2.1-pro-free` | Fish TTS model header |
+| `JARVIS_VOICE_FISH_LATENCY` | `balanced` | `balanced`, `normal`, or `low` |
 | `JARVIS_VOICE_VAD_THRESHOLD` | `0.012` | raise it in a noisy room |
 | `JARVIS_VOICE_VAD_SILENCE_MS` | `900` | silence that ends a turn |
 | `JARVIS_VOICE_LENGTH_SCALE` | `1.0` | Piper speed; `1.1` is a touch slower |
 | `JARVIS_VOICE_IDLE_EXIT_S` | `300` | exit after this long with nothing to do; `0` stays resident |
 | `JARVIS_VOICE_WARMUP` | `lazy` | `lazy` \| `boot` \| `off` — when the STT model is loaded |
-| `JARVIS_VOICE_WHISPER_THREADS` | `0` (auto) | cap Whisper's CPU threads; `2` keeps a phone cooler |
+| `JARVIS_VOICE_WHISPER_THREADS` | `4` on Android, `0` elsewhere | cap Whisper's CPU threads; `2` keeps a phone cooler |
 
 The daemon writes `~/.cache/jarvis-voice/daemon.json` (URL + token, mode 600).
 Requests are authenticated with that token, so other local processes cannot
@@ -359,6 +420,10 @@ Nothing runs unless you use it:
 * **Cheap boot** — under a second, no model loading. The STT model is warmed
   in the background when push-to-talk starts (a transcription is coming
   anyway), so CPU work happens while you speak, never while it sits idle.
+* **Mic only while needed** — the direct phone-mic source is loaded when the
+  first push-to-talk starts, sits idle between turns, and is unloaded when the
+  daemon exits. The first press pays a short (~1 s) module-load cost; later
+  presses in the same session take only a fraction of a second.
 * **Exits when idle** — after `JARVIS_VOICE_IDLE_EXIT_S` seconds (default
   300) with no real activity it stops on its own, returning the loaded
   model's memory to the system. Status polls (`/speech`, `/ptt/state`,
@@ -371,7 +436,7 @@ Nothing runs unless you use it:
   silence.
 
 Measured on the reference Android/Parrot setup: idle daemon **~56 MB RSS**,
-zero wake-ups beyond a 2 s shutdown check; with the `tiny` model loaded
+zero wake-ups beyond a 2 s shutdown check; with the `tiny.en` model loaded
 **~210 MB** until the idle exit frees it.
 
 Tuning:
@@ -403,6 +468,11 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
 | `mic` | `true` | show the 🎙 mic button in the prompt footer |
 | `speak` | `true` | show the 🔊 read / pause button above the text box |
 | `autoSpeak` | `true` | speak replies automatically after push-to-talk starts the turn |
+| `fishAudio` | — | optional `{ provider, apiKey, voiceId, voiceName, model }`; the settings dialog is safer for keys |
+
+The **`Voice: settings`** dialog is the normal way to configure Fish Audio:
+it stores the key in OpenCode's local plugin storage, masks it in the UI, and
+lets you switch back to the local Piper voice without editing config files.
 
 ### HTTP API
 
@@ -415,26 +485,45 @@ token from `~/.cache/jarvis-voice/daemon.json`:
 | `POST /ptt/start` · `POST /ptt/stop` · `POST /ptt/cancel` · `GET /ptt/state` | push-to-talk session |
 | `POST /listen` | record one utterance, return the transcript |
 | `POST /transcribe` | raw PCM/WAV in, text out |
-| `POST /speak` | synthesize + play (`{text, async}`) |
-| `POST /synth` | synthesize only, returns `audio/wav` |
+| `POST /speak` | synthesize + play (`{text, async?, backend?, fish?}`) |
+| `POST /synth` | synthesize only, returns `audio/wav` or `audio/mpeg` |
+| `POST /warmup` | load the STT model now (no audio) |
 | `GET /speech` | what the speakers are doing now (`active`, `paused`, `elapsed_ms`) |
 | `POST /pause` · `POST /resume` | suspend / continue the current playback (`SIGSTOP` / `SIGCONT`) |
 | `POST /interrupt` | stop capture and playback |
 | `POST /probe` · `POST /shutdown` | re-probe the audio, stop the daemon |
 
-### Speech-to-text quality
+### Speech-to-text speed & quality
 
-The default `tiny` model is chosen because it is already cached and runs offline
-immediately — it transcribes clean Piper speech perfectly. For noisy rooms or
-accents, a larger model is noticeably better:
+The default is `tiny.en` (English): it is roughly twice as fast as multilingual
+`tiny` and more accurate for English. The model is warmed when push-to-talk
+starts, while you are speaking, so the first real decode is not paying the full
+load cost. On the reference arm64 phone a 1.5 s clip transcribes in about
+0.6–0.7 s once the model is loaded; a cold model load is about 0.5 s from the
+page cache (a few seconds on a completely cold start).
+
+If an older install only has multilingual `tiny` cached, the daemon uses that
+instead of downloading `tiny.en` silently, so upgrades keep working offline.
+Run `./bin/voice fetch-model tiny.en` once to get the faster English weights.
+Setting `JARVIS_VOICE_WHISPER_MODEL` explicitly always honours your choice.
+
+`tiny.en` is English-only. For another language use multilingual `tiny`, or a
+larger model for noisy rooms and accents:
 
 ```bash
-export JARVIS_VOICE_WHISPER_MODEL=base    # or small / medium
+export JARVIS_VOICE_WHISPER_MODEL=tiny      # multilingual
+export JARVIS_VOICE_WHISPER_MODEL=base      # better accuracy, ~2x slower
 ./bin/voice restart
 ```
 
-On this arm64 device expect roughly real-time with `tiny`; `base` is about
-twice as slow. Piper's `low` voices are also faster than `medium` if you want a
+A near-silence guard runs before Whisper, so a muted or dead microphone
+returns an empty transcript instead of Whisper's “thank you” hallucinations.
+The daemon also rejects a capture backend that returns pure digital silence,
+which is how the silent `parrot_mic` pipe is bypassed automatically.
+
+On Android four Whisper threads are used by default for speed. Set
+`JARVIS_VOICE_WHISPER_THREADS=2` if the phone gets warm during long
+dictations. Piper's `low` voices are also faster than `medium` if you want a
 snappier reply.
 
 ---
@@ -474,16 +563,19 @@ optional accelerants that the daemon reports on and degrades without.
 
 | Symptom | Fix |
 |---|---|
-| `microphone unavailable` | `bash bin/termux-pulse` inside Termux, then `./bin/voice audio probe` |
+| `microphone unavailable` | in Termux run `sh bin/termux-pulse` (PulseAudio + TCP), then `./bin/voice audio probe`; the daemon loads the phone mic directly |
+| The old `parrot_mic` is silent | the daemon bypasses a dead virtual pipe and uses `pulse-sles`; if a bridge watchdog keeps rebuilding PulseAudio, stop that watchdog |
 | `no local TTS backend` | `./bin/voice voice fetch en_GB-alan-medium` |
 | espeak voice instead of Piper | no voice found — `./bin/voice voice list` |
-| It hears you but the transcript is wrong | bigger model: `JARVIS_VOICE_WHISPER_MODEL=base` |
+| It hears you but the transcript is wrong | bigger model: `JARVIS_VOICE_WHISPER_MODEL=base`; `tiny.en` is English-only |
+| Fish Audio says key/voice not set | `ctrl+p` → **Voice: settings**, add the API key, then choose a voice |
+| Fish Audio HTTP 401/402 | check the key on fish.audio; the free model may need credit for some voices |
 | It cuts you off too early | `JARVIS_VOICE_VAD_SILENCE_MS=1500` |
 | It triggers on background noise | `JARVIS_VOICE_VAD_THRESHOLD=0.02` |
 | The key does nothing | restart OpenCode; confirm `voice.pushToTalk` in `ctrl+p` |
 | The buttons are missing | restart OpenCode; `opencode plugin list` should show this folder |
 | `⏸ pause` does nothing | the daemon is older than the plugin — `./bin/voice restart` |
 | It reads the wrong text | it reads only the last answer's final text part; if a turn is still running, wait for it to finish |
-| First voice action after a quiet spell takes ~1 s | that is the daemon starting again — normal on battery; `JARVIS_VOICE_IDLE_EXIT_S=0` avoids it |
+| First push-to-talk after a quiet spell takes ~1 s | the daemon and phone-mic module are starting; later turns in the same session take only a fraction of a second. `JARVIS_VOICE_IDLE_EXIT_S=0` keeps it ready |
 | Keep it resident for a long session | `JARVIS_VOICE_IDLE_EXIT_S=0 ./bin/voice restart` |
 | Nothing at all | `./bin/voice doctor` — it names the broken part and the fix |

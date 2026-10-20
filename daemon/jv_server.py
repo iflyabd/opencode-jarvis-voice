@@ -14,8 +14,9 @@ Endpoints (JSON unless noted):
   GET  /ptt/state         current push-to-talk state
   POST /listen            blocking capture + transcribe     {max_ms?, silence_ms?, ...}
   POST /transcribe        raw 16-bit mono PCM or WAV body   -> {text}
-  POST /speak             synthesize + play locally         {text, async?}
-  POST /synth             synthesize only, returns audio/wav
+  POST /speak             synthesize + play locally         {text, async?, backend?, fish?}
+  POST /synth             synthesize only, returns audio/wav or audio/mpeg
+  POST /warmup            load the STT model now (no audio)
   GET  /speech            what the speakers are doing now (playing/paused)
   POST /pause             suspend the current playback (SIGSTOP)
   POST /resume            continue a paused playback (SIGCONT)
@@ -96,7 +97,7 @@ def record_utterance(
     silence_blocks_needed = max(1, int(silence_ms / cfg.BLOCK_MS))
     min_speech_blocks = max(1, int(min_speech_ms / cfg.BLOCK_MS))
 
-    t0 = time.time()
+    t_start = time.time()
     frames: list[bytes] = []
     speech_blocks = 0
     silent_run = 0
@@ -106,7 +107,13 @@ def record_utterance(
     reason = "max"
 
     with _rec_lock:
-        cap = audio.open_capture(sr)
+        # Load the phone mic before starting the recording clock. Otherwise the
+        # module-load time (often ~1 s) eats into max_ms and truncates short
+        # push-to-talk turns.
+        if cfg.IS_ANDROID:
+            audio.prepare_sles()
+        cap = audio.take_capture(sr)
+        t0 = time.time()
         try:
             # -- wait for speech to begin ------------------------------------
             wait_deadline = t0 + start_timeout_ms / 1000.0
@@ -155,7 +162,9 @@ def record_utterance(
     pcm = b"".join(frames)
     stats = {
         "reason": reason,
-        "ms": int((time.time() - t0) * 1000),
+        "ms": int((time.time() - t_start) * 1000),
+        "open_ms": int((t0 - t_start) * 1000),
+        "record_ms": int((time.time() - t0) * 1000),
         "audio_ms": int(len(pcm) / 2 / sr * 1000),
         "rms": round(audio.rms(pcm), 5),
         "peak": round(peak, 5),
@@ -181,6 +190,7 @@ class PttSession:
         self.state = "listening"      # listening -> transcribing -> done | error | cancelled
         self.result: dict | None = None
         self.error: str | None = None
+        self._cancelled = False
         self._done = threading.Event()
         self._thread = threading.Thread(target=self._run, args=(max_ms,), daemon=True)
         self._thread.start()
@@ -188,7 +198,7 @@ class PttSession:
     def _run(self, max_ms: int | None) -> None:
         try:
             utt = record_utterance(max_ms=max_ms, stop_event=self.stop_event)
-            if utt.stats.get("reason") == "cancelled":
+            if self._cancelled or utt.stats.get("reason") == "cancelled":
                 self.state = "cancelled"
                 self._done.set()
                 return
@@ -200,11 +210,18 @@ class PttSession:
                 return
             self.state = "transcribing"
             res = stt.transcribe(utt.pcm, utt.sr)
+            if self._cancelled:
+                self.state = "cancelled"
+                self.result = None
+                return
             res["stats"] = utt.stats
             res["empty"] = not res.get("text")
             self.result = res
             self.state = "done"
         except Exception as e:
+            if self._cancelled:
+                self.state = "cancelled"
+                return
             self.error = f"{type(e).__name__}: {e}"
             self.state = "error"
         finally:
@@ -219,6 +236,7 @@ class PttSession:
         return {"id": self.id, "state": self.state, "result": self.result}
 
     def cancel(self) -> None:
+        self._cancelled = True
         self.stop_event.set()
         self._done.wait(timeout=10)
 
@@ -445,6 +463,16 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._json_body()
                 if _state["ptt"] and _state["ptt"].state in ("listening", "transcribing"):
                     _state["ptt"].cancel()
+                # Block until the phone mic is ready. The UI only flips to
+                # "Listening..." after this response, so the stream is already
+                # buffering by the time the user starts speaking. prepare_sles
+                # keeps the module parent-owned between turns, so later PTT
+                # presses do not pay the module-load cost again.
+                # Start each PTT turn with a fresh buffered stream.
+                audio.drop_warm_capture()
+                if cfg.IS_ANDROID:
+                    audio.prepare_sles()
+                audio.warm_capture(cfg.SAMPLE_RATE)
                 _state["ptt"] = PttSession(max_ms=body.get("max_ms") or body.get("maxMs"))
                 _maybe_warm_stt()
                 return self._send(200, {"ok": True, "ptt": _state["ptt"].snapshot()})
@@ -498,8 +526,16 @@ class Handler(BaseHTTPRequestHandler):
                 text = (body.get("text") or "").strip()
                 if not text:
                     return self._send(400, {"error": "text required"})
-                out = tts.speak(text, backend=body.get("backend"), wait=not bool(body.get("async")))
+                fish = body.get("fish") if isinstance(body.get("fish"), dict) else None
+                out = tts.speak(text, backend=body.get("backend"),
+                                wait=not bool(body.get("async")), fish=fish)
                 _state["speech"] = {"text": text, "backend": out.get("backend"), "started_at": time.time()}
+                return self._send(200, {"ok": True, **out})
+
+            if path == "/warmup":
+                out = stt.warmup()
+                if not out.get("ok"):
+                    return self._send(503, {"error": out.get("reason") or "warmup failed", **out})
                 return self._send(200, {"ok": True, **out})
 
             if path == "/pause":
@@ -515,9 +551,11 @@ class Handler(BaseHTTPRequestHandler):
                 text = (body.get("text") or "").strip()
                 if not text:
                     return self._send(400, {"error": "text required"})
-                info = tts.synthesize(text, backend=body.get("backend"))
+                fish = body.get("fish") if isinstance(body.get("fish"), dict) else None
+                info = tts.synthesize(text, backend=body.get("backend"), fish=fish)
                 data = Path(info["path"]).read_bytes()
-                return self._send(200, data, ctype="audio/wav")
+                ctype = "audio/mpeg" if str(info.get("path", "")).endswith(".mp3") else "audio/wav"
+                return self._send(200, data, ctype=ctype)
 
             if path == "/interrupt":
                 sess = _state["ptt"]
@@ -638,6 +676,11 @@ def serve(host: str, port: int, probe: bool = True) -> int:
         threading.Thread(target=_idle_watchdog, daemon=True).start()
 
     def _bye(*_a):
+        try:
+            audio.drop_warm_capture()
+            audio.release_sles()
+        except Exception:
+            pass
         cfg.clear_runtime()
         try:
             httpd.shutdown()
@@ -655,6 +698,11 @@ def serve(host: str, port: int, probe: bool = True) -> int:
         # which is the point on battery. Incoming requests still wake it at once.
         httpd.serve_forever(poll_interval=2.0)
     finally:
+        try:
+            audio.drop_warm_capture()
+            audio.release_sles()
+        except Exception:
+            pass
         cfg.clear_runtime()
     return 0
 

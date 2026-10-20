@@ -17,12 +17,24 @@
  */
 
 import { createSignal, type Accessor } from "solid-js"
-import { DaemonError, api, ensureDaemon, summarize, type DaemonInfo, type Health } from "./daemon-client"
+import { DaemonError, api, ensureDaemon, summarize, type DaemonInfo, type FishOptions, type Health } from "./daemon-client"
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 export type MicState = "idle" | "listening" | "transcribing"
 export type SpeechState = "idle" | "playing" | "paused"
+
+type VoiceSettings = {
+  ttsProvider: "local" | "fish"
+  fishApiKey: string
+  fishVoiceId: string
+  fishVoiceName: string
+  fishModel: string
+}
+
+type FishVoice = { id: string; title: string; description?: string }
+
+const FISH_MODEL = "s2.1-pro-free"
 
 export type VoiceController = ReturnType<typeof createVoiceController>
 
@@ -222,6 +234,63 @@ export function createVoiceController(context: any) {
     }
   }
 
+  /* ------------------------------------------------------------- settings */
+
+  const optionFish = context.options?.fishAudio ?? context.options?.fish ?? {}
+  const seedSettings: VoiceSettings = {
+    ttsProvider: String(optionFish.provider ?? context.options?.ttsProvider ?? "local") === "fish" ? "fish" : "local",
+    fishApiKey: String(optionFish.apiKey ?? context.options?.fishApiKey ?? ""),
+    fishVoiceId: String(optionFish.voiceId ?? context.options?.fishVoiceId ?? ""),
+    fishVoiceName: String(optionFish.voiceName ?? ""),
+    fishModel: String(optionFish.model ?? context.options?.fishModel ?? FISH_MODEL),
+  }
+
+  // context.storage is durable and shared between TUI instances; keep a plain
+  // object fallback so the controller also works in the server-side plugin.
+  let settings: VoiceSettings = seedSettings
+  let saveSettings: (mutation: (draft: VoiceSettings) => void) => Promise<void> = async (mutation) => {
+    mutation(settings)
+  }
+  try {
+    if (context?.storage?.store) {
+      const pair = context.storage.store("jarvis-voice.settings.v1", { initial: seedSettings })
+      const [stored, setStored] = pair as [
+        VoiceSettings,
+        (mutation: (draft: VoiceSettings) => void) => Promise<void>,
+      ]
+      settings = stored
+      saveSettings = setStored
+    }
+  } catch {
+    /* storage unavailable: settings stay in memory for this TUI */
+  }
+
+  async function persist(mutation: (draft: VoiceSettings) => void): Promise<void> {
+    try {
+      await saveSettings(mutation)
+    } catch (e) {
+      toast(`Could not save voice settings: ${errorText(e)}`, "error")
+    }
+  }
+
+  function maskKey(key: string): string {
+    const value = (key || "").trim()
+    if (!value) return "not set"
+    return value.length <= 4 ? "set" : `••••${value.slice(-4)}`
+  }
+
+  function ttsRequest(): { backend?: string; fish?: FishOptions } {
+    const key = (settings.fishApiKey || "").trim()
+    const voiceId = (settings.fishVoiceId || "").trim()
+    if (settings.ttsProvider === "fish" && key && voiceId) {
+      return {
+        backend: "fish",
+        fish: { apiKey: key, voiceId, model: (settings.fishModel || FISH_MODEL).trim() },
+      }
+    }
+    return {}
+  }
+
   async function daemon(start = true): Promise<DaemonInfo | null> {
     try {
       return await ensureDaemon({ start })
@@ -234,6 +303,290 @@ export function createVoiceController(context: any) {
     const info = await daemon(true)
     if (!info) toast("voice daemon unavailable — run `voice up` in the jarvis-voice folder", "error")
     return info
+  }
+
+  /* ----------------------------------------------------------- fish audio */
+
+  async function fetchFishVoices(apiKey: string, query = "", selfOnly = true): Promise<FishVoice[]> {
+    const url = new URL("https://api.fish.audio/model")
+    url.searchParams.set("page_size", "50")
+    url.searchParams.set("page_number", "1")
+    // Fish's API calls this `self`; the SDK exposes it as self_only.
+    if (selfOnly) url.searchParams.set("self", "true")
+    if (query.trim()) url.searchParams.set("title", query.trim())
+
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 20000)
+    try {
+      const res = await fetch(url.toString(), {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: ctrl.signal,
+      })
+      const text = await res.text()
+      let data: any = {}
+      try {
+        data = JSON.parse(text)
+      } catch {
+        /* non-JSON error body */
+      }
+      if (!res.ok) {
+        const detail = data?.message || data?.error || text.slice(0, 180) || `HTTP ${res.status}`
+        throw new Error(`Fish Audio ${res.status}: ${detail}`)
+      }
+      const items = Array.isArray(data?.items) ? data.items : []
+      return items
+        .map((v: any) => ({
+          id: String(v?._id ?? v?.id ?? ""),
+          title: String(v?.title ?? v?.name ?? v?._id ?? "voice"),
+          description: [v?.description, Array.isArray(v?.languages) ? v.languages.join(", ") : v?.language, v?.state]
+            .filter(Boolean)
+            .join(" · "),
+        }))
+        .filter((v: FishVoice) => v.id)
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async function setFishKey(): Promise<boolean> {
+    if (!context.ui?.dialog?.prompt) return false
+    const key = await context.ui.dialog.prompt({
+      title: "Fish Audio API key",
+      description: settings.fishApiKey
+        ? `Current: ${maskKey(settings.fishApiKey)}. Paste a new key to replace it.`
+        : "Create a key at fish.audio → API keys. It is stored locally by OpenCode, never committed.",
+      placeholder: "paste your Fish Audio API key",
+    })
+    if (key === undefined) return false
+    const trimmed = key.trim()
+    if (!trimmed) {
+      toast("Fish Audio key unchanged", "info")
+      return false
+    }
+    await persist((draft) => {
+      draft.fishApiKey = trimmed
+      if (!draft.fishModel) draft.fishModel = FISH_MODEL
+    })
+    toast("Fish Audio key saved. Now choose a voice.", "success")
+    return true
+  }
+
+  async function promptManualFishVoice(): Promise<void> {
+    const voiceId = await context.ui.dialog.prompt({
+      title: "Fish Audio voice id",
+      description: "Paste the model id from a fish.audio voice URL (/m/<id>).",
+      placeholder: "voice model id",
+    })
+    if (voiceId === undefined || !voiceId.trim()) return
+    await persist((draft) => {
+      draft.fishVoiceId = voiceId.trim()
+      draft.fishVoiceName = voiceId.trim()
+      draft.ttsProvider = "fish"
+    })
+    toast("Fish Audio voice saved", "success")
+  }
+
+  async function chooseFishVoice(publicSearch = false): Promise<void> {
+    if (!(settings.fishApiKey || "").trim()) {
+      const saved = await setFishKey()
+      if (!saved) return
+    }
+
+    let query = ""
+    if (publicSearch) {
+      const asked = await context.ui.dialog.prompt({
+        title: "Search Fish Audio voices",
+        description: "Search the public Voice Library, e.g. jarvis, narrator, British male.",
+        placeholder: "search text (leave blank for popular voices)",
+      })
+      if (asked === undefined) return
+      query = asked.trim()
+    }
+
+    let voices: FishVoice[] = []
+    try {
+      voices = await fetchFishVoices((settings.fishApiKey || "").trim(), query, !publicSearch)
+    } catch (e) {
+      toast(errorText(e), "error")
+      await promptManualFishVoice()
+      return
+    }
+
+    const options: Array<{ title: string; value: string; description?: string }> = [
+      { title: "Paste a voice id manually…", value: "__manual__", description: "Use any Fish Audio model id" },
+    ]
+    if (!publicSearch) {
+      options.push({ title: "Search the public Voice Library…", value: "__search__" })
+    }
+    for (const v of voices) {
+      options.push({
+        title: v.title || v.id,
+        value: v.id,
+        description: [v.id, v.description].filter(Boolean).join(" · "),
+      })
+    }
+    if (!voices.length) {
+      toast("No voices found. Searching the public library may help.", "warning")
+    }
+
+    const picked: string | undefined = await context.ui.dialog.select({
+      title: publicSearch ? "Fish Audio public voices" : "Your Fish Audio voices",
+      placeholder: "Type to filter, then choose a voice",
+      options,
+      current: settings.fishVoiceId || undefined,
+    })
+    if (picked === undefined) return
+    if (picked === "__manual__") {
+      await promptManualFishVoice()
+      return
+    }
+    if (picked === "__search__") {
+      await chooseFishVoice(true)
+      return
+    }
+    const voice = voices.find((v) => v.id === picked)
+    await persist((draft) => {
+      draft.fishVoiceId = picked
+      draft.fishVoiceName = voice?.title || picked
+      draft.ttsProvider = "fish"
+    })
+    toast(`Fish Audio voice: ${voice?.title || picked}`, "success")
+  }
+
+  async function showVoiceInfo(kind: "mic" | "stt" | "status"): Promise<void> {
+    const info = await daemonOrToast()
+    if (!info) return
+    try {
+      const h: Health = await api.health(info, true)
+      if (kind === "status") {
+        toast(summarize(h), "info")
+        return
+      }
+      if (kind === "mic") {
+        const cap: any = h.audio?.capture
+        toast(
+          cap?.backend
+            ? `Microphone: ${cap.backend}${cap.rms != null ? ` (level ${Number(cap.rms).toFixed(3)})` : ""}`
+            : "No working microphone found",
+          cap?.backend ? "info" : "error",
+        )
+        return
+      }
+      const picked = h.stt?.backends?.find((b: any) => b.backend === h.stt?.picked)
+      const model = picked?.model ? String(picked.model).split("/").pop() : ""
+      toast(`Transcription: ${h.stt?.picked ?? "none"}${model ? ` · ${model}` : ""} · local`, "info")
+    } catch (e) {
+      toast(errorText(e), "error")
+    }
+  }
+
+  async function openSettings(): Promise<void> {
+    if (!context.ui?.dialog?.select) {
+      toast("Settings need the interactive TUI", "warning")
+      return
+    }
+    for (;;) {
+      const provider = settings.ttsProvider === "fish" ? "fish" : "local"
+      const key = (settings.fishApiKey || "").trim()
+      const voice = settings.fishVoiceName || settings.fishVoiceId || "not chosen"
+      const choice: string | undefined = await context.ui.dialog.select({
+        title: "Jarvis Voice settings",
+        placeholder: "Choose a setting",
+        options: [
+          {
+            title: provider === "fish" ? "Fish Audio (active)" : "Use Fish Audio",
+            value: "fish",
+            description: key ? `key ${maskKey(key)} · voice ${voice}` : "Add an API key, then choose a voice",
+          },
+          {
+            title: provider === "local" ? "Local JARVIS voice (active)" : "Use local JARVIS voice",
+            value: "local",
+            description: "Piper, fully offline",
+          },
+          { title: "Fish Audio API key", value: "key", description: key ? `Current: ${maskKey(key)}` : "Not set" },
+          { title: "Fish Audio voice", value: "voice", description: voice },
+          { title: "Fish Audio model", value: "model", description: settings.fishModel || FISH_MODEL },
+          {
+            title: "Search Fish Audio's public voices",
+            value: "search",
+            description: "Find a voice in the library after setting the key",
+          },
+          {
+            title: "Microphone",
+            value: "mic",
+            description: "Automatic: direct phone mic on Android, default mic elsewhere",
+          },
+          { title: "Transcription", value: "stt", description: "Local Whisper, warmed while you speak" },
+          { title: "Show voice status", value: "status" },
+        ],
+      })
+      if (choice === undefined) return
+
+      if (choice === "fish") {
+        if (!key) {
+          await setFishKey()
+          if (!(settings.fishApiKey || "").trim()) continue
+        }
+        if (!settings.fishVoiceId) {
+          await chooseFishVoice()
+          if (!settings.fishVoiceId) continue
+        }
+        await persist((draft) => {
+          draft.ttsProvider = "fish"
+        })
+        toast("Fish Audio will read replies. Spoken text is sent to Fish Audio.", "success")
+      } else if (choice === "local") {
+        await persist((draft) => {
+          draft.ttsProvider = "local"
+        })
+        toast("Using the local JARVIS voice", "success")
+      } else if (choice === "key") {
+        const saved = await setFishKey()
+        if (saved && !settings.fishVoiceId) await chooseFishVoice()
+      } else if (choice === "voice") {
+        await chooseFishVoice()
+      } else if (choice === "search") {
+        await chooseFishVoice(true)
+      } else if (choice === "model") {
+        const model: string | undefined = await context.ui.dialog.select({
+          title: "Fish Audio model",
+          placeholder: "Choose the TTS model",
+          current: settings.fishModel || FISH_MODEL,
+          options: [
+            {
+              title: "s2.1-pro-free",
+              value: "s2.1-pro-free",
+              description: "Free tier; good default",
+            },
+            {
+              title: "s2-pro",
+              value: "s2-pro",
+              description: "Higher quality; uses Fish credits",
+            },
+            { title: "s1", value: "s1", description: "Older model" },
+          ],
+        })
+        if (model) {
+          await persist((draft) => {
+            draft.fishModel = model
+          })
+          toast(`Fish Audio model: ${model}`, "success")
+        }
+      } else if (choice === "mic" || choice === "stt" || choice === "status") {
+        await showVoiceInfo(choice)
+      }
+    }
+  }
+
+  async function preload(): Promise<void> {
+    const info = await daemonOrToast()
+    if (!info) return
+    try {
+      await api.warmup(info)
+      toast("Speech model ready — transcription will be quick", "success")
+    } catch (e) {
+      toast(`Could not warm the speech model: ${errorText(e)}`, "error")
+    }
   }
 
   /* ------------------------------------------------------------ speech state */
@@ -322,7 +675,7 @@ export function createVoiceController(context: any) {
     const info = await daemonOrToast()
     if (!info) return false
     try {
-      await api.speak(info, text, { async: true })
+      await api.speak(info, text, { async: true, ...ttsRequest() })
       setSpeakingMessage(null)
       setSpeechState("playing")
       watchSpeech()
@@ -352,7 +705,7 @@ export function createVoiceController(context: any) {
       }
       const info = await daemonOrToast()
       if (!info) return
-      await api.speak(info, text, { async: true })
+      await api.speak(info, text, { async: true, ...ttsRequest() })
       setSpeakingMessage(answer.id ?? null)
       setSpeechState("playing")
       watchSpeech()
@@ -388,7 +741,7 @@ export function createVoiceController(context: any) {
         // Stop it first so the new read starts at the beginning.
         await api.interrupt(info).catch(() => undefined)
       }
-      await api.speak(info, text, { async: true })
+      await api.speak(info, text, { async: true, ...ttsRequest() })
       setSpeakingMessage(messageID)
       setSpeechState("playing")
       watchSpeech()
@@ -494,7 +847,7 @@ export function createVoiceController(context: any) {
     const toSay = speakable(answer.text)
     if (!toSay) return
     try {
-      await api.speak(info, toSay, { async: true })
+      await api.speak(info, toSay, { async: true, ...ttsRequest() })
       setSpeakingMessage(answer.id ?? null)
       setSpeechState("playing")
       watchSpeech()
@@ -625,6 +978,8 @@ export function createVoiceController(context: any) {
     toggleMic,
     cancel,
     status,
+    openSettings,
+    preload,
     toggleAutoSpeak,
     refreshSpeech,
     dispose,

@@ -12,11 +12,14 @@ perceived latency in a live voice loop.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import wave
 from pathlib import Path
 
@@ -165,6 +168,85 @@ def synth_espeak(text: str, out: Path) -> dict:
     return {"backend": "espeak", "voice": voice}
 
 
+def _fish_error(body: bytes, code: int) -> str:
+    msg = ""
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+        if isinstance(data, dict):
+            msg = str(data.get("message") or data.get("error") or data.get("reason") or "")
+    except Exception:
+        msg = body.decode("utf-8", "replace").strip()[:300]
+    return f"Fish Audio HTTP {code}" + (f": {msg}" if msg else "")
+
+
+def _fish_request(text: str, api_key: str, voice_id: str, model: str,
+                  fmt: str, latency: str) -> bytes:
+    payload = json.dumps({
+        "text": text,
+        "reference_id": voice_id,
+        "format": fmt,
+        "normalize": True,
+        "latency": latency,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        cfg.FISH_API_URL,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "audio/wav, audio/mpeg",
+            "model": model,
+            "User-Agent": f"opencode-jarvis-voice/{cfg.DAEMON_VERSION}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=cfg.FISH_TIMEOUT) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        raise TtsError(_fish_error(e.read() or b"", e.code)) from e
+    except urllib.error.URLError as e:
+        raise TtsError(f"Fish Audio unreachable: {e.reason}") from e
+    except Exception as e:
+        raise TtsError(f"Fish Audio request failed: {e}") from e
+    if not data:
+        raise TtsError("Fish Audio returned empty audio")
+    # A JSON body here is an error even with a 200 status.
+    if data[:1] in (b"{", b"["):
+        raise TtsError(_fish_error(data, 200))
+    return data
+
+
+def synth_fish(text: str, out: Path, fish: dict | None = None) -> dict:
+    """Cloud voice via Fish Audio. Requires an API key and a voice model id."""
+    fish = fish or {}
+    api_key = str(fish.get("apiKey") or cfg.FISH_API_KEY or "").strip()
+    voice_id = str(fish.get("voiceId") or cfg.FISH_VOICE_ID or "").strip()
+    model = str(fish.get("model") or cfg.FISH_MODEL or "s2.1-pro-free").strip()
+    latency = str(fish.get("latency") or cfg.FISH_LATENCY or "balanced").strip()
+    if not api_key:
+        raise TtsError("Fish Audio API key is not set (Voice: settings in OpenCode)")
+    if not voice_id:
+        raise TtsError("Fish Audio voice id is not set (choose a voice in Voice: settings)")
+
+    # WAV avoids a lossy re-encode and is accepted by every local player.
+    # If this account/model rejects WAV, fall back to MP3 and remember the path.
+    try:
+        data = _fish_request(text, api_key, voice_id, model, "wav", latency)
+        out.write_bytes(data)
+        return {"backend": "fish", "voice": voice_id, "model": model,
+                "format": "wav", "path": str(out)}
+    except TtsError as e:
+        message = str(e).lower()
+        if not any(word in message for word in ("format", "wav", "unsupported", "media type")):
+            raise
+        data = _fish_request(text, api_key, voice_id, model, "mp3", latency)
+        mp3 = out.with_suffix(".mp3")
+        mp3.write_bytes(data)
+        return {"backend": "fish", "voice": voice_id, "model": model,
+                "format": "mp3", "path": str(mp3)}
+
+
 _SYNTH = {"piper": synth_piper, "piper-bin": synth_piper_bin, "espeak": synth_espeak}
 
 
@@ -172,13 +254,17 @@ _SYNTH = {"piper": synth_piper, "piper-bin": synth_piper_bin, "espeak": synth_es
 # Cache + public API
 # ----------------------------------------------------------------------------
 
-def _cache_key(text: str, backend: str) -> Path:
-    h = hashlib.sha256(f"{backend}|{cfg.PIPER_VOICE}|{cfg.TTS_LENGTH_SCALE}|{text}".encode()).hexdigest()[:24]
+def _cache_key(text: str, backend: str, voice: str = "") -> Path:
+    h = hashlib.sha256(
+        f"{backend}|{voice}|{cfg.PIPER_VOICE}|{cfg.TTS_LENGTH_SCALE}|{text}".encode()
+    ).hexdigest()[:24]
+    # Fish primarily returns WAV; an MP3 fallback is cached beside it.
     return TTS_CACHE / f"{h}.wav"
 
 
-def synthesize(text: str, backend: str | None = None, use_cache: bool = True) -> dict:
-    """Render text to a WAV file. Returns {path, backend, cached, ms}."""
+def synthesize(text: str, backend: str | None = None, use_cache: bool = True,
+               fish: dict | None = None) -> dict:
+    """Render text to an audio file. Returns {path, backend, cached, ms}."""
     text = (text or "").strip()
     if not text:
         raise TtsError("nothing to say")
@@ -187,27 +273,51 @@ def synthesize(text: str, backend: str | None = None, use_cache: bool = True) ->
         raise TtsError("no local TTS backend available. Install piper-tts, or espeak-ng.")
 
     TTS_CACHE.mkdir(parents=True, exist_ok=True)
-    out = _cache_key(text, backend)
-    if use_cache and out.exists() and out.stat().st_size > 44:
-        return {"path": str(out), "backend": backend, "cached": True, "ms": 0, "chars": len(text)}
+    if backend == "fish":
+        fish = fish or {}
+        api_key = str(fish.get("apiKey") or cfg.FISH_API_KEY or "").strip()
+        voice = str(fish.get("voiceId") or cfg.FISH_VOICE_ID or "")
+        model = str(fish.get("model") or cfg.FISH_MODEL or "")
+        if not api_key:
+            raise TtsError("Fish Audio API key is not set (Voice: settings in OpenCode)")
+        if not voice:
+            raise TtsError("Fish Audio voice id is not set (Voice: settings in OpenCode)")
+        out = _cache_key(text, backend, f"{voice}|{model}")
+    else:
+        out = _cache_key(text, backend)
+    cached = [out]
+    if backend == "fish":
+        cached.append(out.with_suffix(".mp3"))
+    if use_cache:
+        for c in cached:
+            if c.exists() and c.stat().st_size > 44:
+                return {"path": str(c), "backend": backend, "cached": True, "ms": 0, "chars": len(text)}
 
     t0 = time.time()
     fn = _SYNTH.get(backend)
-    if fn is None:
+    if backend != "fish" and fn is None:
         raise TtsError(f"unknown TTS backend '{backend}'")
-    tmp = out.with_suffix(".part.wav")
+    tmp = out.with_name(f"{out.stem}.part{out.suffix}")
     try:
-        info = fn(text, tmp)
+        info = synth_fish(text, tmp, fish=fish) if backend == "fish" else fn(text, tmp)
     except Exception as e:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
         raise TtsError(f"{backend}: {e}") from e
-    tmp.replace(out)
-    info.update({"path": str(out), "cached": False, "ms": int((time.time() - t0) * 1000), "chars": len(text)})
+    actual = Path(info.get("path") or tmp)
+    final = out if actual == tmp else out.with_suffix(actual.suffix)
+    actual.replace(final)
+    info.update({"path": str(final), "cached": False, "ms": int((time.time() - t0) * 1000),
+                 "chars": len(text)})
     return info
 
 
-def speak(text: str, backend: str | None = None, wait: bool = True) -> dict:
+def speak(text: str, backend: str | None = None, wait: bool = True,
+          fish: dict | None = None) -> dict:
     """Synthesize and play through the local speakers."""
-    info = synthesize(text, backend=backend)
+    info = synthesize(text, backend=backend, fish=fish)
     # One voice at a time: an older utterance is cut off, not layered under
     # the new one.
     audio.stop_playback()
