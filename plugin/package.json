@@ -1,6 +1,6 @@
 {
   "name": "opencode-jarvis-voice",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "type": "module",
   "description": "Local voice chat for OpenCode: mic -> Whisper text, Piper voice back. Fully offline.",

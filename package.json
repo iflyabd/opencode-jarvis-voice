@@ -1,6 +1,6 @@
 {
   "name": "opencode-jarvis-voice",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "private": false,
   "type": "module",
   "description": "Fully local voice for OpenCode: push-to-talk mic button, read-aloud with pause/resume, Whisper ears and a Piper voice. No cloud, no API keys.",
