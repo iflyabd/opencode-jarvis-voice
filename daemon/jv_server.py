@@ -346,6 +346,9 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("[%s] %s\n" % (time.strftime("%H:%M:%S"), fmt % args))
 
     def handle_one_request(self) -> None:
+        # BaseHTTPRequestHandler reuses this instance for every request on a
+        # keep-alive connection, so the cached body must start empty each time.
+        self._raw_body: bytes | None = None
         # Clients that disappear mid-request (a TUI closing, a killed curl) are
         # normal here; do not print a traceback for them.
         try:
@@ -379,8 +382,13 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _read_body(self) -> bytes:
+        cached = getattr(self, "_raw_body", None)
+        if cached is not None:
+            return cached
         n = int(self.headers.get("Content-Length") or 0)
-        return self.rfile.read(n) if n else b""
+        raw = self.rfile.read(n) if n else b""
+        self._raw_body = raw
+        return raw
 
     def _json_body(self) -> dict:
         raw = self._read_body()
@@ -394,6 +402,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routes ------------------------------------------------------------
     def do_GET(self) -> None:
+        self._read_body()
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if not self._authorized(q):
@@ -420,6 +429,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": _state["last_error"]})
 
     def do_POST(self) -> None:
+        # Always drain the body, including for routes that take no arguments
+        # (pause/resume/interrupt). Unread bytes stay on the keep-alive socket
+        # and corrupt the next request into "501 Unsupported method".
+        self._read_body()
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if not self._authorized(q):

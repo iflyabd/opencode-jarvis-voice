@@ -243,18 +243,20 @@ export async function request<T = unknown>(
 export const api = {
   health: (info: DaemonInfo, deep = false) => getJsonWithAuth<Health>(info, `/health${deep ? "?deep=1" : ""}`),
   pttStart: (info: DaemonInfo, maxMs?: number) => request(info, "/ptt/start", { body: { max_ms: maxMs } }),
-  pttStop: (info: DaemonInfo, timeoutMs = 190000) => request<Transcript>(info, "/ptt/stop", { body: {}, timeoutMs }),
+  pttStop: (info: DaemonInfo, timeoutMs = 190000) => request<Transcript>(info, "/ptt/stop", { timeoutMs }),
   pttState: (info: DaemonInfo) => getJsonWithAuth<{ ptt: { id: string; state: string } | null }>(info, "/ptt/state"),
-  pttCancel: (info: DaemonInfo) => request(info, "/ptt/cancel", { body: {} }),
+  pttCancel: (info: DaemonInfo) => request(info, "/ptt/cancel"),
   listen: (info: DaemonInfo, body: Record<string, unknown> = {}, timeoutMs = 190000) =>
     request<Transcript>(info, "/listen", { body, timeoutMs }),
   speak: (info: DaemonInfo, text: string, opts: { async?: boolean; backend?: string; timeoutMs?: number } = {}) =>
     request(info, "/speak", { body: { text, ...opts }, timeoutMs: opts.timeoutMs ?? 190000 }),
   synth: (info: DaemonInfo, text: string) => request<ArrayBuffer>(info, "/synth", { body: { text }, raw: true }),
   speech: (info: DaemonInfo) => getJsonWithAuth<SpeechStatus>(info, "/speech", 4000),
-  pause: (info: DaemonInfo) => request<{ ok?: boolean; paused?: boolean; speech?: SpeechStatus }>(info, "/pause", { body: {}, timeoutMs: 8000 }),
-  resume: (info: DaemonInfo) => request<{ ok?: boolean; resumed?: boolean; speech?: SpeechStatus }>(info, "/resume", { body: {}, timeoutMs: 8000 }),
-  interrupt: (info: DaemonInfo) => request(info, "/interrupt", { body: {} }),
+  // These routes take no arguments: send no body so a keep-alive connection
+  // never carries unread bytes into the next request on older daemons too.
+  pause: (info: DaemonInfo) => request<{ ok?: boolean; paused?: boolean; speech?: SpeechStatus }>(info, "/pause", { timeoutMs: 8000 }),
+  resume: (info: DaemonInfo) => request<{ ok?: boolean; resumed?: boolean; speech?: SpeechStatus }>(info, "/resume", { timeoutMs: 8000 }),
+  interrupt: (info: DaemonInfo) => request(info, "/interrupt"),
   probe: (info: DaemonInfo) => request(info, "/probe", { body: {}, timeoutMs: 120000 }),
   devices: (info: DaemonInfo) => getJsonWithAuth<Record<string, unknown>>(info, "/devices"),
   voices: (info: DaemonInfo) => getJsonWithAuth<Record<string, unknown>>(info, "/voices"),
