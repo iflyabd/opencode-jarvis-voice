@@ -7,9 +7,9 @@ leaves the device.
 Press one key, talk, pause, and your words land in the prompt. The reply is
 spoken back in a JARVIS-style voice while it types.
 
-Two mouse buttons do the same: a **🎙 mic** at the bottom-right of the prompt
-box and a **🔊 read / ⏸ pause / ▶ resume** button above the text box, both
-drawn with your OpenCode theme.
+Mouse controls do the same: a **🎙 mic** at the bottom-right of the prompt box,
+and a **🔊 read / ⏸ pause / ▶ resume** control under every answer (plus one
+above the text box for the newest reply), all drawn with your OpenCode theme.
 
 It is built to keep a phone cold: the daemon starts **only when you use voice**,
 warms the model **while you speak** (never at boot), and **exits when idle**, so
@@ -192,9 +192,10 @@ Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 | Button | Where | Click |
 |---|---|---|
 | `🎙 mic` / `● listening` / `◌ transcribing` | bottom-right of the prompt box | start listening; click again to stop and send |
-| `🔊 read` / `⏸ pause` / `▶ resume` | top-right of the composer, right under the message list | read the last answer; pause and resume it in place |
+| `🔊 read` / `⏸ pause` / `▶ resume` | directly under each assistant answer | read **that answer**; click again to pause it, again to resume |
+| `🔊 read` / `⏸ pause` / `▶ resume` | top-right of the composer | read the newest answer, even when older messages are scrolled away |
 
-Both are theme-aware (colours come from the active theme's action and feedback
+All are theme-aware (colours come from the active theme's action and feedback
 tokens, with hover states) and drive the same state as the keybindings — a
 click and `ctrl+alt+v` flip the same switch. They also update **live**: the
 label changes the moment the state does, including changes that happen in the
@@ -203,11 +204,23 @@ pause: the player process is suspended with `SIGSTOP` and continued with
 `SIGCONT`, so nothing is re-synthesized and the voice continues exactly where
 it stopped.
 
-> OpenCode's TUI (v2.0.32) has no per-message slot for plugins, so the reading
-> control lives in the composer strip directly beneath the message list.
+The per-answer button sits between the answer text and its `Build · …` line,
+and it is tied to that message: click the first answer's button and you hear
+the first answer, even if ten newer replies exist. Clicking another answer
+stops the current one and moves the pause label with it.
 
-Reading rules — the button reads **only the final answer**:
+> OpenCode v2.0.32 has no plugin slot for individual messages. The per-answer
+> row is attached to the transcript's existing message / text-part renderables
+> at runtime, using the host's own node classes. That is an internal API: a
+> future TUI rewrite can simply hide the rows, in which case the composer
+> button keeps working, or need a small update in
+> `plugin/message-buttons.ts`. Nothing leaves the process, and the scan runs
+> only on session events — never on a timer.
 
+Reading rules:
+
+* a per-answer button reads only that answer; the composer button reads the
+  newest answer;
 * `reasoning` parts (the grayed-out thinking text) are never spoken;
 * when a turn has several text parts (narration between tool calls, then the
   answer), only the **last** one is read;

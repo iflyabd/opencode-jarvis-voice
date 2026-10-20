@@ -92,16 +92,26 @@ export function assistantAnswerText(message: any): string {
   return ""
 }
 
-/** Text of the newest assistant message, skipping in-flight ones with nothing yet. */
-export function latestAnswerText(messages: any[]): string {
-  if (!Array.isArray(messages)) return ""
+/** A message the reader can speak: an assistant answer with real text. */
+export function isReadableAnswer(message: any): boolean {
+  return roleOf(message) === "assistant" && assistantAnswerText(message).length > 0
+}
+
+/** Newest assistant answer and its id, skipping in-flight ones with nothing yet. */
+export function latestAnswer(messages: any[]): { id?: string; text: string } {
+  if (!Array.isArray(messages)) return { text: "" }
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
     if (roleOf(m) !== "assistant") continue
     const text = assistantAnswerText(m)
-    if (text) return text
+    if (text) return { id: typeof m?.id === "string" ? m.id : undefined, text }
   }
-  return ""
+  return { text: "" }
+}
+
+/** Text of the newest assistant message, skipping in-flight ones with nothing yet. */
+export function latestAnswerText(messages: any[]): string {
+  return latestAnswer(messages).text
 }
 
 /** Turn a markdown answer into something brief and worth listening to. */
@@ -137,6 +147,15 @@ export function speakable(text: string, limit = 600): string {
 export function createVoiceController(context: any) {
   const [mic, setMic] = createSignal<MicState>("idle")
   const [speech, setSpeech] = createSignal<SpeechState>("idle")
+  // Which message the current playback belongs to. The composer button and
+  // the per-message buttons read this to decide between read/pause/resume.
+  const [speakingMessage, setSpeakingMessage] = createSignal<string | null>(null)
+
+  // The host's own TextRenderable class, captured from a mounted button.
+  // `message-buttons.ts` must instantiate the host's classes, not a second copy
+  // from the plugin's node_modules, or the renderer lays the node out without
+  // ever drawing it.
+  let hostTextClass: any = null
 
   /**
    * State changes here repaint the on-screen buttons directly.
@@ -240,6 +259,13 @@ export function createVoiceController(context: any) {
     }
   }
 
+  /** Playback is over: no message owns the speaker any more. */
+  function endPlayback(): void {
+    setSpeakingMessage(null)
+    setSpeechState("idle")
+    stopSpeechWatch()
+  }
+
   function scheduleSpeechPoll(ms: number): void {
     if (speechTimer !== null) return
     speechTimer = setTimeout(() => {
@@ -259,16 +285,18 @@ export function createVoiceController(context: any) {
           scheduleSpeechPoll(SPEECH_POLL_RETRY_MS)
           return
         }
-        setSpeechState("idle")
-        stopSpeechWatch()
+        endPlayback()
         return
       }
       const st = await api.speech(info)
       speechMisses = 0
       const next = st.active ? (st.paused ? "paused" : "playing") : "idle"
-      setSpeechState(next)
-      if (next === "idle") stopSpeechWatch()
-      else scheduleSpeechPoll(next === "paused" ? SPEECH_POLL_PAUSED_MS : SPEECH_POLL_PLAYING_MS)
+      if (next === "idle") {
+        endPlayback()
+      } else {
+        setSpeechState(next)
+        scheduleSpeechPoll(next === "paused" ? SPEECH_POLL_PAUSED_MS : SPEECH_POLL_PLAYING_MS)
+      }
     } catch {
       // A restarting daemon is not an error the user must see; the watcher
       // keeps polling quietly for a moment and only then gives up.
@@ -277,8 +305,7 @@ export function createVoiceController(context: any) {
         scheduleSpeechPoll(SPEECH_POLL_RETRY_MS)
         return
       }
-      setSpeechState("idle")
-      stopSpeechWatch()
+      endPlayback()
     } finally {
       speechPolling = false
     }
@@ -296,6 +323,7 @@ export function createVoiceController(context: any) {
     if (!info) return false
     try {
       await api.speak(info, text, { async: true })
+      setSpeakingMessage(null)
       setSpeechState("playing")
       watchSpeech()
       toast(title ?? `🔊 ${text.slice(0, 80)}${text.length > 80 ? "…" : ""}`)
@@ -316,7 +344,8 @@ export function createVoiceController(context: any) {
     try {
       await context.data.session.message.sync(sid)
       const messages = context.data.session.message.list(sid) ?? []
-      const text = speakable(latestAnswerText(messages))
+      const answer = latestAnswer(messages)
+      const text = speakable(answer.text)
       if (!text) {
         toast("The last reply has nothing to read", "warning")
         return
@@ -324,12 +353,57 @@ export function createVoiceController(context: any) {
       const info = await daemonOrToast()
       if (!info) return
       await api.speak(info, text, { async: true })
+      setSpeakingMessage(answer.id ?? null)
       setSpeechState("playing")
       watchSpeech()
-      toast("🔊 Reading the last reply")
     } catch (e) {
       toast(errorText(e), "error")
     }
+  }
+
+  /** Read one specific assistant message, replacing anything already playing. */
+  async function speakMessage(messageID: string, sessionID?: string): Promise<void> {
+    const sid = sessionID ?? currentSessionID(context)
+    if (!sid) {
+      toast("No active session to read from", "warning")
+      return
+    }
+    try {
+      await context.data.session.message.sync(sid)
+      const messages = context.data.session.message.list(sid) ?? []
+      const message = messages.find((m: any) => m?.id === messageID)
+      if (!message || !isReadableAnswer(message)) {
+        toast("This message has nothing to read", "warning")
+        return
+      }
+      const text = speakable(assistantAnswerText(message))
+      if (!text) {
+        toast("This message has nothing to read", "warning")
+        return
+      }
+      const info = await daemonOrToast()
+      if (!info) return
+      if (speech() !== "idle") {
+        // Another answer (or an arbitrary /voice phrase) owns the speaker.
+        // Stop it first so the new read starts at the beginning.
+        await api.interrupt(info).catch(() => undefined)
+      }
+      await api.speak(info, text, { async: true })
+      setSpeakingMessage(messageID)
+      setSpeechState("playing")
+      watchSpeech()
+    } catch (e) {
+      toast(errorText(e), "error")
+    }
+  }
+
+  /** Click on a message button: pause/resume it, or start reading it. */
+  async function messageAction(messageID: string, sessionID?: string): Promise<void> {
+    if (speakingMessage() === messageID && speech() !== "idle") {
+      await pauseResume(sessionID)
+      return
+    }
+    await speakMessage(messageID, sessionID)
   }
 
   /** Evaluated by the speak button: idle -> read, playing -> pause, paused -> resume. */
@@ -346,12 +420,10 @@ export function createVoiceController(context: any) {
         await api.pause(info)
         setSpeechState("paused")
         watchSpeech()
-        toast("⏸ Paused")
       } else {
         await api.resume(info)
         setSpeechState("playing")
         watchSpeech()
-        toast("▶ Resumed")
       }
     } catch (e) {
       toast(errorText(e), "error")
@@ -411,18 +483,19 @@ export function createVoiceController(context: any) {
       await sleep(300)
     }
 
-    let text = ""
+    let answer: { id?: string; text: string } = { text: "" }
     try {
       await context.data.session.message.sync(sessionID)
-      text = latestAnswerText(context.data.session.message.list(sessionID) ?? [])
+      answer = latestAnswer(context.data.session.message.list(sessionID) ?? [])
     } catch {
       /* fall through with whatever we have */
     }
-    if (!text) return
-    const toSay = speakable(text)
+    if (!answer.text) return
+    const toSay = speakable(answer.text)
     if (!toSay) return
     try {
       await api.speak(info, toSay, { async: true })
+      setSpeakingMessage(answer.id ?? null)
       setSpeechState("playing")
       watchSpeech()
     } catch (e) {
@@ -499,8 +572,7 @@ export function createVoiceController(context: any) {
       const info = await daemonOrToast()
       if (!info) return
       await api.interrupt(info)
-      setSpeechState("idle")
-      stopSpeechWatch()
+      endPlayback()
       toast("Stopped.")
     } catch (e) {
       toast(errorText(e), "error")
@@ -534,12 +606,21 @@ export function createVoiceController(context: any) {
   return {
     mic: mic as Accessor<MicState>,
     speech: speech as Accessor<SpeechState>,
+    /** The message whose audio is playing (or paused), if any. */
+    speakingMessage: speakingMessage as Accessor<string | null>,
+    /** The host's TextRenderable class, learned from a mounted slot button. */
+    textClass: () => hostTextClass,
+    registerTextClass: (ctor: any) => {
+      if (!hostTextClass && typeof ctor === "function") hostTextClass = ctor
+    },
     /** Buttons register their text nodes here; every state change repaints. */
     addRepaint,
     removeRepaint,
     autoSpeak: () => autoSpeak,
     speakText,
     speakLast,
+    speakMessage,
+    messageAction,
     pauseResume,
     toggleMic,
     cancel,

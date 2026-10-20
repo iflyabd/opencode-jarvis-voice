@@ -44,6 +44,10 @@ function liveText(
 ): { node: any; paint: () => void } {
   const node: any = createElement("text")
   try {
+    // Hand the host's own TextRenderable class to the message buttons: a
+    // second copy from the plugin's node_modules would be laid out but never
+    // drawn by the host renderer.
+    voice.registerTextClass?.(node.constructor)
     node.wrapMode = "none"
     node.selectable = false
   } catch {

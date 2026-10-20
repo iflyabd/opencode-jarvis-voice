@@ -10,9 +10,14 @@
  *
  * Pressing the key again while it is listening sends immediately.
  *
- * UI buttons (both follow the host theme, clickable with the mouse):
+ * UI buttons (all follow the host theme, clickable with the mouse):
  *   `prompt.footer`         bottom-right of the prompt box: the mic / PTT button
  *   `session.composer.top`  top-right of the text box: the speaker / pause button
+ *   under each answer       a read / pause / resume button for that message
+ *
+ * The per-message rows are attached to the transcript renderables for assistant
+ * messages and their text parts; see message-buttons.ts. Hosts that do not
+ * expose those ids simply show the composer button only.
  *
  * Commands:  voice.pushToTalk (ctrl+alt+v), voice.pauseResume (ctrl+alt+p),
  *            voice.status, voice.cancel, voice.speakLast, voice.toggleAutoSpeak,
@@ -26,12 +31,14 @@
 
 import { Plugin } from "@opencode/plugin/tui"
 import { createVoiceController } from "./controller"
+import { createMessageButtons } from "./message-buttons"
 import { MicButton, SpeakButton } from "./ui"
 
 export default Plugin.define({
   id: "jarvis-voice.cli",
   async setup(context) {
     const voice = createVoiceController(context)
+    const messages = context.options?.speak === false ? null : createMessageButtons(context, voice)
 
     if (context.options?.mic !== false) {
       context.ui.slot({
@@ -43,9 +50,18 @@ export default Plugin.define({
     if (context.options?.speak !== false) {
       context.ui.slot({
         append: "session.composer.top",
-        render: (input) => <SpeakButton context={context} voice={voice} sessionID={input.sessionID} />,
+        render: (input) => {
+          // Mounting this slot means a session view just appeared; the
+          // transcript below it is laid out on the next frames.
+          messages?.schedule(350)
+          return <SpeakButton context={context} voice={voice} sessionID={input.sessionID} />
+        },
       })
     }
+
+    // Messages may already be on screen when the plugin loads (--continue,
+    // session restored from a tab). The event stream repairs later changes.
+    messages?.schedule(700)
 
     // If speech is already playing (another TUI, an earlier instance), pick the
     // state up so the button shows pause from the first frame.
@@ -124,6 +140,7 @@ export default Plugin.define({
     }))
 
     return () => {
+      messages?.dispose()
       voice.dispose()
     }
   },
