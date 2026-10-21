@@ -52,8 +52,9 @@ const FISH_STT_MODEL = "transcribe-1-pro"
 
 /**
  * Language hints accepted by Fish Audio ASR. Fish detects the language
- * automatically (80+ languages); this list is only for users who want to
- * steer short or ambiguous clips. "Other" accepts any ISO 639-1 code.
+ * automatically (80+ languages); this list is a convenience for setting the
+ * reported language on short or ambiguous clips. "Other" accepts any ISO
+ * 639-1 code.
  */
 export const FISH_STT_LANGUAGES: Array<{ code: string; name: string }> = [
   { code: "af", name: "Afrikaans" },
@@ -454,6 +455,17 @@ export function createVoiceController(context: any) {
     return `Fish Audio · ${model} · ${language}${key ? "" : " · key needed"}`
   }
 
+  function healthSummary(h: Health): string {
+    const bits = summarize(h).split(" | ")
+    if (settings.sttProvider === "fish") {
+      const idx = bits.findIndex((part) => part.startsWith("stt: "))
+      const label = `stt: Fish Audio (${normalizeSttModel(settings.fishSttModel)})`
+      if (idx >= 0) bits[idx] = label
+      else bits.push(label)
+    }
+    return bits.join(" | ")
+  }
+
   async function daemon(start = true): Promise<DaemonInfo | null> {
     try {
       return await ensureDaemon({ start })
@@ -713,7 +725,7 @@ export function createVoiceController(context: any) {
             title: provider === "fish" ? "Fish Audio (active)" : "Use Fish Audio speech-to-text",
             value: "fish",
             description: key
-              ? `Cloud ASR · key ${maskKey(key)} · audio is uploaded`
+              ? `Cloud ASR · key ${maskKey(key)} · audio is uploaded · uses API credit`
               : "Cloud ASR · needs an API key and API credit",
           },
           {
@@ -750,7 +762,7 @@ export function createVoiceController(context: any) {
           draft.sttProvider = "fish"
         })
         toast(
-          "Fish Audio will transcribe the mic. Audio is sent to api.fish.audio; local Whisper is off.",
+          "Fish Audio will transcribe the mic. Audio is sent to api.fish.audio; local Whisper is off. ASR uses API credit separate from the free TTS model.",
           "warning",
         )
       } else if (choice === "model") {
@@ -799,7 +811,7 @@ export function createVoiceController(context: any) {
     try {
       const h: Health = await api.health(info, true)
       if (kind === "status") {
-        toast(summarize(h), "info")
+        toast(healthSummary(h), "info")
         return
       }
       if (kind === "mic") {
@@ -1292,14 +1304,7 @@ export function createVoiceController(context: any) {
       const info = await daemonOrToast()
       if (!info) return
       const h: Health = await api.health(info, true)
-      const bits = summarize(h).split(" | ")
-      if (settings.sttProvider === "fish") {
-        const idx = bits.findIndex((part) => part.startsWith("stt: "))
-        const label = `stt: Fish Audio (${normalizeSttModel(settings.fishSttModel)})`
-        if (idx >= 0) bits[idx] = label
-        else bits.push(label)
-      }
-      toast(`${bits.join(" | ")}${h.audio?.capture?.backend ? "" : " (no mic)"}`, "info")
+      toast(`${healthSummary(h)}${h.audio?.capture?.backend ? "" : " (no mic)"}`, "info")
       if (!h.audio?.capture?.backend) {
         const hint = h.audio?.capture?.hints?.[0]
         if (hint) toast(hint, "warning")

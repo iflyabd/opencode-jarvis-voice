@@ -286,8 +286,9 @@ models handle poorly, or for better accuracy on a slow phone — open
    and recommended — 80+ languages, long recordings, and speaker support.
    `transcribe-1` is the lighter short-clip model.
 3. Optional: choose **Fish Audio language**. **Auto-detect** is recommended and
-   works across Fish's supported languages. Pick a hint for short or ambiguous
-   clips, or choose **Other ISO 639-1 code** and type any two-letter code.
+   works across Fish's supported languages. A hint sets the reported language
+   when a very short clip cannot be detected on its own; detection still runs.
+   Choose **Other ISO 639-1 code** to type any two-letter code.
 4. Choose **Use local Whisper** at any time to stop uploading audio.
 
 Fish still detects the language automatically when a hint is set, so the hint
@@ -615,7 +616,7 @@ optional accelerants that the daemon reports on and degrades without.
 | It hears you but the transcript is wrong | bigger model: `JARVIS_VOICE_WHISPER_MODEL=base`; `tiny.en` is English-only |
 | Fish Audio says key/voice not set | `ctrl+p` → **Voice: settings**, add the API key, then choose a voice |
 | Fish Audio HTTP 401/402 | check the key on fish.audio; the free TTS model may need credit for some voices. Fish **ASR** uses separate API credit — add it at `fish.audio/app/developers` |
-| Fish ASR hears the wrong language | leave the language on **Auto-detect**; it is only a hint. For short clips choose the language under **Transcription → Fish Audio language** |
+| Fish ASR reports the wrong language | leave the language on **Auto-detect**. A hint only sets the reported language when a very short clip cannot be detected; it does not force the transcript |
 | Local Whisper is still used after choosing Fish | open `/voice-settings` → **Transcription** and confirm **Fish Audio (active)**; push-to-talk sends the choice with every turn, while the agent's `voice_listen` tool follows the daemon default |
 | It cuts you off too early | `JARVIS_VOICE_VAD_SILENCE_MS=1500` |
 | It triggers on background noise | `JARVIS_VOICE_VAD_THRESHOLD=0.02` |
