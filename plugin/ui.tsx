@@ -139,7 +139,7 @@ export function MicButton(props: ButtonProps) {
  * Live voice: the microphone keeps listening, every turn is sent on its own
  * and the answer is read back, until it is switched off again.
  */
-export function LiveButton(props: ButtonProps) {
+export function LiveButton(props: ButtonProps & { compact?: boolean }) {
   const [hovered, setHovered] = createSignal(false)
 
   const theme = () => props.context.theme
@@ -160,7 +160,12 @@ export function LiveButton(props: ButtonProps) {
   }
 
   return (
-    <box width="100%" flexDirection="row" justifyContent="flex-end" flexShrink={0}>
+    <box
+      width={props.compact ? undefined : "100%"}
+      flexDirection="row"
+      justifyContent="flex-end"
+      flexShrink={0}
+    >
       <box
         flexShrink={0}
         paddingRight={1}

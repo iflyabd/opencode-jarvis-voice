@@ -43,9 +43,27 @@ export default Plugin.define({
     const messages = context.options?.speak === false ? null : createMessageButtons(context, voice)
 
     if (context.options?.mic !== false) {
+      // One claim for the prompt footer: the host only honours a single
+      // claim per path, so a second one would replace the mic button.
       context.ui.slot({
         append: "prompt.footer",
-        render: (input) => <MicButton context={context} voice={voice} sessionID={input.sessionID} />,
+        render: (input) => {
+          const route = context.ui?.router?.current?.()
+          return (
+            <>
+              {/* A brand new chat is the home screen. It has no
+                  session.composer.top slot, but the prompt box is a
+                  positioned container, so the toggle can be anchored to
+                  the top-right corner of the text box itself. */}
+              {route?.type === "home" ? (
+                <box position="absolute" top={0} right={0} zIndex={2000} flexShrink={0}>
+                  <LiveButton context={context} voice={voice} compact />
+                </box>
+              ) : null}
+              <MicButton context={context} voice={voice} sessionID={input.sessionID} />
+            </>
+          )
+        },
       })
     }
 
@@ -57,18 +75,6 @@ export default Plugin.define({
           // transcript below it is laid out on the next frames.
           messages?.schedule(350)
           return <LiveButton context={context} voice={voice} sessionID={input.sessionID} />
-        },
-      })
-      // A brand new chat is the home screen, which has no session composer
-      // slot: the top of the text box is not a slot there. The toggle is
-      // mounted in the prompt box instead, so it sits with the text box and
-      // not in the page's status bar.
-      context.ui.slot({
-        prepend: "prompt.footer",
-        render: () => {
-          const route = context.ui?.router?.current?.()
-          if (route?.type !== "home") return null
-          return <LiveButton context={context} voice={voice} />
         },
       })
     }

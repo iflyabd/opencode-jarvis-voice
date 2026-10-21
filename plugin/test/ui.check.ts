@@ -309,7 +309,7 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     client: {},
   }
   const cleanup = await plugin.default.setup(context)
-  check("plugin registers three slots", slots.length === 3, `got ${slots.length}`)
+  check("plugin registers two slots", slots.length === 2, `got ${slots.length}`)
   check(
     "mic button appends to prompt.footer",
     slots.some((s) => s.append === "prompt.footer" && typeof s.render === "function"),
@@ -321,8 +321,8 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     slots.map((s) => s.append).join(","),
   )
   check(
-    "live button joins the prompt box on the home screen",
-    slots.some((s) => s.prepend === "prompt.footer" && typeof s.render === "function"),
+    "the prompt footer has one claim, so the mic button is never replaced",
+    slots.filter((s) => (s.append ?? s.prepend) === "prompt.footer").length === 1,
     slots.map((s) => s.append ?? s.prepend).join(","),
   )
   const layer = layers[0]
