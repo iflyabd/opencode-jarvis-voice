@@ -21,6 +21,7 @@ let startBody: any = null
 // caption, the way a live conversation waits for the user to speak.
 let stateMode: "turn" | "hold" = "turn"
 let stopTurns = false
+let startFails = 0
 const spokenByDaemon: string[] = []
 const spokenBodies: any[] = []
 const server = Bun.serve({
@@ -32,6 +33,13 @@ const server = Bun.serve({
     if (url.pathname === "/ping") return json({ ok: true })
     if (url.pathname === "/ptt/start") {
       startBody = await req.json()
+      if (startFails > 0) {
+        startFails -= 1
+        return new Response(
+          JSON.stringify({ error: "microphone 'index:99' could not be opened. sounddevice: nope" }),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        )
+      }
       polls = 0
       return json({ ok: true, ptt: { id: "ptt-1", state: "listening" } })
     }
@@ -338,6 +346,23 @@ answerReady = true
 eventHandler?.({ details: { type: "message.updated" } })
 await new Promise((r) => setTimeout(r, 1200))
 check("nothing is read with auto-speak off", spokenByDaemon.length === 0, `spoken=${JSON.stringify(spokenByDaemon)}`)
+
+// 9. A microphone that cannot open must not end the live conversation: the
+//    reason is shown, and the next turn tries again.
+startFails = 2
+const sentBeforeRetry = sent.length
+const retryRun = voice.toggleLive("ses_test")
+await new Promise((r) => setTimeout(r, 1500))
+check("live mode stays on when the microphone cannot open", voice.live() === true)
+await new Promise((r) => setTimeout(r, 2300))
+check(
+  "live mode retries the microphone after a failure",
+  sent.length > sentBeforeRetry,
+  `${sentBeforeRetry} -> ${sent.length}`,
+)
+await voice.toggleLive("ses_test")
+await retryRun
+check("live mode can still be stopped after a microphone failure", voice.live() === false)
 
 server.stop(true)
 if (failures > 0) {

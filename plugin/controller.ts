@@ -2041,12 +2041,30 @@ export function createVoiceController(context: any) {
    */
   async function liveConversation(sessionID: string | undefined): Promise<void> {
     let sid = sessionID
+    let lastMicError = ""
     while (!liveStop) {
       const info = await daemon(true)
       if (!info) return
       if (!sid) sid = currentSessionID(context) ?? undefined
       setMicState("listening")
-      const text = await recordOneTurn(info)
+      let text = ""
+      try {
+        text = await recordOneTurn(info)
+      } catch (e) {
+        // A microphone that cannot be opened must not end the conversation:
+        // say why once, wait a moment, and keep listening. The user can stop
+        // live mode or pick another device in the settings.
+        setMicState("idle")
+        setLiveCaption("")
+        const why = errorText(e)
+        if (why !== lastMicError) {
+          toast(`Live microphone: ${why}`, "error")
+          lastMicError = why
+        }
+        await sleep(1500)
+        continue
+      }
+      lastMicError = ""
       setMicState("idle")
       if (liveStop) return
       if (!text) continue // nothing was heard: keep listening
@@ -2074,8 +2092,9 @@ export function createVoiceController(context: any) {
     liveBusy = true
     liveStop = false
     setLive(true)
+    const mic = (settings.micSource || "").trim() || "automatic microphone"
     toast(
-      "Live voice on — like a phone call: pause to send, the answer is spoken as it arrives. Click again to stop.",
+      `Live voice on (${mic}) — like a phone call: pause to send, the answer is spoken as it arrives. Click again to stop.`,
       "success",
     )
     try {
