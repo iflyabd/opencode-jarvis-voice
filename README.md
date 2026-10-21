@@ -206,10 +206,10 @@ Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 | `🔊 read` / `⏸ pause` / `▶ resume` | directly under each assistant answer | read **that answer**; click again to pause it, again to resume |
 | `◉ live` / `● live` | top-right of the text box | switch the live voice conversation on or off |
 
-The mic sits at the **bottom** of the text box and the live toggle at the
-**top**, both on the right - the same arrangement in a session and on the home
+The mic sits at the **bottom** of the text box and the live toggle **above**
+it, both on the right - the same arrangement in a session and on the home
 screen where a new chat starts. (That screen publishes no slot above the text
-box, so there the toggle is anchored to the top-right of the text area.)
+box, so there the toggle is anchored to the row just over the text box.)
 
 All are theme-aware (colours come from the active theme's action and feedback
 tokens, with hover states) and drive the same state as the keybindings — a

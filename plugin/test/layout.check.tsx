@@ -52,12 +52,12 @@ function buildFooter(area: any) {
   mic.content = "mic"
   wrapper.add(mic)
 
-  // The plugin measures the text area and moves the anchor up to it.
+  // The plugin measures the text area and moves the anchor just above it.
   const sync = () => {
     const top = area?.y
     const base = wrapper.y
     if (typeof top !== "number" || typeof base !== "number") return
-    const offset = Math.round(top - base)
+    const offset = Math.round(top - base) - 1
     if (anchor.top !== offset) anchor.top = offset
   }
   refs.wrapper = wrapper
@@ -94,7 +94,7 @@ const micRow = lines.findIndex((l) => l.includes("mic"))
 console.log("area.y", refs.area?.y, "wrapper.y", refs.wrapper?.y, "anchor.top", refs.anchor?.top)
 check("the live button is rendered", liveRow >= 0, `row=${liveRow}`)
 check("the live button is above the mic button", liveRow >= 0 && micRow >= 0 && liveRow < micRow, `live=${liveRow} mic=${micRow}`)
-check("the live button is at the top of the text area", liveRow === 1, `row=${liveRow}`)
+check("the live button is above the text box", liveRow === 0, `row=${liveRow}`)
 check("the live button is on the right", lines[liveRow]?.trimEnd().endsWith("LIVE") === true, JSON.stringify(lines[liveRow]))
 check("the mic button is still in the footer", micRow >= 0 && lines[micRow]?.includes("mic") === true, JSON.stringify(lines[micRow]))
 setup.renderer.destroy()

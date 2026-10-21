@@ -65,7 +65,7 @@ const FISH_STT_MODEL = "transcribe-1-pro"
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.5.4"
+export const PLUGIN_VERSION = "1.5.5"
 
 /** Local Whisper models the settings can pick. "" means automatic. */
 const LOCAL_MODELS: Array<{ id: string; title: string; description: string }> = [

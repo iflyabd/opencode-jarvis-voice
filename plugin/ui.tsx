@@ -200,13 +200,14 @@ export function PromptFooterLive(props: ButtonProps) {
   anchor.add(label)
   wrapper.add(anchor)
 
-  // Keep the toggle at the top of the text area while it grows and shrinks.
+  // Keep the toggle just above the text box while it grows and shrinks.
   const sync = () => {
     const editor = props.voice.editor?.()
     const top = editor?.y
     const base = wrapper.y
     if (typeof top !== "number" || typeof base !== "number") return
-    const offset = Math.round(top - base)
+    // One row above the text area: the row that sits over the text box.
+    const offset = Math.round(top - base) - 1
     if (anchor.top !== offset) anchor.top = offset
   }
   const timer = setInterval(sync, 400)
