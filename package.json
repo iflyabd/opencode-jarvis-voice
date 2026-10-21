@@ -1,6 +1,6 @@
 {
   "name": "opencode-jarvis-voice",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "private": false,
   "type": "module",
   "description": "Local voice for OpenCode by default: push-to-talk, read-aloud with pause/resume, Whisper ears and a Piper voice. Optional Fish Audio cloud voices and speech-to-text.",
@@ -44,8 +44,9 @@
     "check": "cd plugin && npx tsc --noEmit",
     "test:ui": "cd plugin && bun test/ui.check.ts",
     "test:flow": "cd plugin && bun test/flow.check.ts",
+    "test:layout": "cd plugin && bun test/layout.check.tsx",
     "test:daemon": ".venv/bin/python daemon/test_turns.py",
-    "test": "npm run check && npm run test:ui && npm run test:flow && npm run test:daemon"
+    "test": "npm run check && npm run test:ui && npm run test:flow && npm run test:layout && npm run test:daemon"
   },
   "dependencies": {
     "@opencode/plugin": "2.1.2"

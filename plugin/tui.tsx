@@ -34,7 +34,7 @@
 import { Plugin } from "@opencode/plugin/tui"
 import { createVoiceController } from "./controller"
 import { createMessageButtons } from "./message-buttons"
-import { LiveButton, MicButton } from "./ui"
+import { LiveButton, MicButton, PromptFooterLive } from "./ui"
 
 export default Plugin.define({
   id: "jarvis-voice.cli",
@@ -49,20 +49,14 @@ export default Plugin.define({
         append: "prompt.footer",
         render: (input) => {
           const route = context.ui?.router?.current?.()
-          return (
-            <>
-              {/* A brand new chat is the home screen. It has no
-                  session.composer.top slot, but the prompt box is a
-                  positioned container, so the toggle can be anchored to
-                  the top-right corner of the text box itself. */}
-              {route?.type === "home" ? (
-                <box position="absolute" top={0} right={0} zIndex={2000} flexShrink={0}>
-                  <LiveButton context={context} voice={voice} compact />
-                </box>
-              ) : null}
-              <MicButton context={context} voice={voice} sessionID={input.sessionID} />
-            </>
-          )
+          if (route?.type === "home") {
+            // A brand new chat: the live toggle is anchored to the
+            // top-right of the text area, the mic stays in the footer.
+            return (
+              <PromptFooterLive context={context} voice={voice} sessionID={input.sessionID} />
+            )
+          }
+          return <MicButton context={context} voice={voice} sessionID={input.sessionID} />
         },
       })
     }

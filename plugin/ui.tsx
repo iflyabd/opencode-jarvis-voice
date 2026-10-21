@@ -135,13 +135,9 @@ export function MicButton(props: ButtonProps) {
   )
 }
 
-/**
- * Live voice: the microphone keeps listening, every turn is sent on its own
- * and the answer is read back, until it is switched off again.
- */
-export function LiveButton(props: ButtonProps & { compact?: boolean }) {
+/** The live button's label, colour and hover handling. */
+function liveLabel(props: ButtonProps) {
   const [hovered, setHovered] = createSignal(false)
-
   const theme = () => props.context.theme
   const on = () => props.voice.live?.() === true
 
@@ -154,11 +150,82 @@ export function LiveButton(props: ButtonProps & { compact?: boolean }) {
 
   const { node: text, paint } = liveText(props.voice, { fg, label })
 
-  const hover = (value: boolean) => {
-    setHovered(value)
-    paint()
+  return {
+    text,
+    on,
+    hover: (value: boolean) => {
+      setHovered(value)
+      paint()
+    },
   }
+}
 
+/**
+ * The prompt footer on the home screen, where a new chat starts.
+ *
+ * That screen publishes no slot above the text box, so the live toggle is
+ * anchored to the top-right of the text area instead: an absolutely
+ * positioned box inside the footer row, moved up to the text area with the
+ * measured offset. The mic button stays in the footer row where it always was.
+ */
+export function PromptFooterLive(props: ButtonProps) {
+  const live = liveLabel(props)
+
+  // OpenTUI only honours `position` when it is set after the element exists.
+  const wrapper: any = createElement("box")
+  wrapper.position = "relative"
+  wrapper.flexShrink = 0
+  wrapper.flexDirection = "row"
+  wrapper.justifyContent = "flex-end"
+
+  const anchor: any = createElement("box")
+  anchor.position = "absolute"
+  anchor.right = 0
+  anchor.top = -1
+  anchor.zIndex = 2000
+  anchor.flexShrink = 0
+
+  const label: any = createElement("box")
+  label.flexShrink = 0
+  label.paddingRight = 1
+  label.onMouseOver = () => live.hover(true)
+  label.onMouseOut = () => live.hover(false)
+  label.onMouseUp = (event: any) => {
+    event?.preventDefault?.()
+    event?.stopPropagation?.()
+    if (event?.button === RIGHT_MOUSE_BUTTON) return
+    void props.voice.toggleLive(props.sessionID)
+  }
+  label.add(live.text)
+  anchor.add(label)
+  wrapper.add(anchor)
+
+  // Keep the toggle at the top of the text area while it grows and shrinks.
+  const sync = () => {
+    const editor = props.voice.editor?.()
+    const top = editor?.y
+    const base = wrapper.y
+    if (typeof top !== "number" || typeof base !== "number") return
+    const offset = Math.round(top - base)
+    if (anchor.top !== offset) anchor.top = offset
+  }
+  const timer = setInterval(sync, 400)
+  onCleanup(() => clearInterval(timer))
+
+  return (
+    <box flexShrink={0} flexDirection="row" justifyContent="flex-end">
+      {wrapper}
+      <MicButton context={props.context} voice={props.voice} sessionID={props.sessionID} />
+    </box>
+  )
+}
+
+/**
+ * Live voice: the microphone keeps listening, every turn is sent on its own
+ * and the answer is read back, until it is switched off again.
+ */
+export function LiveButton(props: ButtonProps & { compact?: boolean }) {
+  const live = liveLabel(props)
   return (
     <box
       width={props.compact ? undefined : "100%"}
@@ -169,8 +236,8 @@ export function LiveButton(props: ButtonProps & { compact?: boolean }) {
       <box
         flexShrink={0}
         paddingRight={1}
-        onMouseOver={() => hover(true)}
-        onMouseOut={() => hover(false)}
+        onMouseOver={() => live.hover(true)}
+        onMouseOut={() => live.hover(false)}
         onMouseUp={(event: any) => {
           event?.preventDefault?.()
           event?.stopPropagation?.()
@@ -178,7 +245,7 @@ export function LiveButton(props: ButtonProps & { compact?: boolean }) {
           void props.voice.toggleLive(props.sessionID)
         }}
       >
-        {text}
+        {live.text}
       </box>
     </box>
   )
