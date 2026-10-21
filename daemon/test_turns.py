@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import jv_audio  # noqa: E402
 import jv_server  # noqa: E402
+import jv_tts  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -97,7 +98,83 @@ check("no device keeps the normal order",
       "pulse-sles" in jv_audio.device_backend_order(""))
 
 
-# ------------------------------------------------------------------- result
+# ----------------------------------------------------------------- speaking
+
+class _FakeAudio:
+    """Records what the speaker does, without touching a sound card."""
+
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.stopped = 0
+
+    def stop_playback(self) -> None:
+        self.stopped += 1
+        self.events.append("stop")
+
+    def play_wav(self, path, timeout=120) -> dict:
+        self.events.append(f"play:{Path(path).stem}")
+        return {"backend": "fake", "ok": True}
+
+
+def _stub_synthesize(events: list[str], delay: float = 0.05):
+    def fake(text: str, backend=None, use_cache=True, fish=None):
+        events.append(f"synth:{text[:12]}")
+        time.sleep(delay)
+        out = Path("/tmp/opencode/jarvis-test-tts")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"RIFF" + b"\0" * 64)
+        return {"path": str(out), "backend": backend or "fish", "cached": False, "ms": 0}
+    return fake
+
+
+def _speak_checks() -> None:
+    events: list[str] = []
+    fake_audio = _FakeAudio(events)
+    real_audio = jv_tts.audio
+    real_synth = jv_tts.synthesize
+    jv_tts.audio = fake_audio
+    jv_tts.synthesize = _stub_synthesize(events)
+    try:
+        # 1. An async utterance returns at once and plays in the background.
+        out = jv_tts.speak("first reply", backend="fish", wait=False, fish={"apiKey": "k", "voiceId": "v"})
+        check("an async utterance returns immediately", out.get("queued") is True, str(out)[:120])
+        time.sleep(0.4)
+        check("the background job played the clip", "play:jarvis-test-tts" in events, str(events))
+        check("the old voice was cut before rendering", events[0] == "stop", str(events))
+
+        # 2. A second utterance supersedes the first: only one voice plays.
+        events.clear()
+        jv_tts.synthesize = _stub_synthesize(events, delay=0.3)
+        jv_tts.speak("one", backend="fish", wait=False, fish={"apiKey": "k", "voiceId": "v"})
+        time.sleep(0.05)
+        jv_tts.speak("two", backend="fish", wait=False, fish={"apiKey": "k", "voiceId": "v"})
+        time.sleep(0.8)
+        plays = [e for e in events if e.startswith("play:")]
+        check("only one voice plays at a time", len(plays) == 1, str(events))
+        check("the newest utterance is the one that plays", "synth:two" in events, str(events))
+
+        # 3. A long reply is rendered in chunks, and the first chunk is
+        #    played before the rest is rendered.
+        events.clear()
+        jv_tts.synthesize = _stub_synthesize(events, delay=0.05)
+        long_text = ("One. Two. Three. Four. Five. Six. Seven. Eight. Nine. Ten. " * 12)
+        jv_tts.speak(long_text, backend="fish", wait=False, fish={"apiKey": "k", "voiceId": "v"})
+        time.sleep(1.2)
+        first_play = next((i for i, e in enumerate(events) if e.startswith("play:")), None)
+        synths_before = len([e for e in events[:first_play] if e.startswith("synth:")]) if first_play is not None else -1
+        total_synths = len([e for e in events if e.startswith("synth:")])
+        check("a long reply is rendered in several chunks", total_synths >= 2, str(total_synths))
+        check(
+            "the first chunk plays before the whole reply is rendered",
+            first_play is not None and synths_before == 1,
+            f"first_play={first_play} synths_before={synths_before} total={total_synths}",
+        )
+    finally:
+        jv_tts.audio = real_audio
+        jv_tts.synthesize = real_synth
+
+
+_speak_checks()
 
 if FAILURES:
     print(f"\n{len(FAILURES)} check(s) failed")

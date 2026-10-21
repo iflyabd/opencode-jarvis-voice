@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-DAEMON_VERSION = "1.3.1"
+DAEMON_VERSION = "1.4.0"
 
 # ----------------------------------------------------------------------------
 # Paths
@@ -229,6 +229,9 @@ FISH_API_KEY = os.environ.get("JARVIS_VOICE_FISH_KEY") or os.environ.get("FISH_A
 FISH_VOICE_ID = os.environ.get("JARVIS_VOICE_FISH_VOICE") or os.environ.get("FISH_VOICE_ID", "")
 FISH_MODEL = os.environ.get("JARVIS_VOICE_FISH_MODEL", "s2.1-pro-free")
 FISH_LATENCY = os.environ.get("JARVIS_VOICE_FISH_LATENCY", "balanced")
+# A cloud reply is rendered in chunks so the first sound arrives early. The
+# chunk size is in characters; a smaller chunk means a faster start.
+FISH_CHUNK_CHARS = int(os.environ.get("JARVIS_VOICE_FISH_CHUNK_CHARS", "220"))
 FISH_TIMEOUT = float(os.environ.get("JARVIS_VOICE_FISH_TIMEOUT", "60"))
 FISH_API_URL = os.environ.get("JARVIS_VOICE_FISH_URL", "https://api.fish.audio/v1/tts")
 # Optional cloud ears. The TUI passes the key per request; the env vars are

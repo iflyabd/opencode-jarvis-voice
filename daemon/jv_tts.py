@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -361,29 +362,188 @@ def synthesize(text: str, backend: str | None = None, use_cache: bool = True,
 
 def speak(text: str, backend: str | None = None, wait: bool = True,
           fish: dict | None = None) -> dict:
-    """Synthesize and play through the local speakers."""
-    info = synthesize(text, backend=backend, fish=fish)
-    # One voice at a time: an older utterance is cut off, not layered under
-    # the new one.
-    audio.stop_playback()
-    if wait:
-        play = audio.play_wav(info["path"])
-        info["playback"] = play
-    else:
+    """Synthesize and play through the local speakers.
 
-        def _play_async() -> None:
+    One voice at a time. A new utterance takes the speaker: the current
+    playback is cut *before* the new one is rendered, because a cloud voice
+    can take seconds to synthesize and two voices must never talk over each
+    other. An utterance that is superseded while it renders is dropped
+    instead of playing later.
+    """
+    backend = backend or pick_backend()
+    gen = _take_speak_generation()
+    try:
+        audio.stop_playback()
+    except Exception:
+        pass
+    if backend == "fish":
+        return _speak_fish(text, gen, wait, fish or {})
+    return _speak_single(text, gen, wait, backend, fish)
+
+
+# ----------------------------------------------------------------------------
+# The speaker: one utterance at a time
+# ----------------------------------------------------------------------------
+
+_speak_lock = threading.Lock()
+_speak_gen = 0
+_speak_active = False
+
+
+def _take_speak_generation() -> int:
+    """Claim the speaker. A newer call supersedes the one before it."""
+    global _speak_gen, _speak_active
+    with _speak_lock:
+        _speak_gen += 1
+        _speak_active = True
+        return _speak_gen
+
+
+def _speak_current(gen: int) -> bool:
+    with _speak_lock:
+        return gen == _speak_gen
+
+
+def _finish_speak(gen: int) -> None:
+    global _speak_active
+    with _speak_lock:
+        if gen == _speak_gen:
+            _speak_active = False
+
+
+def speaking() -> bool:
+    """True while an utterance is being rendered or played."""
+    with _speak_lock:
+        return _speak_active
+
+
+def _speak_single(text: str, gen: int, wait: bool, backend: str | None,
+                  fish: dict | None) -> dict:
+    """Render one clip and play it."""
+    if wait:
+        info = synthesize(text, backend=backend, fish=fish)
+        if not _speak_current(gen):
+            info.update({"spoken": False, "superseded": True})
+            _finish_speak(gen)
+            return info
+        try:
+            info["playback"] = audio.play_wav(info["path"])
+        finally:
+            _finish_speak(gen)
+        info["spoken"] = True
+        return info
+
+    def _run() -> None:
+        try:
+            info = synthesize(text, backend=backend, fish=fish)
+            if not _speak_current(gen):
+                return
+            audio.play_wav(info["path"])
+        except audio.AudioError:
+            # A stop, interrupt or superseding utterance cancels playback on
+            # purpose; only real failures would be worth reporting and the
+            # daemon reports those through /speech and /health.
+            pass
+        except Exception:
+            pass
+        finally:
+            _finish_speak(gen)
+
+    # The request returns straight away: the reply is already on its way to
+    # the speakers, and the caller can show the "playing" state at once.
+    threading.Thread(target=_run, daemon=True).start()
+    return {"backend": backend, "spoken": True, "queued": True, "ms": 0,
+            "chars": len(text or ""), "playback": {"backend": "async", "ok": True}}
+
+
+# ----------------------------------------------------------------------------
+# Fish: render the reply in chunks so the first sound arrives early
+# ----------------------------------------------------------------------------
+
+def _split_for_speech(text: str, max_chars: int | None = None) -> list[str]:
+    """Split a reply into chunks that can be rendered one at a time.
+
+    The split follows sentence boundaries: a cloud voice that renders a whole
+    reply in one request can take many seconds before the first sound, while
+    the first chunk is ready in a fraction of that time.
+    """
+    limit = max_chars or cfg.FISH_CHUNK_CHARS
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if not text:
+        return []
+    chunks: list[str] = []
+    current = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) > limit:
+            # A very long sentence: break it on word boundaries.
+            piece = ""
+            for word in sentence.split(" "):
+                if piece and len(piece) + len(word) + 1 > limit:
+                    chunks.append(piece)
+                    piece = word
+                else:
+                    piece = f"{piece} {word}".strip()
+            if piece:
+                current = f"{current} {piece}".strip()
+            continue
+        if current and len(current) + len(sentence) + 1 > limit:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        chunks.append(current)
+    return [c for c in chunks if c]
+
+
+def _speak_fish(text: str, gen: int, wait: bool, fish: dict) -> dict:
+    """Render a Fish reply chunk by chunk and play it in order."""
+    chunks = _split_for_speech(text)
+    if len(chunks) <= 1:
+        return _speak_single(text, gen, wait, "fish", fish)
+
+    state = {"chunks": len(chunks), "ms": 0}
+
+    def _run() -> None:
+        for index, chunk in enumerate(chunks):
+            if not _speak_current(gen):
+                return
+            options = dict(fish)
+            if index == 0:
+                # The first sound matters most: ask Fish for the fastest
+                # first chunk it can give.
+                options["latency"] = "low"
+            t0 = time.time()
+            try:
+                info = synthesize(chunk, backend="fish", fish=options)
+            except Exception:
+                return
+            state["ms"] += int((time.time() - t0) * 1000)
+            if not _speak_current(gen):
+                return
             try:
                 audio.play_wav(info["path"])
             except audio.AudioError:
-                # A stop, interrupt or superseding utterance cancels playback
-                # on purpose; only real failures would be worth reporting and
-                # the daemon reports those through /speech and /health.
-                pass
+                return
+            except Exception:
+                return
 
-        threading.Thread(target=_play_async, daemon=True).start()
-        info["playback"] = {"backend": "async", "ok": True}
-    info["spoken"] = True
-    return info
+    def _run_and_finish() -> None:
+        try:
+            _run()
+        finally:
+            _finish_speak(gen)
+
+    if wait:
+        _run_and_finish()
+    else:
+        threading.Thread(target=_run_and_finish, daemon=True).start()
+    return {"backend": "fish", "spoken": True, "queued": True, "ms": 0,
+            "chunks": state["chunks"], "chars": len(text or ""),
+            "playback": {"backend": "async", "ok": True}}
 
 
 def warmup() -> dict:

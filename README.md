@@ -322,6 +322,30 @@ tells you whether the chosen device hears anything. A microphone that is
 picked explicitly never falls back to another one: if it cannot be opened,
 the turn fails with the reason instead of quietly recording somewhere else.
 
+### Reading a reply with Fish Audio
+
+Cloud voices are not instant, so the daemon does three things to make a reply
+start quickly:
+
+- **The request returns at once.** The rendering and the playback happen in
+  the background, so the UI shows "playing" immediately instead of waiting
+  for the whole clip.
+- **The reply is rendered in chunks** (sentences, about 220 characters each).
+  The first chunk starts playing as soon as it is ready, and the rest follow
+  in order, so the time to the first sound is a fraction of the time to
+  render the whole reply. The first chunk is asked for with Fish's fastest
+  latency mode.
+- **Every chunk is cached**, so reading the same reply again is instant.
+
+Set `JARVIS_VOICE_FISH_CHUNK_CHARS` to change the chunk size (a smaller chunk
+starts sooner), and `JARVIS_VOICE_FISH_LATENCY` to change the quality/latency
+balance of the rest (`low`, `balanced` or `normal`).
+
+**One voice at a time.** Pressing *read* on another answer while something is
+playing cuts the current voice first and starts the new one - two voices never
+talk over each other. A reply that is still rendering when a new one starts is
+dropped instead of playing later.
+
 ### Optional Fish Audio speech-to-text
 
 Local Whisper stays the default, and your mic audio stays on the device unless
@@ -484,6 +508,7 @@ Everything is an environment variable, read at daemon start:
 | `JARVIS_VOICE_FISH_VOICE` | — | optional Fish Audio voice/model id |
 | `JARVIS_VOICE_FISH_MODEL` | `s2.1-pro-free` | Fish TTS model header |
 | `JARVIS_VOICE_FISH_LATENCY` | `balanced` | `balanced`, `normal`, or `low` |
+| `JARVIS_VOICE_FISH_CHUNK_CHARS` | `220` | characters per rendered chunk; smaller starts the voice sooner |
 | `JARVIS_VOICE_FISH_ASR_MODEL` | `transcribe-1-pro` | Fish ASR model header (`transcribe-1-pro` or `transcribe-1`) |
 | `JARVIS_VOICE_FISH_ASR_URL` | `https://api.fish.audio/v1/asr` | override for testing a proxy or mock |
 | `JARVIS_VOICE_FISH_ASR_TIMEOUT` | `60` | seconds to wait for a Fish ASR response |

@@ -323,9 +323,12 @@ def speech_status() -> dict:
     """Playback status for the TUI play/pause button."""
     st = audio.playback_status()
     last = _state["speech"]
+    # A cloud reply is rendered before it plays, and a chunked reply has a
+    # short gap between the chunks. The speaker is busy in both cases.
+    active = bool(st["playing"] or tts.speaking())
     return {
         "ok": True,
-        "active": st["playing"],
+        "active": active,
         "paused": st["paused"],
         "text": last.get("text") or "",
         "backend": last.get("backend"),
