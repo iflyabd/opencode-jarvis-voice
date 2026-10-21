@@ -216,7 +216,7 @@ async function mount(render: () => unknown, width = 40, height = 3) {
 /* ----------------------------------------------------------- answer picking */
 
 {
-  const { assistantAnswerText, latestAnswerText, speakable } = await import("../controller.ts")
+  const { assistantAnswerText, latestAnswerText, speakable, FISH_STT_LANGUAGES } = await import("../controller.ts")
 
   const withThinking = {
     type: "assistant",
@@ -249,9 +249,20 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     ]) === "answer one",
   )
   check("code-only reply is not spoken", speakable("```js\nconst x = 1\n```") === "", JSON.stringify(speakable("```js\nconst x = 1\n```")))
-  const long = speakable(`${"This is a sentence with real words. ".repeat(100)}`)
-  check("long reply is cut to a brief length", long.length <= 601, `len=${long.length}`)
+  const longText = `${"This is a sentence with real words. ".repeat(100)}`.trim()
+  const long = speakable(longText)
+  check("long reply is read in full", long.length > 600 && long.endsWith("real words."), `len=${long.length}`)
+  check("an explicit speech limit still clips", speakable(longText, 600).length <= 601)
   check("markdown fences are not read", !speakable("Hi ```code here``` bye").includes("code here"))
+
+  const sttCodes = FISH_STT_LANGUAGES.map((item) => item.code)
+  check("Fish STT exposes a broad language list", sttCodes.length >= 60, `codes=${sttCodes.length}`)
+  check(
+    "Fish STT includes major world languages",
+    ["en", "zh", "ja", "ko", "es", "ar", "hi", "fr", "de", "pt"].every((code) => sttCodes.includes(code)),
+    sttCodes.join(","),
+  )
+  check("Fish STT language codes are unique", new Set(sttCodes).size === sttCodes.length)
 }
 
 /* ----------------------------------------------------------- plugin wiring */

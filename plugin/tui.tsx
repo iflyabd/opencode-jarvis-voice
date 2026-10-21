@@ -128,7 +128,7 @@ export default Plugin.define({
         },
         {
           id: "voice.settings",
-          title: "Voice: settings (Fish Audio / microphone)",
+          title: "Voice: settings (Fish Audio / transcription / microphone)",
           group: "Jarvis Voice",
           palette: true,
           slash: { name: "voice-settings" },

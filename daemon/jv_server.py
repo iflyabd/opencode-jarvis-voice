@@ -8,15 +8,15 @@ talks to it on 127.0.0.1, so the plugin never needs a native audio stack.
 Endpoints (JSON unless noted):
   GET  /health            capability report: audio, stt, tts, voice, pulse
   GET  /devices           input devices / pulse sources
-  POST /ptt/start         begin push-to-talk capture        {max_ms?}
+  POST /ptt/start         begin push-to-talk capture        {max_ms?, stt?}
   POST /ptt/stop          end capture, transcribe, return   {}   -> {text,...}
   POST /ptt/cancel        discard the current capture
   GET  /ptt/state         current push-to-talk state
-  POST /listen            blocking capture + transcribe     {max_ms?, silence_ms?, ...}
+  POST /listen            blocking capture + transcribe     {max_ms?, silence_ms?, stt?, ...}
   POST /transcribe        raw 16-bit mono PCM or WAV body   -> {text}
   POST /speak             synthesize + play locally         {text, async?, backend?, fish?}
   POST /synth             synthesize only, returns audio/wav or audio/mpeg
-  POST /warmup            load the STT model now (no audio)
+  POST /warmup            load the local STT model now      {stt?}
   GET  /speech            what the speakers are doing now (playing/paused)
   POST /pause             suspend the current playback (SIGSTOP)
   POST /resume            continue a paused playback (SIGCONT)
@@ -183,9 +183,10 @@ def record_utterance(
 class PttSession:
     """One push-to-talk recording, owned by a background thread."""
 
-    def __init__(self, max_ms: int | None = None):
+    def __init__(self, max_ms: int | None = None, stt_options: dict | None = None):
         self.id = f"ptt-{int(time.time() * 1000)}"
         self.started_at = time.time()
+        self.stt_options = stt_options if isinstance(stt_options, dict) else None
         self.stop_event = threading.Event()
         self.state = "listening"      # listening -> transcribing -> done | error | cancelled
         self.result: dict | None = None
@@ -209,7 +210,7 @@ class PttSession:
                 self._done.set()
                 return
             self.state = "transcribing"
-            res = stt.transcribe(utt.pcm, utt.sr)
+            res = stt.transcribe(utt.pcm, utt.sr, options=self.stt_options)
             if self._cancelled:
                 self.state = "cancelled"
                 self.result = None
@@ -275,19 +276,24 @@ def _touch(path: str) -> None:
         _state["last_activity"] = time.time()
 
 
-def _maybe_warm_stt() -> None:
+def _maybe_warm_stt(options: dict | None = None) -> None:
     """lazy mode: load the STT model while the user is already speaking.
 
     Push-to-talk means a transcription is coming anyway, so the CPU work
     overlaps with the recording and the daemon never preloads while idle.
+    Fish ASR is cloud-hosted, so selecting it must not load Whisper.
     """
+    if stt.resolve_backend(options) == "fish":
+        # Do not flip the global warm flag: if the user switches back to
+        # local Whisper in this daemon's lifetime, it should still warm lazily.
+        return
     if cfg.WARMUP_MODE != "lazy" or _state["warm"]:
         return
     _state["warm"] = True
 
     def run() -> None:
         try:
-            st = stt.warmup()
+            st = stt.warmup(options)
             print(f"[jarvis-voice] stt warm (lazy): {st}", flush=True)
         except Exception as e:
             print(f"[jarvis-voice] stt warmup failed: {e}", flush=True)
@@ -461,6 +467,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/ptt/start":
                 body = self._json_body()
+                stt_options = body.get("stt") if isinstance(body.get("stt"), dict) else None
+                # Refuse a misconfigured cloud provider before opening the mic.
+                stt.validate_options(stt_options)
                 if _state["ptt"] and _state["ptt"].state in ("listening", "transcribing"):
                     _state["ptt"].cancel()
                 # Block until the phone mic is ready. The UI only flips to
@@ -473,8 +482,11 @@ class Handler(BaseHTTPRequestHandler):
                 if cfg.IS_ANDROID:
                     audio.prepare_sles()
                 audio.warm_capture(cfg.SAMPLE_RATE)
-                _state["ptt"] = PttSession(max_ms=body.get("max_ms") or body.get("maxMs"))
-                _maybe_warm_stt()
+                _state["ptt"] = PttSession(
+                    max_ms=body.get("max_ms") or body.get("maxMs"),
+                    stt_options=stt_options,
+                )
+                _maybe_warm_stt(stt_options)
                 return self._send(200, {"ok": True, "ptt": _state["ptt"].snapshot()})
 
             if path == "/ptt/stop":
@@ -494,6 +506,8 @@ class Handler(BaseHTTPRequestHandler):
 
             if path == "/listen":
                 body = self._json_body()
+                stt_options = body.get("stt") if isinstance(body.get("stt"), dict) else None
+                stt.validate_options(stt_options)
                 utt = record_utterance(
                     max_ms=body.get("max_ms"),
                     silence_ms=body.get("silence_ms"),
@@ -503,7 +517,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if utt.stats["audio_ms"] < 120 or not utt.pcm:
                     return self._send(200, {"ok": True, "text": "", "empty": True, "stats": utt.stats})
-                res = stt.transcribe(utt.pcm, utt.sr)
+                res = stt.transcribe(utt.pcm, utt.sr, options=stt_options)
                 res["stats"] = utt.stats
                 res["empty"] = not res.get("text")
                 if res["text"]:
@@ -533,7 +547,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, **out})
 
             if path == "/warmup":
-                out = stt.warmup()
+                body = self._json_body()
+                stt_options = body.get("stt") if isinstance(body.get("stt"), dict) else None
+                out = stt.warmup(stt_options)
                 if not out.get("ok"):
                     return self._send(503, {"error": out.get("reason") or "warmup failed", **out})
                 return self._send(200, {"ok": True, **out})

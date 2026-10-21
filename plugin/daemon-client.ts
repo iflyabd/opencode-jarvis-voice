@@ -28,6 +28,7 @@ export type Transcript = {
   model?: string
   ms?: number
   language?: string
+  language_code?: string
   stats?: Record<string, unknown>
 }
 
@@ -36,6 +37,18 @@ export type FishOptions = {
   voiceId: string
   model?: string
   latency?: string
+}
+
+export type FishSttOptions = {
+  apiKey: string
+  model?: string
+  /** Optional ISO 639-1 hint; empty/omitted means Fish auto-detects. */
+  language?: string
+}
+
+export type SttOptions = {
+  backend?: "local" | "fish"
+  fish?: FishSttOptions
 }
 
 export type SpeechStatus = {
@@ -249,7 +262,8 @@ export async function request<T = unknown>(
 
 export const api = {
   health: (info: DaemonInfo, deep = false) => getJsonWithAuth<Health>(info, `/health${deep ? "?deep=1" : ""}`),
-  pttStart: (info: DaemonInfo, maxMs?: number) => request(info, "/ptt/start", { body: { max_ms: maxMs } }),
+  pttStart: (info: DaemonInfo, maxMs?: number, stt?: SttOptions) =>
+    request(info, "/ptt/start", { body: { max_ms: maxMs, ...(stt ? { stt } : {}) } }),
   pttStop: (info: DaemonInfo, timeoutMs = 190000) => request<Transcript>(info, "/ptt/stop", { timeoutMs }),
   pttState: (info: DaemonInfo) => getJsonWithAuth<{ ptt: { id: string; state: string } | null }>(info, "/ptt/state"),
   pttCancel: (info: DaemonInfo) => request(info, "/ptt/cancel"),
@@ -259,7 +273,8 @@ export const api = {
     request(info, "/speak", { body: { text, ...opts }, timeoutMs: opts.timeoutMs ?? 190000 }),
   synth: (info: DaemonInfo, text: string, fish?: FishOptions) =>
     request<ArrayBuffer>(info, "/synth", { body: { text, fish }, raw: true }),
-  warmup: (info: DaemonInfo) => request(info, "/warmup", { body: {}, timeoutMs: 60000 }),
+  warmup: (info: DaemonInfo, stt?: SttOptions) =>
+    request(info, "/warmup", { body: stt ? { stt } : {}, timeoutMs: 60000 }),
   speech: (info: DaemonInfo) => getJsonWithAuth<SpeechStatus>(info, "/speech", 4000),
   // These routes take no arguments: send no body so a keep-alive connection
   // never carries unread bytes into the next request on older daemons too.

@@ -1,20 +1,31 @@
 """
-Speech-to-text. 100% local. Picks the best backend that is actually installed.
+Speech-to-text. Local by default, optional Fish Audio cloud ASR.
 
   faster-whisper   CTranslate2  - fastest on CPU, arm64 friendly (preferred)
   whisper          openai      - reference implementation
   whispercpp       whisper-cli - ggml, tiny footprint
   vosk            vosk        - streaming, very small
+  fish-asr         Fish Audio  - optional cloud transcription, explicit opt-in
+
+The local backends never send audio anywhere. Fish ASR is selected by the TUI
+settings or JARVIS_VOICE_STT=fish and receives one WAV per utterance. Its
+language hint is optional: Fish auto-detects and supports 80+ languages.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import os
+import re
 import shutil
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
+import uuid
 import wave
 from pathlib import Path
 
@@ -240,6 +251,140 @@ def transcribe_vosk(pcm: bytes, sr: int = cfg.SAMPLE_RATE) -> dict:
     return {"text": (json.loads(rec.FinalResult()).get("text") or "").strip(), "backend": "vosk", "model": model_dir}
 
 
+# ----------------------------------------------------------------------------
+# Optional Fish Audio cloud ASR
+# ----------------------------------------------------------------------------
+
+def _fish_opts(options: dict | None) -> dict:
+    if not isinstance(options, dict):
+        return {}
+    fish = options.get("fish")
+    return fish if isinstance(fish, dict) else {}
+
+
+def _language_hint(value: object) -> str:
+    """Normalize an optional ISO 639-1 hint. Empty means auto-detect."""
+    text = str(value or "").strip().lower()
+    if not text or text in ("auto", "detect", "automatic"):
+        return ""
+    text = re.split(r"[-_]", text)[0]
+    if not re.fullmatch(r"[a-z]{2}", text):
+        raise SttError("Fish Audio language must be a two-letter ISO 639-1 code (for example en, es, zh)")
+    return text
+
+
+def _fish_model(value: object) -> str:
+    model = str(value or cfg.FISH_ASR_MODEL or "transcribe-1-pro").strip()
+    # The model header is case-sensitive and an unknown value would silently
+    # fall back to transcribe-1, so normalize it before sending.
+    return model if model in ("transcribe-1-pro", "transcribe-1") else "transcribe-1-pro"
+
+
+def _pcm_to_wav(pcm: bytes, sr: int) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _fish_asr_error(body: bytes, code: int) -> str:
+    message = ""
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+        if isinstance(data, dict):
+            message = str(data.get("message") or data.get("error") or data.get("reason") or "")
+    except Exception:
+        message = body.decode("utf-8", "replace").strip()[:300]
+    out = f"Fish Audio STT HTTP {code}" + (f": {message}" if message else "")
+    if code == 401:
+        out += " (check the Fish Audio API key)"
+    elif code == 402:
+        out += " (add API credit at fish.audio/app/developers; ASR is separate from the free TTS model)"
+    return out
+
+
+def transcribe_fish(pcm: bytes, sr: int = cfg.SAMPLE_RATE, fish: dict | None = None) -> dict:
+    """Transcribe one utterance with Fish Audio's /v1/asr endpoint."""
+    fish = fish or {}
+    api_key = str(fish.get("apiKey") or cfg.FISH_API_KEY or "").strip()
+    if not api_key:
+        raise SttError("Fish Audio API key is not set (Voice: settings → Transcription in OpenCode)")
+    model = _fish_model(fish.get("model"))
+    language = _language_hint(fish.get("language"))
+    audio = _pcm_to_wav(pcm, sr)
+
+    boundary = "----jarvisvoice" + uuid.uuid4().hex
+    fields: dict[str, str] = {"ignore_timestamps": "true"}
+    if language:
+        fields["language"] = language
+    if model == "transcribe-1-pro":
+        # Clean command transcripts: no emotion cues, no speaker turns, and no
+        # word timestamps. Speaker markers are still stripped below if present.
+        fields["tag_audio_events"] = "false"
+        fields["diarize"] = "false"
+
+    parts: list[bytes] = []
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        )
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="audio"; filename="speech.wav"\r\n'
+        f"Content-Type: audio/wav\r\n\r\n".encode()
+    )
+    parts.append(audio)
+    parts.append(b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        cfg.FISH_ASR_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Accept": "application/json",
+            "model": model,
+            "User-Agent": f"opencode-jarvis-voice/{cfg.DAEMON_VERSION}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=cfg.FISH_ASR_TIMEOUT) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        raise SttError(_fish_asr_error(e.read() or b"", e.code)) from e
+    except urllib.error.URLError as e:
+        raise SttError(f"Fish Audio STT unreachable: {e.reason}") from e
+    except Exception as e:
+        raise SttError(f"Fish Audio STT request failed: {e}") from e
+
+    try:
+        data = json.loads(raw.decode("utf-8", "replace"))
+    except Exception as e:
+        raise SttError(f"Fish Audio STT returned invalid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise SttError("Fish Audio STT returned an unexpected response")
+
+    text = str(data.get("text") or "")
+    # transcribe-1-pro puts speaker tokens inline. A PTT turn is one speaker,
+    # so they are noise in the prompt; tag_audio_events=false removes cues.
+    text = re.sub(r"<\|speaker:\d+\|>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return {
+        "text": text,
+        "backend": "fish-asr",
+        "model": model,
+        "language": data.get("language"),
+        "language_code": data.get("language_code"),
+        "duration_s": round(float(data.get("duration") or 0.0), 2),
+        "request_id": data.get("request_id"),
+    }
+
+
 _ORDER = ["faster-whisper", "whisper", "whispercpp", "vosk"]
 
 _AVAIL_TTL = 15.0   # probing is cheap now, but status pages can poll; keep it free
@@ -279,13 +424,54 @@ def _probe_backends() -> list[dict]:
     return out
 
 
-def pick_backend() -> str | None:
-    if cfg.STT_BACKEND and cfg.STT_BACKEND != "auto":
-        return None if cfg.STT_BACKEND == "none" else cfg.STT_BACKEND
+def _pick_local() -> str | None:
     for b in available_backends():
         if b["ok"]:
             return b["backend"]
     return None
+
+
+def pick_backend() -> str | None:
+    if cfg.STT_BACKEND and cfg.STT_BACKEND != "auto":
+        if cfg.STT_BACKEND == "none":
+            return None
+        if cfg.STT_BACKEND in ("fish", "fish-asr", "fish_audio", "fish-audio"):
+            return "fish"
+        return cfg.STT_BACKEND
+    return _pick_local()
+
+
+def resolve_backend(options: dict | None = None, backend: str | None = None) -> str | None:
+    """Resolve a per-request backend, falling back to the daemon default.
+
+    An explicit "local" must stay local even when the daemon env says fish:
+    otherwise changing the provider in the TUI would not take effect.
+    """
+    explicit = str(
+        backend
+        or (options or {}).get("backend")
+        or (options or {}).get("provider")
+        or ""
+    ).strip().lower()
+    if explicit in ("fish", "fish-asr", "fish_audio", "fish-audio"):
+        return "fish"
+    if explicit == "local":
+        return _pick_local()
+    if explicit in ("", "auto"):
+        return pick_backend()
+    return explicit
+
+
+def validate_options(options: dict | None = None, backend: str | None = None) -> None:
+    """Fail before recording when a cloud backend is missing its credentials."""
+    if resolve_backend(options, backend) != "fish":
+        return
+    fish = _fish_opts(options)
+    api_key = str(fish.get("apiKey") or cfg.FISH_API_KEY or "").strip()
+    if not api_key:
+        raise SttError("Fish Audio API key is not set (Voice: settings → Transcription in OpenCode)")
+    _fish_model(fish.get("model"))
+    _language_hint(fish.get("language"))
 
 
 def _pcm_rms(pcm: bytes) -> float | None:
@@ -301,9 +487,14 @@ def _pcm_rms(pcm: bytes) -> float | None:
         return None
 
 
-def transcribe(pcm: bytes, sr: int = cfg.SAMPLE_RATE, backend: str | None = None) -> dict:
+def transcribe(
+    pcm: bytes,
+    sr: int = cfg.SAMPLE_RATE,
+    backend: str | None = None,
+    options: dict | None = None,
+) -> dict:
     """Transcribe 16-bit mono PCM. Returns {text, backend, model, ms}."""
-    backend = backend or pick_backend()
+    backend = resolve_backend(options, backend)
     if not backend:
         raise SttError("no local STT backend available. Install one:  pip install faster-whisper")
 
@@ -313,27 +504,35 @@ def transcribe(pcm: bytes, sr: int = cfg.SAMPLE_RATE, backend: str | None = None
                 "rms": round(level or 0.0, 6), "duration_s": round(len(pcm) / 2 / sr, 2)}
 
     t0 = time.time()
-    fn = {
-        "faster-whisper": transcribe_faster_whisper,
-        "faster_whisper": transcribe_faster_whisper,
-        "whisper": transcribe_openai_whisper,
-        "whispercpp": transcribe_whispercpp,
-        "whisper.cpp": transcribe_whispercpp,
-        "vosk": transcribe_vosk,
-    }.get(backend)
-    if fn is None:
-        raise SttError(f"unknown STT backend '{backend}'")
-    res = fn(pcm, sr)
+    if backend == "fish":
+        res = transcribe_fish(pcm, sr, _fish_opts(options))
+    else:
+        fn = {
+            "faster-whisper": transcribe_faster_whisper,
+            "faster_whisper": transcribe_faster_whisper,
+            "whisper": transcribe_openai_whisper,
+            "whispercpp": transcribe_whispercpp,
+            "whisper.cpp": transcribe_whispercpp,
+            "vosk": transcribe_vosk,
+        }.get(backend)
+        if fn is None:
+            raise SttError(f"unknown STT backend '{backend}'")
+        res = fn(pcm, sr)
     res["ms"] = int((time.time() - t0) * 1000)
     res["text"] = (res.get("text") or "").strip()
     return res
 
 
-def warmup() -> dict:
-    """Load the model now so the first real utterance is not slow."""
-    b = pick_backend()
+def warmup(options: dict | None = None, backend: str | None = None) -> dict:
+    """Load the local model now so the first real utterance is not slow."""
+    b = resolve_backend(options, backend)
     if not b:
         return {"ok": False, "reason": "no backend"}
+    if b == "fish":
+        # Cloud ASR has no local weights to warm. Returning ok keeps the
+        # preload button harmless when Fish is the selected provider.
+        return {"ok": True, "backend": "fish-asr", "skipped": True,
+                "reason": "Fish Audio ASR is cloud-hosted; nothing to preload"}
     t0 = time.time()
     try:
         if b in ("faster-whisper", "faster_whisper"):

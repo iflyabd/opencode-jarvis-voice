@@ -17,7 +17,16 @@
  */
 
 import { createSignal, type Accessor } from "solid-js"
-import { DaemonError, api, ensureDaemon, summarize, type DaemonInfo, type FishOptions, type Health } from "./daemon-client"
+import {
+  DaemonError,
+  api,
+  ensureDaemon,
+  summarize,
+  type DaemonInfo,
+  type FishOptions,
+  type Health,
+  type SttOptions,
+} from "./daemon-client"
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -30,11 +39,114 @@ type VoiceSettings = {
   fishVoiceId: string
   fishVoiceName: string
   fishModel: string
+  sttProvider: "local" | "fish"
+  fishSttModel: string
+  /** Optional ISO 639-1 hint; "" means Fish auto-detects. */
+  fishSttLanguage: string
 }
 
 type FishVoice = { id: string; title: string; description?: string }
 
 const FISH_MODEL = "s2.1-pro-free"
+const FISH_STT_MODEL = "transcribe-1-pro"
+
+/**
+ * Language hints accepted by Fish Audio ASR. Fish detects the language
+ * automatically (80+ languages); this list is only for users who want to
+ * steer short or ambiguous clips. "Other" accepts any ISO 639-1 code.
+ */
+export const FISH_STT_LANGUAGES: Array<{ code: string; name: string }> = [
+  { code: "af", name: "Afrikaans" },
+  { code: "sq", name: "Albanian" },
+  { code: "am", name: "Amharic" },
+  { code: "ar", name: "Arabic" },
+  { code: "hy", name: "Armenian" },
+  { code: "az", name: "Azerbaijani" },
+  { code: "be", name: "Belarusian" },
+  { code: "bn", name: "Bengali" },
+  { code: "bs", name: "Bosnian" },
+  { code: "bg", name: "Bulgarian" },
+  { code: "my", name: "Burmese" },
+  { code: "ca", name: "Catalan" },
+  { code: "zh", name: "Chinese" },
+  { code: "hr", name: "Croatian" },
+  { code: "cs", name: "Czech" },
+  { code: "da", name: "Danish" },
+  { code: "nl", name: "Dutch" },
+  { code: "en", name: "English" },
+  { code: "et", name: "Estonian" },
+  { code: "fi", name: "Finnish" },
+  { code: "fr", name: "French" },
+  { code: "gl", name: "Galician" },
+  { code: "ka", name: "Georgian" },
+  { code: "de", name: "German" },
+  { code: "el", name: "Greek" },
+  { code: "gu", name: "Gujarati" },
+  { code: "he", name: "Hebrew" },
+  { code: "hi", name: "Hindi" },
+  { code: "hu", name: "Hungarian" },
+  { code: "is", name: "Icelandic" },
+  { code: "id", name: "Indonesian" },
+  { code: "it", name: "Italian" },
+  { code: "ja", name: "Japanese" },
+  { code: "kn", name: "Kannada" },
+  { code: "kk", name: "Kazakh" },
+  { code: "ko", name: "Korean" },
+  { code: "ky", name: "Kyrgyz" },
+  { code: "lv", name: "Latvian" },
+  { code: "lt", name: "Lithuanian" },
+  { code: "mk", name: "Macedonian" },
+  { code: "ms", name: "Malay" },
+  { code: "ml", name: "Malayalam" },
+  { code: "mr", name: "Marathi" },
+  { code: "mn", name: "Mongolian" },
+  { code: "ne", name: "Nepali" },
+  { code: "no", name: "Norwegian" },
+  { code: "ps", name: "Pashto" },
+  { code: "fa", name: "Persian" },
+  { code: "pl", name: "Polish" },
+  { code: "pt", name: "Portuguese" },
+  { code: "pa", name: "Punjabi" },
+  { code: "ro", name: "Romanian" },
+  { code: "ru", name: "Russian" },
+  { code: "sr", name: "Serbian" },
+  { code: "si", name: "Sinhala" },
+  { code: "sk", name: "Slovak" },
+  { code: "sl", name: "Slovenian" },
+  { code: "so", name: "Somali" },
+  { code: "es", name: "Spanish" },
+  { code: "sw", name: "Swahili" },
+  { code: "sv", name: "Swedish" },
+  { code: "tl", name: "Tagalog" },
+  { code: "ta", name: "Tamil" },
+  { code: "te", name: "Telugu" },
+  { code: "th", name: "Thai" },
+  { code: "tr", name: "Turkish" },
+  { code: "uk", name: "Ukrainian" },
+  { code: "ur", name: "Urdu" },
+  { code: "uz", name: "Uzbek" },
+  { code: "vi", name: "Vietnamese" },
+  { code: "cy", name: "Welsh" },
+  { code: "xh", name: "Xhosa" },
+  { code: "zu", name: "Zulu" },
+]
+
+function normalizeSttModel(value: unknown): string {
+  const model = String(value ?? "").trim()
+  return model === "transcribe-1" ? "transcribe-1" : FISH_STT_MODEL
+}
+
+function normalizeSttLanguage(value: unknown): string {
+  let text = String(value ?? "").trim().toLowerCase()
+  if (!text || text === "auto") return ""
+  text = text.split(/[-_]/)[0]
+  return /^[a-z]{2}$/.test(text) ? text : ""
+}
+
+function sttLanguageName(code: string): string {
+  if (!code) return "Auto-detect"
+  return FISH_STT_LANGUAGES.find((item) => item.code === code)?.name ?? code
+}
 
 export type VoiceController = ReturnType<typeof createVoiceController>
 
@@ -126,8 +238,8 @@ export function latestAnswerText(messages: any[]): string {
   return latestAnswer(messages).text
 }
 
-/** Turn a markdown answer into something brief and worth listening to. */
-export function speakable(text: string, limit = 600): string {
+/** Turn a markdown answer into something worth listening to. */
+export function speakable(text: string, limit = 0): string {
   let out = text
     .replace(/```[\s\S]*?```/g, " (code) ")
     .replace(/`([^`]+)`/g, "$1")
@@ -144,7 +256,9 @@ export function speakable(text: string, limit = 600): string {
     .replace(/\n{2,}/g, ". ")
     .replace(/\n/g, " ")
     .trim()
-  if (out.length > limit) {
+  // Read long answers in full. Callers that need a preview can pass an
+  // explicit limit; the voice buttons deliberately do not truncate.
+  if (limit > 0 && out.length > limit) {
     const cut = out.slice(0, limit)
     const stop = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("! "), cut.lastIndexOf("? "))
     out = stop > limit * 0.4 ? cut.slice(0, stop + 1) : `${cut}...`
@@ -237,12 +351,16 @@ export function createVoiceController(context: any) {
   /* ------------------------------------------------------------- settings */
 
   const optionFish = context.options?.fishAudio ?? context.options?.fish ?? {}
+  const optionStt = context.options?.stt ?? context.options?.speechToText ?? {}
   const seedSettings: VoiceSettings = {
     ttsProvider: String(optionFish.provider ?? context.options?.ttsProvider ?? "local") === "fish" ? "fish" : "local",
     fishApiKey: String(optionFish.apiKey ?? context.options?.fishApiKey ?? ""),
     fishVoiceId: String(optionFish.voiceId ?? context.options?.fishVoiceId ?? ""),
     fishVoiceName: String(optionFish.voiceName ?? ""),
     fishModel: String(optionFish.model ?? context.options?.fishModel ?? FISH_MODEL),
+    sttProvider: String(optionStt.provider ?? context.options?.sttProvider ?? optionFish.sttProvider ?? "local") === "fish" ? "fish" : "local",
+    fishSttModel: normalizeSttModel(optionStt.model ?? context.options?.fishSttModel ?? optionFish.sttModel),
+    fishSttLanguage: normalizeSttLanguage(optionStt.language ?? context.options?.fishSttLanguage ?? optionFish.sttLanguage),
   }
 
   // context.storage is durable and shared between TUI instances; keep a plain
@@ -258,8 +376,27 @@ export function createVoiceController(context: any) {
         VoiceSettings,
         (mutation: (draft: VoiceSettings) => void) => Promise<void>,
       ]
+      // Keep the live Solid store object; replacing it with a plain object
+      // would stop reflecting later setStored() mutations. Settings created
+      // before Fish STT existed are missing the new fields, so backfill them
+      // in place without touching the user's TTS choice.
       settings = stored
       saveSettings = setStored
+      const needsMigration =
+        (stored.sttProvider !== "local" && stored.sttProvider !== "fish") ||
+        !stored.fishSttModel ||
+        typeof stored.fishSttLanguage !== "string"
+      if (needsMigration) {
+        void setStored((draft) => {
+          if (draft.sttProvider !== "local" && draft.sttProvider !== "fish") {
+            draft.sttProvider = seedSettings.sttProvider
+          }
+          draft.fishSttModel = normalizeSttModel(draft.fishSttModel ?? seedSettings.fishSttModel)
+          draft.fishSttLanguage = normalizeSttLanguage(draft.fishSttLanguage ?? seedSettings.fishSttLanguage)
+        }).catch(() => {
+          /* defaults still apply in memory */
+        })
+      }
     }
   } catch {
     /* storage unavailable: settings stay in memory for this TUI */
@@ -289,6 +426,32 @@ export function createVoiceController(context: any) {
       }
     }
     return {}
+  }
+
+  function sttRequest(): SttOptions {
+    // Always send an explicit backend: it lets the TUI override a daemon
+    // environment that defaults to Fish, and local selection must stay local.
+    if (settings.sttProvider !== "fish") return { backend: "local" }
+    return {
+      backend: "fish",
+      fish: {
+        apiKey: (settings.fishApiKey || "").trim(),
+        model: normalizeSttModel(settings.fishSttModel),
+        language: normalizeSttLanguage(settings.fishSttLanguage),
+      },
+    }
+  }
+
+  function sttReady(): boolean {
+    return settings.sttProvider !== "fish" || Boolean((settings.fishApiKey || "").trim())
+  }
+
+  function sttLabel(): string {
+    if (settings.sttProvider !== "fish") return "Local Whisper · on-device"
+    const model = normalizeSttModel(settings.fishSttModel)
+    const language = sttLanguageName(normalizeSttLanguage(settings.fishSttLanguage))
+    const key = (settings.fishApiKey || "").trim()
+    return `Fish Audio · ${model} · ${language}${key ? "" : " · key needed"}`
   }
 
   async function daemon(start = true): Promise<DaemonInfo | null> {
@@ -367,7 +530,7 @@ export function createVoiceController(context: any) {
       draft.fishApiKey = trimmed
       if (!draft.fishModel) draft.fishModel = FISH_MODEL
     })
-    toast("Fish Audio key saved. Now choose a voice.", "success")
+    toast("Fish Audio key saved.", "success")
     return true
   }
 
@@ -453,7 +616,184 @@ export function createVoiceController(context: any) {
     toast(`Fish Audio voice: ${voice?.title || picked}`, "success")
   }
 
+  async function chooseFishSttLanguage(): Promise<void> {
+    const options: Array<{ title: string; value: string; description?: string }> = [
+      {
+        title: "Auto-detect (recommended)",
+        value: "__auto__",
+        description: "Fish detects the spoken language; works across its 80+ supported languages",
+      },
+      ...FISH_STT_LANGUAGES.map((item) => ({
+        title: `${item.name} (${item.code})`,
+        value: item.code,
+        description: `ISO 639-1 hint: ${item.code}`,
+      })),
+      {
+        title: "Other ISO 639-1 code…",
+        value: "__other__",
+        description: "Type any two-letter language code",
+      },
+    ]
+    const picked: string | undefined = await context.ui.dialog.select({
+      title: "Fish Audio STT language",
+      placeholder: "Type to filter, then choose a language",
+      options,
+      current: settings.fishSttLanguage || "__auto__",
+    })
+    if (picked === undefined) return
+
+    if (picked === "__auto__") {
+      await persist((draft) => {
+        draft.fishSttLanguage = ""
+      })
+      toast("Fish Audio will detect the language automatically", "success")
+      return
+    }
+    if (picked === "__other__") {
+      if (!context.ui?.dialog?.prompt) {
+        toast("This TUI cannot prompt for a language code", "warning")
+        return
+      }
+      const raw = await context.ui.dialog.prompt({
+        title: "Fish Audio STT language code",
+        description:
+          "Enter a lowercase ISO 639-1 code, e.g. en, es, zh, ja. Fish still auto-detects; this is only a hint.",
+        placeholder: "two-letter code",
+        value: settings.fishSttLanguage || "",
+      })
+      if (raw === undefined) return
+      const text = raw.trim().toLowerCase()
+      if (!text || text === "auto") {
+        await persist((draft) => {
+          draft.fishSttLanguage = ""
+        })
+        toast("Fish Audio will detect the language automatically", "success")
+        return
+      }
+      const code = normalizeSttLanguage(text)
+      if (!code) {
+        toast("Use a two-letter ISO 639-1 code such as en, es, zh, or ja", "warning")
+        return
+      }
+      await persist((draft) => {
+        draft.fishSttLanguage = code
+      })
+      toast(`Fish Audio STT language hint: ${sttLanguageName(code)} (${code})`, "success")
+      return
+    }
+
+    const code = normalizeSttLanguage(picked)
+    if (!code) return
+    await persist((draft) => {
+      draft.fishSttLanguage = code
+    })
+    toast(`Fish Audio STT language hint: ${sttLanguageName(code)} (${code})`, "success")
+  }
+
+  async function openSttSettings(): Promise<void> {
+    if (!context.ui?.dialog?.select) {
+      await showVoiceInfo("stt")
+      return
+    }
+    for (;;) {
+      const key = (settings.fishApiKey || "").trim()
+      const provider = settings.sttProvider
+      const model = normalizeSttModel(settings.fishSttModel)
+      const language = sttLanguageName(normalizeSttLanguage(settings.fishSttLanguage))
+      const choice: string | undefined = await context.ui.dialog.select({
+        title: "Speech-to-text",
+        placeholder: "Choose how the microphone is transcribed",
+        options: [
+          {
+            title: provider === "local" ? "Local Whisper (active)" : "Use local Whisper",
+            value: "local",
+            description: "Private and offline; audio never leaves the device",
+          },
+          {
+            title: provider === "fish" ? "Fish Audio (active)" : "Use Fish Audio speech-to-text",
+            value: "fish",
+            description: key
+              ? `Cloud ASR · key ${maskKey(key)} · audio is uploaded`
+              : "Cloud ASR · needs an API key and API credit",
+          },
+          {
+            title: "Fish Audio ASR model",
+            value: "model",
+            description: model === "transcribe-1-pro" ? "transcribe-1-pro (recommended)" : "transcribe-1",
+          },
+          {
+            title: "Fish Audio language",
+            value: "language",
+            description: `${language} · auto-detect is recommended`,
+          },
+          {
+            title: "Fish Audio API key",
+            value: "key",
+            description: key ? `Current: ${maskKey(key)}` : "Not set",
+          },
+          { title: "Done", value: "done" },
+        ],
+      })
+      if (choice === undefined || choice === "done") return
+
+      if (choice === "local") {
+        await persist((draft) => {
+          draft.sttProvider = "local"
+        })
+        toast("Speech-to-text: local Whisper (audio stays on this device)", "success")
+      } else if (choice === "fish") {
+        if (!(settings.fishApiKey || "").trim()) {
+          const saved = await setFishKey()
+          if (!saved) continue
+        }
+        await persist((draft) => {
+          draft.sttProvider = "fish"
+        })
+        toast(
+          "Fish Audio will transcribe the mic. Audio is sent to api.fish.audio; local Whisper is off.",
+          "warning",
+        )
+      } else if (choice === "model") {
+        const picked: string | undefined = await context.ui.dialog.select({
+          title: "Fish Audio ASR model",
+          placeholder: "Choose the speech-to-text model",
+          current: model,
+          options: [
+            {
+              title: "transcribe-1-pro (recommended)",
+              value: "transcribe-1-pro",
+              description: "80+ languages, long audio, speaker labels; best accuracy",
+            },
+            {
+              title: "transcribe-1",
+              value: "transcribe-1",
+              description: "Short recordings; lighter response without speaker labels",
+            },
+          ],
+        })
+        if (picked) {
+          await persist((draft) => {
+            draft.fishSttModel = normalizeSttModel(picked)
+          })
+          toast(`Fish Audio ASR model: ${normalizeSttModel(picked)}`, "success")
+        }
+      } else if (choice === "language") {
+        await chooseFishSttLanguage()
+      } else if (choice === "key") {
+        await setFishKey()
+      }
+    }
+  }
+
   async function showVoiceInfo(kind: "mic" | "stt" | "status"): Promise<void> {
+    if (kind === "stt" && settings.sttProvider === "fish") {
+      const ready = sttReady()
+      toast(
+        `Transcription: ${sttLabel()}${ready ? "" : " — add the key in Voice: settings"}`,
+        ready ? "info" : "warning",
+      )
+      return
+    }
     const info = await daemonOrToast()
     if (!info) return
     try {
@@ -516,7 +856,7 @@ export function createVoiceController(context: any) {
             value: "mic",
             description: "Automatic: direct phone mic on Android, default mic elsewhere",
           },
-          { title: "Transcription", value: "stt", description: "Local Whisper, warmed while you speak" },
+          { title: "Transcription", value: "stt", description: sttLabel() },
           { title: "Show voice status", value: "status" },
         ],
       })
@@ -572,7 +912,9 @@ export function createVoiceController(context: any) {
           })
           toast(`Fish Audio model: ${model}`, "success")
         }
-      } else if (choice === "mic" || choice === "stt" || choice === "status") {
+      } else if (choice === "stt") {
+        await openSttSettings()
+      } else if (choice === "mic" || choice === "status") {
         await showVoiceInfo(choice)
       }
     }
@@ -581,9 +923,18 @@ export function createVoiceController(context: any) {
   async function preload(): Promise<void> {
     const info = await daemonOrToast()
     if (!info) return
+    if (!sttReady()) {
+      toast("Fish Audio STT needs an API key — open Voice: settings → Transcription", "warning")
+      return
+    }
     try {
-      await api.warmup(info)
-      toast("Speech model ready — transcription will be quick", "success")
+      await api.warmup(info, sttRequest())
+      toast(
+        settings.sttProvider === "fish"
+          ? "Fish Audio STT is cloud-hosted; no local model needs loading"
+          : "Speech model ready — transcription will be quick",
+        "success",
+      )
     } catch (e) {
       toast(`Could not warm the speech model: ${errorText(e)}`, "error")
     }
@@ -875,6 +1226,10 @@ export function createVoiceController(context: any) {
       return
     }
     if (micBusy) return
+    if (!sttReady()) {
+      toast("Fish Audio STT needs an API key — open Voice: settings → Transcription", "warning")
+      return
+    }
 
     micBusy = true
     micCancelled = false
@@ -882,7 +1237,7 @@ export function createVoiceController(context: any) {
     try {
       const info = await daemonOrToast()
       if (!info) return
-      await api.pttStart(info, 30000)
+      await api.pttStart(info, 30000, sttRequest())
       toast("🎙 Listening… speak now (press again to send)")
 
       // Wait for the capture turn to end on its own (silence detection).
@@ -937,7 +1292,14 @@ export function createVoiceController(context: any) {
       const info = await daemonOrToast()
       if (!info) return
       const h: Health = await api.health(info, true)
-      toast(`${summarize(h)}${h.audio?.capture?.backend ? "" : " (no mic)"}`, "info")
+      const bits = summarize(h).split(" | ")
+      if (settings.sttProvider === "fish") {
+        const idx = bits.findIndex((part) => part.startsWith("stt: "))
+        const label = `stt: Fish Audio (${normalizeSttModel(settings.fishSttModel)})`
+        if (idx >= 0) bits[idx] = label
+        else bits.push(label)
+      }
+      toast(`${bits.join(" | ")}${h.audio?.capture?.backend ? "" : " (no mic)"}`, "info")
       if (!h.audio?.capture?.backend) {
         const hint = h.audio?.capture?.hints?.[0]
         if (hint) toast(hint, "warning")

@@ -3,7 +3,7 @@
 **Local voice chat for OpenCode.** Speak to it, it answers out loud — a Piper
 voice in your ear, Whisper ears on your machine. Local by default: no cloud,
 no API keys, nothing leaves the device unless you explicitly turn on the
-optional Fish Audio voice.
+optional Fish Audio voice or speech-to-text.
 
 Press one key, talk, pause, and your words land in the prompt. The reply is
 spoken back in a JARVIS-style voice while it types.
@@ -31,7 +31,7 @@ Works the same on **Parrot OS**, **Termux / Android**, and a **normal PC**
   │  daemon (Python)            │  HTTP   │  OpenCode plugin (TypeScript) │
   │  · audio backends           │◄───────►│  · voice_listen  (tool)       │
   │  · voice-activity detection │127.0.0.1│  · voice_speak   (tool)       │
-  │  · Whisper  → text          │ :8765   │  · voice_status  (tool)       │
+  │  · Whisper / Fish ASR → text│ :8765   │  · voice_status  (tool)       │
   │  · Piper    → speech        │         │  · push-to-talk keybind       │
   └─────────────────────────────┘         └──────────────────────────────┘
         │
@@ -43,7 +43,8 @@ The daemon owns all the native audio work, which is why the same plugin works
 everywhere. Each capture backend runs in its **own child process**, so a wedged
 ALSA node or a native crash can never take the assistant down — and every read
 has a hard timeout, so a dead device reports an error instead of hanging.
-Speech-to-text is always local. Text-to-speech is local Piper by default, with
+Speech-to-text is local Whisper by default, with optional Fish Audio cloud ASR
+selected explicitly in settings. Text-to-speech is local Piper by default, with
 optional Fish Audio cloud voices selected explicitly in settings.
 
 ---
@@ -228,8 +229,8 @@ Reading rules:
 * `reasoning` parts (the grayed-out thinking text) are never spoken;
 * when a turn has several text parts (narration between tool calls, then the
   answer), only the **last** one is read;
-* the clip is trimmed to a brief, sentence-capped length (~600 characters),
-  with code blocks, tables and markdown symbols stripped first.
+* long answers are read in full, with code blocks, tables and markdown
+  symbols stripped first.
 
 ### Other commands
 
@@ -237,7 +238,7 @@ Reading rules:
 |---|---|
 | `Voice: push to talk` | record a turn (`ctrl+alt+v`) |
 | `Voice: read / pause / resume the reply` | one button for read, pause, resume (`ctrl+alt+p`) |
-| `Voice: settings (Fish Audio / microphone)` | choose the voice provider, API key, voice, and inspect mic/STT |
+| `Voice: settings (Fish Audio / transcription / microphone)` | choose the voice and speech-to-text providers, API key, voice, language; inspect mic/STT |
 | `Voice: preload the speech model` | load Whisper now so the next transcript is fast |
 | `Voice: status` | what mic, STT model, TTS voice are in use |
 | `Voice: cancel listening / stop speaking` | shut it up immediately |
@@ -250,7 +251,8 @@ Piper stays the default and works offline. If you want a cloned or library
 voice, Fish Audio can be selected on demand:
 
 1. Open the command palette (`ctrl+p`) and run
-   **`Voice: settings (Fish Audio / microphone)`**, or type `/voice-settings`.
+   **`Voice: settings (Fish Audio / transcription / microphone)`**, or type
+   `/voice-settings`.
 2. Choose **Fish Audio API key** and paste a key from
    [fish.audio](https://fish.audio) → API keys.
 3. Choose **Fish Audio voice** to list the voices in your account, search the
@@ -261,14 +263,44 @@ voice, Fish Audio can be selected on demand:
    Choose **Use local JARVIS voice** to switch back at any time.
 
 The key is kept in OpenCode's local plugin storage, is sent only to
-`api.fish.audio` over HTTPS, and is never written to the repo, logs, or a
-toast. When Fish is active the **spoken text** is sent to Fish Audio; the mic
-audio and Whisper transcription stay local. If the key or voice is missing,
-the plugin falls back to the local Piper voice rather than silently failing.
+`api.fish.audio` over HTTPS (plus the loopback daemon), and is never written
+to the repo, logs, or a toast. With Fish **TTS** active the spoken text is
+sent to Fish Audio; mic audio and Whisper transcription stay local unless you
+also enable Fish **STT** below. If the key or voice is missing, TTS falls back
+to the local Piper voice rather than silently failing.
 
 Advanced/CLI use can set `JARVIS_VOICE_FISH_KEY`, `JARVIS_VOICE_FISH_VOICE`,
 and `JARVIS_VOICE_FISH_MODEL`; the settings dialog is preferred because it
 stores the key without putting it in a shell history or committed config.
+
+### Optional Fish Audio speech-to-text
+
+Local Whisper stays the default, and your mic audio stays on the device unless
+you switch this on. When you want cloud ASR — for a language Whisper's tiny
+models handle poorly, or for better accuracy on a slow phone — open
+`/voice-settings` → **Transcription**:
+
+1. Choose **Use Fish Audio speech-to-text**. The Fish Audio key from the voice
+   section is reused; if none is set, the dialog asks for one.
+2. Optional: choose **Fish Audio ASR model**. `transcribe-1-pro` is the default
+   and recommended — 80+ languages, long recordings, and speaker support.
+   `transcribe-1` is the lighter short-clip model.
+3. Optional: choose **Fish Audio language**. **Auto-detect** is recommended and
+   works across Fish's supported languages. Pick a hint for short or ambiguous
+   clips, or choose **Other ISO 639-1 code** and type any two-letter code.
+4. Choose **Use local Whisper** at any time to stop uploading audio.
+
+Fish still detects the language automatically when a hint is set, so the hint
+never limits which language can be spoken. The setting affects push-to-talk in
+the TUI. The agent's `voice_listen` tool uses the daemon default, which remains
+local unless you start the daemon with `JARVIS_VOICE_STT=fish` and
+`JARVIS_VOICE_FISH_KEY` in its environment.
+
+> **Privacy and billing:** selecting Fish ASR sends each recorded utterance to
+> `api.fish.audio` over HTTPS. The key is stored in OpenCode's local plugin
+> storage, never in the repo or logs. Fish ASR uses API credit separate from
+> the free TTS model; without credit the daemon returns a clear HTTP 402 error
+> and suggests adding credit at `fish.audio/app/developers`.
 
 ### Let the agent use voice itself
 
@@ -391,15 +423,19 @@ Everything is an environment variable, read at daemon start:
 | `JARVIS_VOICE_CAPTURE_BACKEND` | auto | force `pulse`, `pulse-sles`, `sounddevice`, `termux`, … |
 | `JARVIS_VOICE_SLES` | `1` | set `0` to disable the direct Android phone-mic backend |
 | `JARVIS_VOICE_SLES_SOURCE` | `jarvis_mic` | PulseAudio source name used for the direct phone mic |
+| `JARVIS_VOICE_STT` | `auto` | `auto`, a local backend, `fish`, or `none`; the TUI setting wins per request |
 | `JARVIS_VOICE_WHISPER_MODEL` | `tiny.en` | `tiny.en`, `tiny` (multilingual), `base`, `small`, `medium`, `large-v3` |
 | `JARVIS_VOICE_WHISPER_DIR` | — | local model folder, for purely offline use |
-| `JARVIS_VOICE_LANGUAGE` | auto | e.g. `en` to skip detection |
+| `JARVIS_VOICE_LANGUAGE` | auto | local Whisper hint, e.g. `en` to skip detection |
 | `JARVIS_VOICE_PIPER_VOICE` | auto | explicit `.onnx` path or voice name |
 | `JARVIS_VOICE_TTS` | auto | `piper`, `piper-bin`, `espeak`, `none` |
-| `JARVIS_VOICE_FISH_KEY` | — | optional Fish Audio key; the settings dialog is preferred |
+| `JARVIS_VOICE_FISH_KEY` | — | optional Fish TTS/ASR key; the settings dialog is preferred |
 | `JARVIS_VOICE_FISH_VOICE` | — | optional Fish Audio voice/model id |
 | `JARVIS_VOICE_FISH_MODEL` | `s2.1-pro-free` | Fish TTS model header |
 | `JARVIS_VOICE_FISH_LATENCY` | `balanced` | `balanced`, `normal`, or `low` |
+| `JARVIS_VOICE_FISH_ASR_MODEL` | `transcribe-1-pro` | Fish ASR model header (`transcribe-1-pro` or `transcribe-1`) |
+| `JARVIS_VOICE_FISH_ASR_URL` | `https://api.fish.audio/v1/asr` | override for testing a proxy or mock |
+| `JARVIS_VOICE_FISH_ASR_TIMEOUT` | `60` | seconds to wait for a Fish ASR response |
 | `JARVIS_VOICE_VAD_THRESHOLD` | `0.012` | raise it in a noisy room |
 | `JARVIS_VOICE_VAD_SILENCE_MS` | `900` | silence that ends a turn |
 | `JARVIS_VOICE_LENGTH_SCALE` | `1.0` | Piper speed; `1.1` is a touch slower |
@@ -468,7 +504,8 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
 | `mic` | `true` | show the 🎙 mic button in the prompt footer |
 | `speak` | `true` | show the 🔊 read / pause button above the text box |
 | `autoSpeak` | `true` | speak replies automatically after push-to-talk starts the turn |
-| `fishAudio` | — | optional `{ provider, apiKey, voiceId, voiceName, model }`; the settings dialog is safer for keys |
+| `fishAudio` | — | optional `{ provider, apiKey, voiceId, voiceName, model, sttProvider, sttModel, sttLanguage }`; the settings dialog is safer for keys |
+| `stt` | — | optional `{ provider, model, language }` defaults for speech-to-text; normally set in the settings dialog |
 
 The **`Voice: settings`** dialog is the normal way to configure Fish Audio:
 it stores the key in OpenCode's local plugin storage, masks it in the UI, and
@@ -482,16 +519,21 @@ token from `~/.cache/jarvis-voice/daemon.json`:
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | capability report (`?deep=1` re-probes the mic) |
-| `POST /ptt/start` · `POST /ptt/stop` · `POST /ptt/cancel` · `GET /ptt/state` | push-to-talk session |
-| `POST /listen` | record one utterance, return the transcript |
+| `POST /ptt/start` · `POST /ptt/stop` · `POST /ptt/cancel` · `GET /ptt/state` | push-to-talk session; `/ptt/start` accepts `{max_ms?, stt?}` |
+| `POST /listen` | record one utterance, return the transcript; accepts `{max_ms?, silence_ms?, stt?}` |
 | `POST /transcribe` | raw PCM/WAV in, text out |
 | `POST /speak` | synthesize + play (`{text, async?, backend?, fish?}`) |
 | `POST /synth` | synthesize only, returns `audio/wav` or `audio/mpeg` |
-| `POST /warmup` | load the STT model now (no audio) |
+| `POST /warmup` | load the local STT model now (no audio); accepts `{stt?}` and is a no-op for Fish |
 | `GET /speech` | what the speakers are doing now (`active`, `paused`, `elapsed_ms`) |
 | `POST /pause` · `POST /resume` | suspend / continue the current playback (`SIGSTOP` / `SIGCONT`) |
 | `POST /interrupt` | stop capture and playback |
 | `POST /probe` · `POST /shutdown` | re-probe the audio, stop the daemon |
+
+The optional `stt` object has the shape
+`{ "backend": "fish", "fish": { "apiKey": "…", "model": "transcribe-1-pro", "language": "en" } }`.
+`backend: "local"` forces on-device Whisper even if the daemon environment
+defaults to Fish.
 
 ### Speech-to-text speed & quality
 
@@ -508,7 +550,10 @@ Run `./bin/voice fetch-model tiny.en` once to get the faster English weights.
 Setting `JARVIS_VOICE_WHISPER_MODEL` explicitly always honours your choice.
 
 `tiny.en` is English-only. For another language use multilingual `tiny`, or a
-larger model for noisy rooms and accents:
+larger model for noisy rooms and accents. Alternatively select Fish Audio ASR
+in `/voice-settings` → **Transcription**; it supports 80+ languages and does
+the decoding on Fish's servers, at the cost of uploading the utterance and
+using paid API credit:
 
 ```bash
 export JARVIS_VOICE_WHISPER_MODEL=tiny      # multilingual
@@ -540,7 +585,7 @@ opencode-jarvis-voice/
 ├── daemon/
 │   ├── jv_server.py          # HTTP API + push-to-talk sessions + playback control
 │   ├── jv_audio.py           # capture/playback backends, crash-isolated, pause/resume
-│   ├── jv_stt.py             # faster-whisper / whisper / whisper.cpp / vosk
+│   ├── jv_stt.py             # faster-whisper / whisper / whisper.cpp / vosk / Fish ASR
 │   ├── jv_tts.py             # Piper / piper binary / espeak
 │   ├── jv_voices.py          # Piper voice discovery, registry, download
 │   └── jv_config.py          # paths, platform detection, tuning
@@ -569,7 +614,9 @@ optional accelerants that the daemon reports on and degrades without.
 | espeak voice instead of Piper | no voice found — `./bin/voice voice list` |
 | It hears you but the transcript is wrong | bigger model: `JARVIS_VOICE_WHISPER_MODEL=base`; `tiny.en` is English-only |
 | Fish Audio says key/voice not set | `ctrl+p` → **Voice: settings**, add the API key, then choose a voice |
-| Fish Audio HTTP 401/402 | check the key on fish.audio; the free model may need credit for some voices |
+| Fish Audio HTTP 401/402 | check the key on fish.audio; the free TTS model may need credit for some voices. Fish **ASR** uses separate API credit — add it at `fish.audio/app/developers` |
+| Fish ASR hears the wrong language | leave the language on **Auto-detect**; it is only a hint. For short clips choose the language under **Transcription → Fish Audio language** |
+| Local Whisper is still used after choosing Fish | open `/voice-settings` → **Transcription** and confirm **Fish Audio (active)**; push-to-talk sends the choice with every turn, while the agent's `voice_listen` tool follows the daemon default |
 | It cuts you off too early | `JARVIS_VOICE_VAD_SILENCE_MS=1500` |
 | It triggers on background noise | `JARVIS_VOICE_VAD_THRESHOLD=0.02` |
 | The key does nothing | restart OpenCode; confirm `voice.pushToTalk` in `ctrl+p` |

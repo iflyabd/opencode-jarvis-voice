@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-DAEMON_VERSION = "1.0.5"
+DAEMON_VERSION = "1.1.0"
 
 # ----------------------------------------------------------------------------
 # Paths
@@ -152,7 +152,7 @@ PULSE_SERVER = os.environ.get("PULSE_SERVER", "")
 # Speech-to-text
 # ----------------------------------------------------------------------------
 
-STT_BACKEND = os.environ.get("JARVIS_VOICE_STT", "auto").strip().lower()   # auto|faster-whisper|whisper|whispercpp|vosk|none
+STT_BACKEND = os.environ.get("JARVIS_VOICE_STT", "auto").strip().lower()   # auto|faster-whisper|whisper|whispercpp|vosk|fish|none
 # tiny.en is noticeably faster and more accurate than multilingual tiny for
 # English. Set JARVIS_VOICE_WHISPER_MODEL=tiny (or auto) for other languages.
 WHISPER_MODEL = os.environ.get("JARVIS_VOICE_WHISPER_MODEL", "tiny.en")     # tiny.en|tiny|base|small|medium|large-v3
@@ -228,6 +228,11 @@ FISH_MODEL = os.environ.get("JARVIS_VOICE_FISH_MODEL", "s2.1-pro-free")
 FISH_LATENCY = os.environ.get("JARVIS_VOICE_FISH_LATENCY", "balanced")
 FISH_TIMEOUT = float(os.environ.get("JARVIS_VOICE_FISH_TIMEOUT", "60"))
 FISH_API_URL = os.environ.get("JARVIS_VOICE_FISH_URL", "https://api.fish.audio/v1/tts")
+# Optional cloud ears. The TUI passes the key per request; the env vars are
+# for CLI/agent use. Fish ASR is billed separately from the free TTS model.
+FISH_ASR_URL = os.environ.get("JARVIS_VOICE_FISH_ASR_URL", "https://api.fish.audio/v1/asr")
+FISH_ASR_MODEL = os.environ.get("JARVIS_VOICE_FISH_ASR_MODEL", "transcribe-1-pro")
+FISH_ASR_TIMEOUT = float(os.environ.get("JARVIS_VOICE_FISH_ASR_TIMEOUT", "60"))
 
 # Where we look for Piper voices, in priority order.
 VOICE_SEARCH_DIRS = [
