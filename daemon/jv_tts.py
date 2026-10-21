@@ -15,6 +15,7 @@ import collections
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import struct
@@ -356,6 +357,11 @@ def synthesize(text: str, backend: str | None = None, use_cache: bool = True,
     actual = Path(info.get("path") or tmp)
     final = out if actual == tmp else out.with_suffix(actual.suffix)
     actual.replace(final)
+    # Trim the tail once, before the clip is shared through the cache. Doing
+    # it at playback time rewrote a cached file in place - and a reader that
+    # was playing that same file could hear it cut off mid-word.
+    if final.suffix.lower() == ".wav":
+        _trim_wav_tail(final)
     info.update({"path": str(final), "cached": False, "ms": int((time.time() - t0) * 1000),
                  "chars": len(text)})
     return info
@@ -380,8 +386,11 @@ def speak(text: str, backend: str | None = None, wait: bool = True,
     backend = backend or pick_backend()
     if append:
         return enqueue_speech(text, backend=backend, fish=fish)
-    clear_speech_queue()
-    return _speak_now(text, backend=backend, wait=wait, fish=fish)
+    # Claim the speaker while the queue lock is held. A queue worker that was
+    # just about to start a sentence cannot then take the newest generation
+    # and cut this utterance off.
+    gen = _take_speaker(drop_queue=True)
+    return _speak_now(text, backend=backend, wait=wait, fish=fish, gen=gen)
 
 
 def _speak_now(text: str, backend: str | None = None, wait: bool = True,
@@ -429,6 +438,40 @@ def _take_speak_generation() -> int:
         _speak_gen += 1
         _speak_active = True
         return _speak_gen
+
+
+def _take_speaker(drop_queue: bool = False) -> int:
+    """Claim the speaker, optionally dropping queued speech in the same step.
+
+    The queue worker claims a generation while holding the queue lock. A new
+    utterance must do the same, otherwise the worker can slip in between the
+    queue clear and the claim and supersede the utterance that just started.
+    """
+    global _queue_gen
+    if not drop_queue:
+        return _take_speak_generation()
+    with _queue_lock:
+        _queue_gen += 1
+        _queue.clear()
+        return _take_speak_generation()
+
+
+def stop_speaking() -> dict:
+    """Stop the current utterance and everything queued behind it.
+
+    Bumping the generation matters as much as stopping the player: a chunked
+    reply checks it between chunks, so an interrupt cannot resume with the
+    next paragraph (which used to overlap the newly requested read).
+    """
+    global _queue_gen, _speak_gen, _speak_active
+    with _queue_lock:
+        _queue_gen += 1
+        dropped = len(_queue)
+        _queue.clear()
+        with _speak_lock:
+            _speak_gen += 1
+            _speak_active = False
+    return {"dropped": dropped}
 
 
 def _speak_current(gen: int) -> bool:
@@ -607,6 +650,12 @@ def _split_for_speech(text: str, max_chars: int | None = None) -> list[str]:
         if not sentence:
             continue
         if len(sentence) > limit:
+            # Flush the sentences already waiting before adding pieces of this
+            # one. Appending them first put later words ahead of earlier ones,
+            # which the listener hears as cut/repeated speech.
+            if current:
+                chunks.append(current)
+                current = ""
             # A very long sentence: break it on word boundaries.
             piece = ""
             for word in sentence.split(" "):
@@ -616,7 +665,7 @@ def _split_for_speech(text: str, max_chars: int | None = None) -> list[str]:
                 else:
                     piece = f"{piece} {word}".strip()
             if piece:
-                current = f"{current} {piece}".strip()
+                current = piece
             continue
         if current and len(current) + len(sentence) + 1 > limit:
             chunks.append(current)
@@ -672,69 +721,136 @@ def _trim_wav_tail(path: Path, keep_ms: int = 60) -> None:
 def _speak_chunked(text: str, gen: int, wait: bool, backend: str, fish: dict | None) -> dict:
     """Render a reply chunk by chunk and play it in order.
 
-    The next chunk is rendered while the current one is playing, so the reply
-    does not stop between the paragraphs while the next request is made.
+    A producer renders up to two chunks ahead while the current one plays, so
+    a slow cloud render does not leave a silent gap between paragraphs. A
+    failed chunk is retried; if Fish stays unreachable, the rest of the reply
+    continues with the local voice instead of stopping mid-sentence.
     """
     chunks = _split_for_speech(text)
     if len(chunks) <= 1:
         return _speak_single(text, gen, wait, backend, fish)
 
-    state = {"chunks": len(chunks), "ms": 0}
+    # Only local backends are a fallback: asking Fish again after Fish failed
+    # would just burn another timeout.
+    fallback = None
+    if backend == "fish":
+        alt = pick_backend()
+        if alt and alt != "fish":
+            fallback = alt
 
-    def _render(chunk: str, fast: bool) -> dict:
+    state = {"chunks": len(chunks), "ms": 0, "backend": backend}
+    ready: "queue.Queue[tuple[int, dict] | None]" = queue.Queue(maxsize=2)
+    stop = threading.Event()
+    started = threading.Event()
+
+    def _render(chunk: str, fast: bool, backend_name: str) -> dict:
         options = dict(fish or {})
-        if fast and backend == "fish":
-            # The first sound matters most: ask Fish for the fastest
-            # first chunk it can give.
+        if fast and backend_name == "fish":
+            # The first sound matters most: ask Fish for the fastest first
+            # chunk it can give. Retries use the normal latency.
             options["latency"] = "low"
         t0 = time.time()
-        info = synthesize(chunk, backend=backend, fish=options or None)
+        info = synthesize(chunk, backend=backend_name, fish=options or None)
         state["ms"] += int((time.time() - t0) * 1000)
-        try:
-            _trim_wav_tail(Path(info["path"]))
-        except Exception:
-            pass
         return info
+
+    def _render_retry(chunk: str, fast: bool, backend_name: str) -> dict:
+        attempts = 3 if backend_name == "fish" else 1
+        last: Exception | None = None
+        for attempt in range(attempts):
+            if stop.is_set() or not _speak_current(gen):
+                raise audio.AudioError("superseded")
+            try:
+                return _render(chunk, fast and attempt == 0, backend_name)
+            except Exception as e:
+                last = e
+                if attempt + 1 < attempts:
+                    # Fish's free tier can rate-limit a burst of chunks; a
+                    # short pause rides over it without losing the sentence.
+                    time.sleep(0.5 * (2 ** attempt))
+        raise last or audio.AudioError("tts render failed")
+
+    def _put(item) -> bool:
+        while not stop.is_set():
+            try:
+                ready.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _produce() -> None:
+        backend_now = backend
+        for index, chunk in enumerate(chunks):
+            if stop.is_set() or not _speak_current(gen):
+                break
+            try:
+                try:
+                    info = _render_retry(chunk, index == 0, backend_now)
+                except Exception as e:
+                    if (not stop.is_set() and backend_now == "fish" and fallback
+                            and _speak_current(gen)):
+                        print(f"[jarvis-voice] tts: Fish chunk failed ({e}); "
+                              f"continuing with {fallback}", flush=True)
+                        backend_now = fallback
+                        state["backend"] = fallback
+                        info = _render_retry(chunk, index == 0, backend_now)
+                    else:
+                        raise
+            except Exception as e:
+                if not stop.is_set() and _speak_current(gen):
+                    print(f"[jarvis-voice] tts: chunk skipped: {e}", flush=True)
+                continue
+            if stop.is_set() or not _speak_current(gen):
+                break
+            if not _put((index, info)):
+                break
+            if index == 0:
+                # Let the first clip reach the speakers before rendering
+                # ahead, so a fast local render cannot pile up in front of it.
+                started.wait(2.0)
+        _put(None)
 
     def _play(path: str) -> None:
         try:
             audio.play_wav(path)
-        except audio.AudioError:
-            pass
-        except Exception:
-            pass
+        except audio.AudioError as e:
+            print(f"[jarvis-voice] tts: playback failed: {e}", flush=True)
+        except Exception as e:
+            print(f"[jarvis-voice] tts: playback failed: {type(e).__name__}: {e}", flush=True)
+
+    def _consume() -> None:
+        while True:
+            if stop.is_set() or not _speak_current(gen):
+                return
+            try:
+                item = ready.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                return
+            index, info = item
+            if stop.is_set() or not _speak_current(gen):
+                return
+            if index == 0:
+                started.set()
+            _play(info["path"])
 
     def _run() -> None:
-        pending: dict | None = None
-        for index, chunk in enumerate(chunks):
-            if not _speak_current(gen):
-                return
-            if pending is None:
-                pending = _render(chunk, index == 0)
-            current = pending
-            pending = None
-            # Play this chunk while the next one is rendered in the background.
-            player = threading.Thread(target=_play, args=(current["path"],), daemon=True)
-            player.start()
-            if index + 1 < len(chunks):
-                try:
-                    pending = _render(chunks[index + 1], False)
-                except Exception:
-                    pending = None
-            player.join()
-            if not _speak_current(gen):
-                return
-
-    def _run_and_finish() -> None:
+        producer = threading.Thread(target=_produce, daemon=True, name="tts-produce")
+        producer.start()
         try:
-            _run()
+            _consume()
         finally:
+            stop.set()
+            started.set()
             _finish_speak(gen)
+            producer.join(timeout=1.0)
 
     if wait:
-        _run_and_finish()
+        _run()
     else:
-        threading.Thread(target=_run_and_finish, daemon=True).start()
+        threading.Thread(target=_run, daemon=True, name="tts-chunked").start()
     return {"backend": backend, "spoken": True, "queued": True, "ms": 0,
             "chunks": state["chunks"], "chars": len(text or ""),
             "playback": {"backend": "async", "ok": True}}

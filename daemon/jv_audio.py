@@ -1106,7 +1106,36 @@ def _playback_candidates() -> list[str]:
         c.append("termux-media-player")
     if cfg.IS_WINDOWS:
         c.append("powershell")
+    # Start with the player that worked last time. On a phone the first
+    # candidate can fail after a second of audio, and falling through to the
+    # next one used to replay the same clip from the beginning.
+    last = _playback_state.get("last_ok")
+    if last in c:
+        c.remove(last)
+        c.insert(0, last)
     return c
+
+
+_PLAYBACK_HINT = cfg.CACHE_DIR / "playback-backend"
+
+
+def _load_playback_hint() -> str | None:
+    try:
+        value = _PLAYBACK_HINT.read_text().strip()
+        return value or None
+    except Exception:
+        return None
+
+
+def _remember_playback(backend: str) -> None:
+    if _playback_state.get("last_ok") == backend:
+        return
+    _playback_state["last_ok"] = backend
+    try:
+        _PLAYBACK_HINT.parent.mkdir(parents=True, exist_ok=True)
+        _PLAYBACK_HINT.write_text(backend)
+    except Exception:
+        pass
 
 
 _playback_state: dict = {
@@ -1115,7 +1144,14 @@ _playback_state: dict = {
     "paused": False,
     "started_at": 0.0,
     "command": None,
+    "last_ok": _load_playback_hint(),
 }
+
+
+# A player that dies sooner than this never produced sound worth hearing;
+# trying the next backend is safe. After it, retrying would replay the clip
+# from the start - the "cut then repeat" the reader used to produce.
+_PLAYED_ANY_MS = 350
 
 
 def play_wav(path: str | Path, timeout: float = 120) -> dict:
@@ -1124,6 +1160,7 @@ def play_wav(path: str | Path, timeout: float = 120) -> dict:
         raise AudioError(f"audio file missing: {path}")
     errors = []
     for backend in _playback_candidates():
+        started = time.time()
         try:
             if backend in ("paplay", "aplay", "ffplay", "play"):
                 cmd = {
@@ -1135,6 +1172,7 @@ def play_wav(path: str | Path, timeout: float = 120) -> dict:
                 _blocking_play(cmd, timeout)
             elif backend == "termux-media-player":
                 _blocking_play([_which("termux-media-player") or "termux-media-player", "play", str(path)], timeout=8)
+                _remember_playback(backend)
                 return {"backend": backend, "ok": True, "note": "handed to the Android media player"}
             elif backend == "powershell":
                 ps = _which("powershell") or "powershell"
@@ -1145,9 +1183,15 @@ def play_wav(path: str | Path, timeout: float = 120) -> dict:
                 _blocking_play(cmd, timeout)
             else:
                 continue
+            _remember_playback(backend)
             return {"backend": backend, "ok": True}
         except Exception as e:
             errors.append(f"{backend}: {type(e).__name__}: {e}"[:200])
+            if (time.time() - started) * 1000 >= _PLAYED_ANY_MS:
+                # Part of the clip reached the speaker. A second backend would
+                # start it over, stutter, and repeat the first words: stop here
+                # and let the caller decide (usually the next chunk, if any).
+                raise AudioError("playback failed after audio started. " + " | ".join(errors)) from e
             continue
     raise AudioError("no playback backend worked. " + " | ".join(errors))
 
@@ -1216,7 +1260,24 @@ def stop_playback() -> None:
             p.terminate()
         except Exception:
             pass
-    _playback_state["paused"] = False
+        # Wait for it to actually let go of the speaker. Without this, a new
+        # utterance can start while the old one is still draining its buffer,
+        # and the two voices overlap (heard as cut/repeated words).
+        deadline = time.time() + 1.5
+        while time.time() < deadline and p.poll() is None:
+            time.sleep(0.02)
+        if p.poll() is None:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            deadline = time.time() + 0.5
+            while time.time() < deadline and p.poll() is None:
+                time.sleep(0.02)
+    with _playback_state["lock"]:
+        if _playback_state.get("proc") is p:
+            _playback_state["proc"] = None
+            _playback_state["paused"] = False
     if _which("termux-media-player"):
         _run(["termux-media-player", "stop"], timeout=4)
 

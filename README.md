@@ -405,11 +405,23 @@ start quickly:
 - **The reply is rendered in chunks** (sentences, about 220 characters each).
   The first chunk starts playing as soon as it is ready, and the rest follow
   in order, so the time to the first sound is a fraction of the time to
-  render the whole reply. The first chunk is asked for with Fish's fastest
-  latency mode.
-- **The chunks run into each other.** The next chunk is rendered *while* the
-  current one is playing, and the silence at the end of every clip is
-  trimmed, so the reply does not pause between the paragraphs.
+  render the whole reply. Sentences always keep their order, including very
+  long ones that have to be split across chunks. The first chunk is asked for
+  with Fish's fastest latency mode.
+- **The chunks run into each other.** Up to two chunks are rendered *while*
+  the current one is playing, and the silence at the end of every clip is
+  trimmed, so the reply does not pause between the paragraphs. The silence is
+  trimmed once when the clip is rendered, never while a cached clip is
+  playing.
+- **A failed chunk does not end the reply.** Fish requests are retried three
+  times; if Fish stays unreachable, the rest of the answer continues with the
+  local voice instead of stopping mid-sentence.
+- **A clip that already reached the speaker is never replayed.** If a player
+  dies after part of a clip was heard, the daemon does not fall through to
+  another player and start that clip over. It remembers the player that
+  worked last and tries that one first.
+- **Interrupting stops the whole read.** A new *read* request invalidates the
+  reader, so the next paragraph cannot start over the newly requested voice.
 - **Every chunk is cached**, so reading the same reply again is instant.
 
 Set `JARVIS_VOICE_FISH_CHUNK_CHARS` to change the chunk size (a smaller chunk

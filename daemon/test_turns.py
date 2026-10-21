@@ -552,6 +552,218 @@ def _queue_checks() -> None:
 
 _queue_checks()
 
+
+# --------------------------------------------------------------- the reader
+
+def _reader_checks() -> None:
+    """The reader must cut a clip once, never restart it, and never go mute."""
+    import struct
+    import wave
+
+    clip = Path("/tmp/opencode/jv-reader-check.wav")
+    clip.parent.mkdir(parents=True, exist_ok=True)
+    clip.write_bytes(b"RIFF" + b"\0" * 64)
+
+    real_block = jv_audio._blocking_play
+    real_last = jv_audio._playback_state.get("last_ok")
+    real_hint = jv_audio._PLAYBACK_HINT
+    hint = Path("/tmp/opencode/jv-playback-hint")
+    try:
+        hint.unlink()
+    except OSError:
+        pass
+    jv_audio._PLAYBACK_HINT = hint
+    calls: list[str] = []
+    try:
+        # 1. A player that dies after it started must not be followed by
+        #    another player replaying the same clip from the beginning.
+        jv_audio._playback_state["last_ok"] = None
+        candidates = jv_audio._playback_candidates()
+        check("the device has at least two playback candidates", len(candidates) >= 2, str(candidates))
+
+        def late_failure(cmd, timeout):
+            calls.append(cmd[0].rsplit("/", 1)[-1])
+            time.sleep(0.45)
+            raise jv_audio.AudioError("stream died after starting")
+
+        jv_audio._blocking_play = late_failure
+        raised = False
+        try:
+            jv_audio.play_wav(clip)
+        except jv_audio.AudioError as e:
+            raised = "after audio started" in str(e)
+        check("a clip that already played is not replayed on another backend",
+              raised and len(calls) == 1, f"raised={raised} calls={calls}")
+
+        # 2. A player that fails before any sound is safe to replace.
+        calls.clear()
+
+        def early_failure(cmd, timeout):
+            calls.append(cmd[0].rsplit("/", 1)[-1])
+            if len(calls) == 1:
+                raise jv_audio.AudioError("sink refused")
+            return None
+
+        jv_audio._blocking_play = early_failure
+        jv_audio._playback_state["last_ok"] = None
+        got = jv_audio.play_wav(clip)
+        check("a player that fails before any sound falls through",
+              got.get("backend") == candidates[1] and len(calls) == 2,
+              f"{got} candidates={candidates} calls={calls}")
+
+        # 3. The player that worked last time goes first next time.
+        jv_audio._blocking_play = lambda cmd, timeout: None
+        got = jv_audio.play_wav(clip)
+        check("the last working player is tried first",
+              got.get("backend") == candidates[1],
+              f"{got} candidates={candidates}")
+    finally:
+        jv_audio._blocking_play = real_block
+        jv_audio._playback_state["last_ok"] = real_last
+        jv_audio._PLAYBACK_HINT = real_hint
+        try:
+            clip.unlink()
+            hint.unlink()
+        except OSError:
+            pass
+
+    # 4. A transient Fish failure is retried, and every chunk still plays.
+    real_synth = jv_tts.synthesize
+    real_play = jv_tts.audio.play_wav
+    real_pick = jv_tts.pick_backend
+    real_limit = jv_tts.cfg.FISH_CHUNK_CHARS
+    jv_tts.cfg.FISH_CHUNK_CHARS = 16
+    events: list[tuple[str, str]] = []
+    attempts: dict[str, int] = {}
+    path_text: dict[str, str] = {}
+
+    def flaky_synth(text: str, backend=None, use_cache=True, fish=None):
+        attempts[text] = attempts.get(text, 0) + 1
+        if "fails" in text and attempts[text] <= 2:
+            raise jv_tts.TtsError("Fish Audio HTTP 503")
+        out = Path(f"/tmp/opencode/jv-reader-{len(path_text)}.wav")
+        out.write_bytes(b"RIFF" + b"\0" * 64)
+        path_text[str(out)] = text
+        return {"path": str(out), "backend": backend or "fish", "cached": False, "ms": 1}
+
+    def fake_play(path, timeout=120):
+        events.append(("play", path_text.get(str(path), Path(path).stem)))
+        return {"backend": "fake", "ok": True}
+
+    jv_tts.synthesize = flaky_synth
+    jv_tts.audio.play_wav = fake_play
+    try:
+        sentence = ("alpha beta gamma delta " * 8).strip() + " omega."
+        split = jv_tts._split_for_speech("Short first. " + sentence + " Final.", max_chars=20)
+        check("a long sentence never jumps ahead of the sentence before it",
+              split[0] == "Short first."
+              and " ".join(split) == "Short first. " + sentence + " Final.",
+              str(split)[:160])
+
+        text = "First part. It fails now. Last part."
+        jv_tts.speak(text, backend="fish", wait=True, fish={"apiKey": "k", "voiceId": "v"})
+        played = [value for kind, value in events if kind == "play"]
+        check("a failed chunk is retried and the reply still finishes",
+              attempts.get("It fails now.") == 3
+              and played == ["First part.", "It fails now.", "Last part."],
+              f"attempts={attempts} played={played}")
+
+        # 5. When Fish stays down the local voice takes over instead of
+        #    leaving the rest of the answer unread.
+        events.clear()
+        attempts.clear()
+        path_text.clear()
+        used: list[str | None] = []
+
+        def fish_down_synth(text: str, backend=None, use_cache=True, fish=None):
+            used.append(backend)
+            if backend == "fish":
+                raise jv_tts.TtsError("Fish Audio HTTP 503")
+            out = Path(f"/tmp/opencode/jv-local-{len(path_text)}.wav")
+            out.write_bytes(b"RIFF" + b"\0" * 64)
+            path_text[str(out)] = text
+            return {"path": str(out), "backend": backend, "cached": False, "ms": 1}
+
+        jv_tts.synthesize = fish_down_synth
+        jv_tts.pick_backend = lambda: "piper"
+        jv_tts.speak("One part. Two part. Three part.", backend="fish", wait=True,
+                     fish={"apiKey": "k", "voiceId": "v"})
+        played = [value for kind, value in events if kind == "play"]
+        check("Fish going down mid-reply continues with the local voice",
+              "fish" in used and "piper" in used
+              and played == ["One part.", "Two part.", "Three part."],
+              f"used={used} played={played}")
+
+        # 6. An interrupt invalidates the reader: the next paragraph must not
+        #    start over the newly requested read.
+        events.clear()
+        attempts.clear()
+        path_text.clear()
+        jv_tts.synthesize = flaky_synth
+        jv_tts.cfg.FISH_CHUNK_CHARS = 8
+        total = 8
+
+        def slow_play(path, timeout=120):
+            events.append(("play", path_text.get(str(path), Path(path).stem)))
+            time.sleep(0.35)
+            return {"backend": "fake", "ok": True}
+
+        jv_tts.audio.play_wav = slow_play
+        long_text = " ".join(f"Part {i}." for i in range(total))
+        jv_tts.speak(long_text, backend="fish", wait=False, fish={"apiKey": "k", "voiceId": "v"})
+        time.sleep(0.1)
+        dropped = jv_tts.stop_speaking()
+        time.sleep(1.0)
+        played = [value for kind, value in events if kind == "play"]
+        check("an interrupt stops a chunked reply and clears what waits",
+              len(played) <= 1 and jv_tts.speaking() is False,
+              f"played={played} dropped={dropped} speaking={jv_tts.speaking()}")
+        jv_tts.cfg.FISH_CHUNK_CHARS = 16
+    finally:
+        jv_tts.synthesize = real_synth
+        jv_tts.audio.play_wav = real_play
+        jv_tts.pick_backend = real_pick
+        jv_tts.cfg.FISH_CHUNK_CHARS = real_limit
+        jv_tts.clear_speech_queue()
+
+    # 7. Trimming happens once, when the clip is created - never while a
+    #    cached file might be playing.
+    real_synth = jv_tts.synthesize
+
+    def silent_tail(text: str, out: Path):
+        with wave.open(str(out), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(struct.pack("<h", 8000) * 4000)  # 0.25 s of tone
+            w.writeframes(struct.pack("<h", 0) * 4000)     # 0.25 s of silence
+        return {"path": str(out), "backend": "trimtest"}
+
+    jv_tts._SYNTH["trimtest"] = silent_tail
+    try:
+        text = f"trim check {time.time_ns()}"
+        info = jv_tts.synthesize(text, backend="trimtest")
+        with wave.open(info["path"], "rb") as w:
+            seconds = w.getnframes() / w.getframerate()
+        check("a rendered clip is trimmed before it is cached",
+              0.25 <= seconds < 0.4, f"{seconds:.3f}s")
+        size = Path(info["path"]).stat().st_size
+        again = jv_tts.synthesize(text, backend="trimtest")
+        check("a cached clip is returned unchanged",
+              again.get("cached") is True
+              and Path(info["path"]).stat().st_size == size,
+              f"cached={again.get('cached')} size={size}")
+        try:
+            Path(info["path"]).unlink()
+        except OSError:
+            pass
+    finally:
+        jv_tts._SYNTH.pop("trimtest", None)
+        jv_tts.synthesize = real_synth
+
+
+_reader_checks()
+
 if FAILURES:
     print(f"\n{len(FAILURES)} check(s) failed")
     raise SystemExit(1)

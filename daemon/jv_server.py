@@ -838,7 +838,7 @@ class Handler(BaseHTTPRequestHandler):
                 sess = _state["ptt"]
                 if sess:
                     sess.cancel()
-                tts.clear_speech_queue()
+                tts.stop_speaking()
                 audio.stop_playback()
                 audio.drop_warm_capture()
                 _state["speech"] = {"text": "", "backend": None, "started_at": 0.0}
@@ -940,9 +940,13 @@ def serve(host: str, port: int, probe: bool = True) -> int:
                 if time.time() - _state["last_activity"] < idle:
                     continue
                 sp = audio.playback_status()
-                if sp.get("playing") and not sp.get("paused"):
+                # tts.speaking() covers the gap between rendered chunks and the
+                # queue; checking only the current player let a long reply be
+                # mistaken for an idle daemon.
+                if tts.speaking() and not sp.get("paused"):
                     continue
                 if sp.get("playing") or sp.get("paused"):
+                    tts.stop_speaking()
                     audio.stop_playback()
                 print(f"[jarvis-voice] idle for {int(idle)}s - exiting "
                       f"(on-demand; JARVIS_VOICE_IDLE_EXIT_S=0 stays resident)", flush=True)
