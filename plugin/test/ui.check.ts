@@ -29,7 +29,7 @@ ensureRuntimePluginSupport({
 })
 
 const { testRender } = await import("@opentui/solid")
-const { MicButton, SpeakButton } = await import("../ui.tsx")
+const { LiveButton, MicButton } = await import("../ui.tsx")
 const plugin = await import("../tui.tsx")
 // The same Solid runtime the components use; the live-update checks below
 // exercise the real signal path instead of re-mounting with a fixed state.
@@ -71,9 +71,10 @@ type FakeVoice = {
   voice: Record<string, unknown>
   setMic: (state: string) => void
   setSpeech: (state: string) => void
+  setLive: (state: boolean) => void
 }
 
-function fakeVoice(mic = "idle", speech = "idle"): FakeVoice {
+function fakeVoice(mic = "idle", speech = "idle", live = false): FakeVoice {
   // Real signals, exactly like the controller: the buttons read them when the
   // controller repaints them. The repaint registry mirrors the controller's:
   // a state change must repaint the registered text nodes, which is what
@@ -81,6 +82,7 @@ function fakeVoice(mic = "idle", speech = "idle"): FakeVoice {
   const { createSignal } = solid
   const [micState, setMicState] = createSignal(mic)
   const [speechState, setSpeechState] = createSignal(speech)
+  const [liveState, setLiveState] = createSignal(live)
   const repaints = new Set<() => void>()
   const repaint = () => {
     for (const fn of repaints) fn()
@@ -97,6 +99,10 @@ function fakeVoice(mic = "idle", speech = "idle"): FakeVoice {
       repaints.delete(fn)
     },
     autoSpeak: () => true,
+    live: liveState,
+    toggleLive: async (sid?: string) => {
+      calls.push(`toggleLive:${sid ?? "-"}`)
+    },
     speakText: async () => true,
     speakLast: async () => {},
     pauseResume: async (sid?: string) => {
@@ -120,6 +126,10 @@ function fakeVoice(mic = "idle", speech = "idle"): FakeVoice {
     },
     setSpeech: (state: string) => {
       setSpeechState(() => state)
+      repaint()
+    },
+    setLive: (state: boolean) => {
+      setLiveState(() => state)
       repaint()
     },
   }
@@ -176,40 +186,32 @@ async function mount(render: () => unknown, width = 40, height = 3) {
   s.renderer.destroy()
 }
 
-/* ------------------------------------------------------------- speak button */
+/* ------------------------------------------------------------- live button */
 
 {
   const f = fakeVoice()
-  const s = await mount(() => SpeakButton({ context: { theme }, voice: f.voice, sessionID: "ses_xyz" }), 40, 3)
-  check("speak button renders idle label", s.captureCharFrame().includes("read"), JSON.stringify(s.captureCharFrame()))
+  const s = await mount(() => LiveButton({ context: { theme }, voice: f.voice, sessionID: "ses_xyz" }), 40, 3)
+  check("live button renders the idle label", s.captureCharFrame().includes("live"), JSON.stringify(s.captureCharFrame()))
   await s.mockMouse.click(34, 0)
   await s.renderOnce()
-  check("speak click calls pauseResume with the slot's session", f.calls.includes("pauseResume:ses_xyz"), f.calls.join(","))
+  check("live click calls toggleLive with the slot's session", f.calls.includes("toggleLive:ses_xyz"), f.calls.join(","))
 
-  // LIVE updates on the same mounted button: read -> pause -> resume -> read.
-  f.setSpeech("playing")
+  // The label follows the live state, live.
+  f.setLive(true)
   await s.renderOnce()
-  check("speak label updates live to pause", s.captureCharFrame().includes("pause"), JSON.stringify(s.captureCharFrame()))
-  f.setSpeech("paused")
-  await s.renderOnce()
-  check("speak label updates live to resume", s.captureCharFrame().includes("resume"), JSON.stringify(s.captureCharFrame()))
-  f.setSpeech("idle")
-  await s.renderOnce()
-  check("speak label returns live to read", s.captureCharFrame().includes("read"), JSON.stringify(s.captureCharFrame()))
+  check("live label updates when the conversation starts", s.captureCharFrame().includes("live"), JSON.stringify(s.captureCharFrame()))
   s.renderer.destroy()
 }
 
 {
-  const f = fakeVoice("idle", "playing")
-  const s = await mount(() => SpeakButton({ context: { theme }, voice: f.voice }), 40, 3)
-  check("speak button shows pause while playing", s.captureCharFrame().includes("pause"), JSON.stringify(s.captureCharFrame()))
-  s.renderer.destroy()
-}
-
-{
-  const f = fakeVoice("idle", "paused")
-  const s = await mount(() => SpeakButton({ context: { theme }, voice: f.voice }), 40, 3)
-  check("speak button shows resume while paused", s.captureCharFrame().includes("resume"), JSON.stringify(s.captureCharFrame()))
+  // The mic button stops the live conversation instead of recording.
+  const f = fakeVoice("idle", "idle", true)
+  const s = await mount(() => MicButton({ context: { theme }, voice: f.voice, sessionID: "ses_live" }), 40, 3)
+  check("mic button shows the live state", s.captureCharFrame().includes("live"), JSON.stringify(s.captureCharFrame()))
+  await s.mockMouse.click(2, 0)
+  await s.renderOnce()
+  check("mic click stops the live conversation", f.calls.includes("toggleLive:ses_live"), f.calls.join(","))
+  check("mic click does not start a one-shot recording", !f.calls.includes("toggleMic:ses_live"), f.calls.join(","))
   s.renderer.destroy()
 }
 
@@ -314,7 +316,7 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     slots.map((s) => s.append).join(","),
   )
   check(
-    "speak button appends to session.composer.top",
+    "live button appends to session.composer.top",
     slots.some((s) => s.append === "session.composer.top" && typeof s.render === "function"),
     slots.map((s) => s.append).join(","),
   )

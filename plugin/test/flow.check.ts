@@ -43,6 +43,8 @@ const server = Bun.serve({
         stats: { rms: 0.42 },
       })
     }
+    if (url.pathname === "/ptt/cancel") return json({ ok: true, cancelled: true })
+    if (url.pathname === "/speak") return json({ ok: true, backend: "fake", spoken: true })
     if (url.pathname === "/health") {
       return json({
         ok: true,
@@ -88,6 +90,7 @@ const sent: string[] = []
 const sentRaw: any[] = []
 const dispatched: string[] = []
 let hostCommands: any[] = []
+let agentBusy = false
 const context: any = {
   options: {},
   storage: { store: () => [store, setStore] },
@@ -112,7 +115,8 @@ const context: any = {
   data: {
     session: {
       list: () => [{ id: "ses_test" }],
-      status: () => "idle",
+      // The agent picks the message up right after it is sent.
+      status: () => (agentBusy ? "busy" : "idle"),
       message: { list: () => [], sync: async () => {} },
     },
   },
@@ -124,6 +128,10 @@ const context: any = {
         // OpenCode 2.1 puts the text in `text.text`; 2.0 used a plain string.
         const text = typeof input?.text === "string" ? input.text : (input?.text?.text ?? input?.body?.text ?? "")
         sent.push(text)
+        agentBusy = true
+        setTimeout(() => {
+          agentBusy = false
+        }, 200)
         return { id: "msg_1", sessionID: "ses_test", type: "user", payload: { text } }
       },
     },
@@ -177,6 +185,18 @@ check("the chosen microphone is sent with the turn", startBody?.mic?.device === 
 setStore("micSource", "")
 await voice.toggleMic("ses_test")
 check("automatic means no device in the request", startBody?.mic?.device === "", JSON.stringify(startBody?.mic))
+
+// 5. Live mode: record, send, read the answer, and keep going until it is
+//    switched off.
+setStore("autoSend", true)
+const sentBeforeLive = sent.length
+const liveRun = voice.toggleLive("ses_test")
+await new Promise((r) => setTimeout(r, 1500))
+check("live mode is on", voice.live() === true)
+check("live mode sent the transcript", sent.length > sentBeforeLive, `${sentBeforeLive} -> ${sent.length}`)
+await voice.toggleLive("ses_test")
+await liveRun
+check("live mode is off again", voice.live() === false)
 
 server.stop(true)
 if (failures > 0) {

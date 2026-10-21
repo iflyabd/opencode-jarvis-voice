@@ -9,8 +9,9 @@ Press one key, talk, pause, and your words land in the prompt. The reply is
 spoken back in a JARVIS-style voice while it types.
 
 Mouse controls do the same: a **🎙 mic** at the bottom-right of the prompt box,
-and a **🔊 read / ⏸ pause / ▶ resume** control under every answer (plus one
-above the text box for the newest reply), all drawn with your OpenCode theme.
+and a **🔊 read / ⏸ pause / ▶ resume** control under every answer, plus a
+**◉ live** toggle above the text box for a hands-free voice conversation, all
+drawn with your OpenCode theme.
 
 It is built to keep a phone cold: the daemon starts **only when you use voice**,
 warms the model **while you speak** (never at boot), and **exits when idle**, so
@@ -203,7 +204,7 @@ Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 |---|---|---|
 | `🎙 mic` / `● listening` / `◌ transcribing` | bottom-right of the prompt box | start listening; click again to stop |
 | `🔊 read` / `⏸ pause` / `▶ resume` | directly under each assistant answer | read **that answer**; click again to pause it, again to resume |
-| `🔊 read` / `⏸ pause` / `▶ resume` | top-right of the composer | read the newest answer, even when older messages are scrolled away |
+| `◉ live` / `● live` | top-right of the composer | switch the live voice conversation on or off |
 
 All are theme-aware (colours come from the active theme's action and feedback
 tokens, with hover states) and drive the same state as the keybindings — a
@@ -236,6 +237,25 @@ Reading rules:
   answer), only the **last** one is read;
 * long answers are read in full, with code blocks, tables and markdown
   symbols stripped first.
+
+### Live voice conversation
+
+The `◉ live` button at the top-right of the text box switches a hands-free
+conversation on:
+
+1. The microphone keeps listening. Each turn ends on silence, exactly like a
+   push-to-talk turn.
+2. What you said is sent to the agent on its own.
+3. The answer is read back to you.
+4. The microphone listens again - and again, for as long as live mode is on.
+
+Click `● live` (or the mic button, or run **Voice: live voice conversation**
+from the palette) to stop and go back to the manual mode: the mic button then
+records one turn at a time again, and the transcript lands in the prompt box
+for review.
+
+Live mode uses the same microphone and speech-to-text settings as everything
+else, and it honours the auto-send and auto-speak switches.
 
 ### The transcript goes into the prompt box
 
@@ -274,6 +294,7 @@ shown in a toast so it can be copied by hand.
 | `Voice: status` | what mic, STT model, TTS voice are in use, plus the plugin and daemon versions |
 | `Voice: cancel listening / stop speaking` | shut it up immediately |
 | `Voice: speak the last reply` | read the current answer out loud |
+| `Voice: live voice conversation (listen, send, read back)` | switch the live conversation on or off |
 | `Voice: toggle speaking replies` | auto-speak the assistant on/off |
 | `Voice: toggle auto-send (transcript goes to the prompt box)` | hands-free mode on/off: send the transcript straight away, or drop it in the prompt box for review |
 
@@ -581,7 +602,7 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
 | Option | Default | Meaning |
 |---|---|---|
 | `mic` | `true` | show the 🎙 mic button in the prompt footer |
-| `speak` | `true` | show the 🔊 read / pause button above the text box |
+| `speak` | `true` | show the ◉ live button above the text box |
 | `autoSpeak` | `true` | speak replies automatically after push-to-talk starts the turn |
 | `autoSend` | `false` | send the transcript to the agent as soon as it is transcribed; off means it lands in the prompt box for review |
 | `fishAudio` | — | optional `{ provider, apiKey, voiceId, voiceName, model, sttProvider, sttModel, sttLanguage }`; the settings dialog is safer for keys |

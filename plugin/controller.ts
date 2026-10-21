@@ -65,7 +65,7 @@ const FISH_STT_MODEL = "transcribe-1-pro"
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.4.1"
+export const PLUGIN_VERSION = "1.5.0"
 
 /** Local Whisper models the settings can pick. "" means automatic. */
 const LOCAL_MODELS: Array<{ id: string; title: string; description: string }> = [
@@ -338,6 +338,9 @@ export function speakable(text: string, limit = 0): string {
 export function createVoiceController(context: any) {
   const [mic, setMic] = createSignal<MicState>("idle")
   const [speech, setSpeech] = createSignal<SpeechState>("idle")
+  // Live voice: the mic keeps listening, every turn is sent on its own and
+  // the answer is read back, until the user switches it off again.
+  const [live, setLive] = createSignal(false)
   // Which message the current playback belongs to. The composer button and
   // the per-message buttons read this to decide between read/pause/resume.
   const [speakingMessage, setSpeakingMessage] = createSignal<string | null>(null)
@@ -1621,6 +1624,30 @@ export function createVoiceController(context: any) {
 
   /* ------------------------------------------------------- speak the reply */
 
+  /**
+   * Wait for the agent to pick the message up, then read the answer back.
+   *
+   * Right after a message is sent the session is still idle for a moment, so
+   * waiting for "idle" alone would give up before the answer exists.
+   */
+  async function speakAnswerAfterSend(sessionID: string | undefined): Promise<void> {
+    if (!sessionID) return
+    for (let i = 0; i < 60; i++) {
+      await sleep(300)
+      let status: string | undefined
+      try {
+        status = context.data.session.status(sessionID)
+      } catch {
+        status = undefined
+      }
+      if (status === undefined) return // no session data: nothing to wait for
+      if (status === "busy") {
+        await speakReply(sessionID)
+        return
+      }
+    }
+  }
+
   async function speakReply(sessionID: string | undefined): Promise<void> {
     if (!sessionID) return
     const info = await daemon(false)
@@ -1702,10 +1729,106 @@ export function createVoiceController(context: any) {
     }
   }
 
+  /* ------------------------------------------------------- live voice mode */
+
+  let liveStop = false
+  let liveBusy = false
+
+  /** Switch the live conversation off and drop the capture in progress. */
+  function stopLive(): void {
+    liveStop = true
+    setLive(false)
+    void (async () => {
+      try {
+        const info = await daemon(false)
+        if (info) await api.pttCancel(info)
+      } catch {
+        /* the daemon is going away anyway */
+      }
+    })()
+  }
+
+  /**
+   * Record one turn and hand back the transcript.
+   * Returns "" when nothing was heard or the turn was cancelled.
+   */
+  async function recordOneTurn(info: DaemonInfo): Promise<string> {
+    await api.pttStart(info, 30000, sttRequest(), micRequest())
+    for (let i = 0; i < 240; i++) {
+      if (liveStop) return ""
+      await sleep(250)
+      const state = await api.pttState(info).catch(() => null)
+      const st = state?.ptt?.state
+      if (st === "transcribing") setMicState("transcribing")
+      if (!st || (st !== "listening" && st !== "transcribing")) break
+    }
+    if (liveStop) {
+      await api.pttCancel(info).catch(() => undefined)
+      return ""
+    }
+    const res = await api.pttStop(info, 150000).catch(() => null)
+    if (res === null) return ""
+    return transcriptText(res)
+  }
+
+  /**
+   * Live voice conversation: listen, send, read the answer, listen again.
+   * Runs until the user switches it off.
+   */
+  async function liveConversation(sessionID: string | undefined): Promise<void> {
+    let sid = sessionID
+    while (!liveStop) {
+      const info = await daemon(true)
+      if (!info) return
+      if (!sid) sid = currentSessionID(context) ?? undefined
+      setMicState("listening")
+      const text = await recordOneTurn(info)
+      setMicState("idle")
+      if (liveStop) return
+      if (!text) continue // nothing was heard: keep listening
+      const sent = await submit(sid, text)
+      if (!sent) continue
+      // Read the answer back, then listen again. The small pause keeps the
+      // tail of the playback out of the next recording.
+      if (autoSpeak) await speakAnswerAfterSend(sid)
+      await sleep(600)
+    }
+  }
+
+  async function toggleLive(forcedSessionID?: string): Promise<void> {
+    if (live()) {
+      stopLive()
+      toast("Live voice off", "info")
+      return
+    }
+    if (liveBusy) return
+    const info = await daemonOrToast()
+    if (!info) return
+    liveBusy = true
+    liveStop = false
+    setLive(true)
+    toast("Live voice on — talk, it sends your words and reads the answer. Click again to stop.", "success")
+    try {
+      await liveConversation(forcedSessionID ?? currentSessionID(context))
+    } catch (e) {
+      toast(errorText(e), "error")
+    } finally {
+      setLive(false)
+      liveBusy = false
+    }
+  }
+
   /* -------------------------------------------------------- push to talk */
 
   async function toggleMic(forcedSessionID?: string): Promise<void> {
     const sessionID = forcedSessionID ?? currentSessionID(context)
+
+    if (live()) {
+      // The live conversation owns the microphone: the button stops it.
+      stopLive()
+      toast("Live voice off", "info")
+      return
+    }
 
     if (mic() !== "idle") {
       // Second press: stop the recording. The loop below picks the
@@ -1858,6 +1981,8 @@ export function createVoiceController(context: any) {
     addRepaint,
     removeRepaint,
     autoSpeak: () => autoSpeak,
+    /** True while the live conversation is running. */
+    live: () => live(),
     /** True when transcripts are sent to the agent without a review step. */
     autoSend: () => autoSendEnabled(),
     speakText,
@@ -1866,6 +1991,7 @@ export function createVoiceController(context: any) {
     messageAction,
     pauseResume,
     toggleMic,
+    toggleLive,
     cancel,
     status,
     openSettings,

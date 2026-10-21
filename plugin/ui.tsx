@@ -76,8 +76,10 @@ export function MicButton(props: ButtonProps) {
 
   const theme = () => props.context.theme
   const state = () => props.voice.mic()
+  const live = () => props.voice.live?.() === true
 
   const label = () => {
+    if (live()) return "● live"
     switch (state()) {
       case "listening":
         return "● listening"
@@ -90,6 +92,7 @@ export function MicButton(props: ButtonProps) {
 
   const fg = () => {
     const t = theme()
+    if (live()) return t.text.feedback.error.base
     switch (state()) {
       case "listening":
         return t.text.feedback.error.base
@@ -119,6 +122,11 @@ export function MicButton(props: ButtonProps) {
         event?.preventDefault?.()
         event?.stopPropagation?.()
         if (event?.button === RIGHT_MOUSE_BUTTON) return
+        // While the live conversation runs the mic button stops it.
+        if (live()) {
+          void props.voice.toggleLive(props.sessionID)
+          return
+        }
         void props.voice.toggleMic(props.sessionID)
       }}
     >
@@ -127,34 +135,21 @@ export function MicButton(props: ButtonProps) {
   )
 }
 
-/** Speaker: click to read the last reply, then pause / resume it in place. */
-export function SpeakButton(props: ButtonProps) {
+/**
+ * Live voice: the microphone keeps listening, every turn is sent on its own
+ * and the answer is read back, until it is switched off again.
+ */
+export function LiveButton(props: ButtonProps) {
   const [hovered, setHovered] = createSignal(false)
 
   const theme = () => props.context.theme
-  const state = () => props.voice.speech()
+  const on = () => props.voice.live?.() === true
 
-  const label = () => {
-    switch (state()) {
-      case "playing":
-        return "⏸ pause"
-      case "paused":
-        return "▶ resume"
-      default:
-        return "🔊 read"
-    }
-  }
-
+  const label = () => (on() ? "● live" : "◉ live")
   const fg = () => {
     const t = theme()
-    switch (state()) {
-      case "playing":
-        return hovered() ? t.text.feedback.success.base : t.text.feedback.success.muted
-      case "paused":
-        return t.text.feedback.warning.base
-      default:
-        return hovered() ? t.text.action.secondary.hovered : t.text.action.secondary.base
-    }
+    if (on()) return t.text.feedback.error.base
+    return hovered() ? t.text.action.secondary.hovered : t.text.action.secondary.base
   }
 
   const { node: text, paint } = liveText(props.voice, { fg, label })
@@ -175,7 +170,7 @@ export function SpeakButton(props: ButtonProps) {
           event?.preventDefault?.()
           event?.stopPropagation?.()
           if (event?.button === RIGHT_MOUSE_BUTTON) return
-          void props.voice.pauseResume(props.sessionID)
+          void props.voice.toggleLive(props.sessionID)
         }}
       >
         {text}

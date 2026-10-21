@@ -13,7 +13,7 @@
  *
  * UI buttons (all follow the host theme, clickable with the mouse):
  *   `prompt.footer`         bottom-right of the prompt box: the mic / PTT button
- *   `session.composer.top`  top-right of the text box: the speaker / pause button
+ *   `session.composer.top`  top-right of the text box: the live voice toggle
  *   under each answer       a read / pause / resume button for that message
  *
  * The per-message rows are attached to the transcript renderables for assistant
@@ -22,7 +22,7 @@
  *
  * Commands:  voice.pushToTalk (ctrl+alt+v), voice.pauseResume (ctrl+alt+p),
  *            voice.status, voice.cancel, voice.speakLast, voice.toggleAutoSpeak,
- *            voice.toggleAutoSend, /voice
+ *            voice.toggleAutoSend, voice.toggleLive, /voice
  *
  * Options (plugin options in cli.json):
  *   { "mic": false }          hide the mic button
@@ -34,7 +34,7 @@
 import { Plugin } from "@opencode/plugin/tui"
 import { createVoiceController } from "./controller"
 import { createMessageButtons } from "./message-buttons"
-import { MicButton, SpeakButton } from "./ui"
+import { LiveButton, MicButton } from "./ui"
 
 export default Plugin.define({
   id: "jarvis-voice.cli",
@@ -56,7 +56,7 @@ export default Plugin.define({
           // Mounting this slot means a session view just appeared; the
           // transcript below it is laid out on the next frames.
           messages?.schedule(350)
-          return <SpeakButton context={context} voice={voice} sessionID={input.sessionID} />
+          return <LiveButton context={context} voice={voice} sessionID={input.sessionID} />
         },
       })
     }
@@ -163,6 +163,15 @@ export default Plugin.define({
           palette: true,
           run: async () => {
             await voice.toggleAutoSend()
+          },
+        },
+        {
+          id: "voice.toggleLive",
+          title: "Voice: live voice conversation (listen, send, read back)",
+          group: "Jarvis Voice",
+          palette: true,
+          run: async () => {
+            await voice.toggleLive()
           },
         },
       ],
