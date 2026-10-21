@@ -65,7 +65,7 @@ const FISH_STT_MODEL = "transcribe-1-pro"
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.4.0"
+export const PLUGIN_VERSION = "1.4.1"
 
 /** Local Whisper models the settings can pick. "" means automatic. */
 const LOCAL_MODELS: Array<{ id: string; title: string; description: string }> = [
@@ -1514,14 +1514,77 @@ export function createVoiceController(context: any) {
   }
 
   /**
+   * Does the host expose its own "submit the prompt" command?
+   *
+   * That command is what Enter does. Using it means the transcript travels
+   * the same way a typed message does, which is the only way to send from a
+   * brand new chat: there is no session id yet until the first message is
+   * sent.
+   */
+  function hostSubmitCommand(): string | null {
+    try {
+      const commands = context.keymap?.commands?.() ?? []
+      for (const command of commands as any[]) {
+        if (command?.id === "prompt.submit") return "prompt.submit"
+        if (command?.id === "input.submit") return "input.submit"
+      }
+    } catch {
+      /* the keymap is not available */
+    }
+    return null
+  }
+
+  /**
+   * Type the transcript into the prompt and let the host send it - exactly
+   * what pressing Enter does.
+   *
+   * This is the only way to send from a brand new chat: there is no session
+   * id until the first message is sent. A real submit empties the prompt
+   * box, so that is used to confirm it worked.
+   */
+  async function submitViaHost(text: string): Promise<boolean> {
+    const command = hostSubmitCommand() ?? "prompt.submit"
+    if (!insertIntoPrompt(text)) return false
+    try {
+      context.keymap?.dispatch?.(command)
+    } catch {
+      try {
+        context.keymap?.dispatch?.("prompt.clear")
+      } catch {
+        /* nothing else to do */
+      }
+      return false
+    }
+    await sleep(150)
+    const after = promptEditor()
+    if (after && typeof after.plainText === "string" && after.plainText.trim() === text.trim()) {
+      // The words are still in the box: the host did not send them.
+      try {
+        context.keymap?.dispatch?.("prompt.clear")
+      } catch {
+        /* nothing else to do */
+      }
+      return false
+    }
+    return true
+  }
+
+  /**
    * Send the transcript as the user's message - the same thing pressing
    * Enter in the prompt does.
    *
-   * OpenCode 2.1 moved the prompt text into `text.text`; 2.0 took a plain
-   * string. Sending the wrong shape posts an empty message, which is why
-   * auto-send used to end up as a toast with the words instead of a message.
+   * The host's own submit is preferred: the text is typed into the prompt
+   * and the host sends it. That works in a new chat, where no session exists
+   * yet, and it keeps the TUI in step with what was sent.
+   *
+   * The client API is the fallback. OpenCode 2.1 moved the prompt text into
+   * `text.text`; 2.0 took a plain string. Sending the wrong shape posts an
+   * empty message, which is why auto-send used to end up as a toast with the
+   * words instead of a message.
    */
   async function submit(sessionID: string | undefined, text: string): Promise<boolean> {
+    if (await submitViaHost(text)) return true
+
     const client: any = context.client
     if (!sessionID || typeof client?.session?.prompt !== "function") {
       // Last resort: leave the text where the user can use it.
@@ -1603,25 +1666,39 @@ export function createVoiceController(context: any) {
     }
   }
 
+  /** The current session, waiting for one to show up (a new chat has none). */
+  async function resolveSessionID(timeoutMs = 4000): Promise<string | undefined> {
+    const steps = Math.max(1, Math.round(timeoutMs / 200))
+    for (let i = 0; i < steps; i++) {
+      const id = currentSessionID(context)
+      if (id) return id
+      await sleep(200)
+    }
+    return undefined
+  }
+
   /**
    * Wait for the user to send the transcript we put in the prompt box, then
    * read the answer back. Used when auto-send is off but replies are spoken.
    */
   async function speakWhenAnswered(sessionID: string | undefined): Promise<void> {
-    if (!sessionID) return
-    for (let i = 0; i < 240; i++) {
-      await sleep(500)
-      let status: string | undefined
-      try {
-        status = context.data.session.status(sessionID)
-      } catch {
-        status = undefined
+    let sid = sessionID
+    for (let i = 0; i < 300; i++) {
+      if (!sid) sid = currentSessionID(context)
+      if (sid) {
+        let status: string | undefined
+        try {
+          status = context.data.session.status(sid)
+        } catch {
+          status = undefined
+        }
+        if (status === undefined) return // no session data: nothing to wait for
+        if (status === "busy") {
+          await speakReply(sid)
+          return
+        }
       }
-      if (status === undefined) return // no session data: nothing to wait for
-      if (status === "busy") {
-        await speakReply(sessionID)
-        return
-      }
+      await sleep(400)
     }
   }
 
@@ -1693,9 +1770,14 @@ export function createVoiceController(context: any) {
 
       if (autoSendEnabled()) {
         // Hands-free mode: the transcript goes straight to the agent.
-        toast(`📝 ${text}`, "success")
         const sent = await submit(sessionID, text)
-        if (sent && autoSpeak) void speakReply(sessionID)
+        if (sent) {
+          toast("📤 Sent", "success")
+          // A brand new chat only gets a session id when the first message
+          // is sent, so look it up again before waiting for the reply.
+          const sid = sessionID ?? (await resolveSessionID())
+          if (sid && autoSpeak) void speakReply(sid)
+        }
         return
       }
 

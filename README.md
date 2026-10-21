@@ -252,10 +252,13 @@ If you want the hands-free flow, turn **auto-send** on:
   command palette, or
 * **Voice: settings → Auto-send transcripts** in the settings dialog.
 
-With auto-send on, the transcript is submitted to the agent as soon as it is
-transcribed - the same thing pressing Enter in the prompt does - and the reply
-is spoken back (when auto-speak is on). With auto-send off, the reply is still
-spoken once you send the transcript.
+With auto-send on, the transcript is typed into the prompt box and the host's
+own submit command sends it - exactly what pressing Enter does. That path also
+works in a **brand new chat**, where no session id exists yet (a session is
+only created when the first message is sent). If the host does not expose a
+submit command, the plugin posts the message through the client API instead.
+Either way the reply is spoken back (when auto-speak is on). With auto-send
+off, the reply is still spoken once you send the transcript.
 
 If the host TUI does not expose an editable prompt box, the transcript is
 shown in a toast so it can be copied by hand.

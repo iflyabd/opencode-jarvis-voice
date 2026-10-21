@@ -86,10 +86,24 @@ const editor = {
 
 const sent: string[] = []
 const sentRaw: any[] = []
+const dispatched: string[] = []
+let hostCommands: any[] = []
 const context: any = {
   options: {},
   storage: { store: () => [store, setStore] },
   renderer: { currentFocusedEditor: editor, requestRender() {}, on() {} },
+  keymap: {
+    commands: () => hostCommands,
+    dispatch: (id: string) => {
+      dispatched.push(id)
+      // The host empties the prompt when it clears it, and when it really
+      // submits. A "prompt.submit" without the command does nothing.
+      if (id === "prompt.clear") editor.plainText = ""
+      else if (id === "prompt.submit" && hostCommands.some((c: any) => c?.id === "prompt.submit")) {
+        editor.plainText = ""
+      }
+    },
+  },
   ui: {
     toast: { show() {} },
     dialog: {},
@@ -130,7 +144,8 @@ check("the transcript reaches the prompt box", editor.plainText === "hello from 
 check("nothing is sent without a review", sent.length === 0, `sent=${sent.length}`)
 check("auto-send is off by default", voice.autoSend() === false)
 
-// 2. With auto-send on, the transcript is submitted to the agent.
+// 2. With auto-send on, the transcript is submitted to the agent. Without a
+//    host submit command the plugin falls back to the client API.
 setStore("autoSend", true)
 editor.plainText = ""
 await voice.toggleMic("ses_test")
@@ -141,7 +156,20 @@ check(
   JSON.stringify(sentRaw[0]),
 )
 
-// 3. The picked microphone travels with the turn.
+// 3. With the host's own submit command the text is typed into the prompt
+//    and the host sends it - the way Enter does. This is the path that
+//    works in a brand new chat, where no session id exists yet.
+hostCommands = [{ id: "prompt.submit" }]
+const sentBefore = sent.length
+editor.plainText = ""
+dispatched.length = 0
+await voice.toggleMic("ses_test")
+check("the host submit command is used when it exists", dispatched.includes("prompt.submit"), dispatched.join(","))
+check("the host cleared the prompt, so it was sent", editor.plainText === "", editor.plainText)
+check("the client API is not used twice", sent.length === sentBefore, `${sentBefore} -> ${sent.length}`)
+hostCommands = []
+
+// 4. The picked microphone travels with the turn.
 setStore("micSource", "pulse:jarvis_mic")
 await voice.toggleMic("ses_test")
 check("the chosen microphone is sent with the turn", startBody?.mic?.device === "pulse:jarvis_mic", JSON.stringify(startBody?.mic))

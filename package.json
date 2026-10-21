@@ -1,6 +1,6 @@
 {
   "name": "opencode-jarvis-voice",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "private": false,
   "type": "module",
   "description": "Local voice for OpenCode by default: push-to-talk, read-aloud with pause/resume, Whisper ears and a Piper voice. Optional Fish Audio cloud voices and speech-to-text.",
