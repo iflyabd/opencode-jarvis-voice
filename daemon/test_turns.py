@@ -176,6 +176,55 @@ def _speak_checks() -> None:
 
 _speak_checks()
 
+
+# --------------------------------------------------------- chunk pipelining
+
+def _pipeline_checks() -> None:
+    """The next chunk must be rendered while the current one is playing.
+
+    Rendering the next chunk only after the current one finished put a
+    network round trip of silence between every paragraph.
+    """
+    events: list[tuple[str, float, float]] = []
+
+    def fake_synth(text: str, backend=None, use_cache=True, fish=None):
+        start = time.monotonic()
+        time.sleep(0.2)                         # the render takes a moment
+        events.append(("synth", start, time.monotonic()))
+        out = Path("/tmp/opencode/jarvis-pipeline.wav")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"RIFF" + b"\0" * 64)
+        return {"path": str(out), "backend": backend or "fish", "cached": False, "ms": 200}
+
+    def fake_play(path, timeout=120):
+        start = time.monotonic()
+        time.sleep(0.3)                         # the clip plays for a moment
+        events.append(("play", start, time.monotonic()))
+        return {"backend": "fake", "ok": True}
+
+    real_synth = jv_tts.synthesize
+    real_play = jv_tts.audio.play_wav
+    jv_tts.synthesize = fake_synth
+    jv_tts.audio.play_wav = fake_play
+    try:
+        text = ". ".join(f"Sentence number {i} is long enough to need its own chunk" for i in range(6)) + "."
+        jv_tts.speak(text, backend="fish", wait=True, fish={"apiKey": "k", "voiceId": "v"})
+        kinds = [e[0] for e in events]
+        check("the reply is rendered in several chunks", kinds.count("synth") >= 2, str(kinds))
+        plays = [e for e in events if e[0] == "play"]
+        synths = [e for e in events if e[0] == "synth"]
+        check(
+            "the next chunk is rendered while the current one plays",
+            len(plays) >= 1 and len(synths) >= 2 and synths[1][1] < plays[0][2],
+            f"second render at {synths[1][1]:.3f}, first clip ends at {plays[0][2]:.3f}",
+        )
+    finally:
+        jv_tts.synthesize = real_synth
+        jv_tts.audio.play_wav = real_play
+
+
+_pipeline_checks()
+
 if FAILURES:
     print(f"\n{len(FAILURES)} check(s) failed")
     raise SystemExit(1)

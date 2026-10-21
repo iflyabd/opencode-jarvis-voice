@@ -377,7 +377,12 @@ def speak(text: str, backend: str | None = None, wait: bool = True,
     except Exception:
         pass
     if backend == "fish":
-        return _speak_fish(text, gen, wait, fish or {})
+        return _speak_chunked(text, gen, wait, "fish", fish or {})
+    # A local voice is rendered in one go, but a long reply still takes a
+    # while: chunking it starts the first sentence sooner and keeps the
+    # paragraphs running into each other.
+    if len(text) > cfg.FISH_CHUNK_CHARS:
+        return _speak_chunked(text, gen, wait, backend, fish)
     return _speak_single(text, gen, wait, backend, fish)
 
 
@@ -499,36 +504,101 @@ def _split_for_speech(text: str, max_chars: int | None = None) -> list[str]:
     return [c for c in chunks if c]
 
 
-def _speak_fish(text: str, gen: int, wait: bool, fish: dict) -> dict:
-    """Render a Fish reply chunk by chunk and play it in order."""
+def _trim_wav_tail(path: Path, keep_ms: int = 60) -> None:
+    """Cut the silence at the end of a clip so the chunks join up.
+
+    Every rendered chunk ends with a little silence. Left alone, those tails
+    add up to a pause between the paragraphs of a reply.
+    """
+    try:
+        import array
+        import sys as _sys
+
+        with wave.open(str(path), "rb") as w:
+            params = w.getparams()
+            frames = w.readframes(w.getnframes())
+        if not frames:
+            return
+        width = max(1, params.sampwidth or 2)
+        count = len(frames) // width
+        samples = array.array("h")
+        samples.frombytes(frames[: count * width])
+        if _sys.byteorder == "big":
+            samples.byteswap()
+        floor = 250  # about -42 dB: the noise floor of a rendered clip
+        last = -1
+        for i in range(count - 1, -1, -1):
+            if abs(samples[i]) > floor:
+                last = i
+                break
+        if last < 0:
+            return
+        keep = int((params.framerate or 16000) * keep_ms / 1000)
+        end = min(count, last + keep)
+        if end >= count:
+            return
+        with wave.open(str(path), "wb") as w:
+            w.setparams(params)
+            w.writeframes(samples[:end].tobytes())
+    except Exception:
+        # Not a plain WAV (the MP3 fallback): leave the clip as it is.
+        return
+
+
+def _speak_chunked(text: str, gen: int, wait: bool, backend: str, fish: dict | None) -> dict:
+    """Render a reply chunk by chunk and play it in order.
+
+    The next chunk is rendered while the current one is playing, so the reply
+    does not stop between the paragraphs while the next request is made.
+    """
     chunks = _split_for_speech(text)
     if len(chunks) <= 1:
-        return _speak_single(text, gen, wait, "fish", fish)
+        return _speak_single(text, gen, wait, backend, fish)
 
     state = {"chunks": len(chunks), "ms": 0}
 
+    def _render(chunk: str, fast: bool) -> dict:
+        options = dict(fish or {})
+        if fast and backend == "fish":
+            # The first sound matters most: ask Fish for the fastest
+            # first chunk it can give.
+            options["latency"] = "low"
+        t0 = time.time()
+        info = synthesize(chunk, backend=backend, fish=options or None)
+        state["ms"] += int((time.time() - t0) * 1000)
+        try:
+            _trim_wav_tail(Path(info["path"]))
+        except Exception:
+            pass
+        return info
+
+    def _play(path: str) -> None:
+        try:
+            audio.play_wav(path)
+        except audio.AudioError:
+            pass
+        except Exception:
+            pass
+
     def _run() -> None:
+        pending: dict | None = None
         for index, chunk in enumerate(chunks):
             if not _speak_current(gen):
                 return
-            options = dict(fish)
-            if index == 0:
-                # The first sound matters most: ask Fish for the fastest
-                # first chunk it can give.
-                options["latency"] = "low"
-            t0 = time.time()
-            try:
-                info = synthesize(chunk, backend="fish", fish=options)
-            except Exception:
-                return
-            state["ms"] += int((time.time() - t0) * 1000)
+            if pending is None:
+                pending = _render(chunk, index == 0)
+            current = pending
+            pending = None
+            # Play this chunk while the next one is rendered in the background.
+            player = threading.Thread(target=_play, args=(current["path"],), daemon=True)
+            player.start()
+            if index + 1 < len(chunks):
+                try:
+                    pending = _render(chunks[index + 1], False)
+                except Exception:
+                    pending = None
+            player.join()
             if not _speak_current(gen):
-                return
-            try:
-                audio.play_wav(info["path"])
-            except audio.AudioError:
-                return
-            except Exception:
                 return
 
     def _run_and_finish() -> None:
@@ -541,7 +611,7 @@ def _speak_fish(text: str, gen: int, wait: bool, fish: dict) -> dict:
         _run_and_finish()
     else:
         threading.Thread(target=_run_and_finish, daemon=True).start()
-    return {"backend": "fish", "spoken": True, "queued": True, "ms": 0,
+    return {"backend": backend, "spoken": True, "queued": True, "ms": 0,
             "chunks": state["chunks"], "chars": len(text or ""),
             "playback": {"backend": "async", "ok": True}}
 

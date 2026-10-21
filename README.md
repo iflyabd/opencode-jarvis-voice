@@ -366,6 +366,9 @@ start quickly:
   in order, so the time to the first sound is a fraction of the time to
   render the whole reply. The first chunk is asked for with Fish's fastest
   latency mode.
+- **The chunks run into each other.** The next chunk is rendered *while* the
+  current one is playing, and the silence at the end of every clip is
+  trimmed, so the reply does not pause between the paragraphs.
 - **Every chunk is cached**, so reading the same reply again is instant.
 
 Set `JARVIS_VOICE_FISH_CHUNK_CHARS` to change the chunk size (a smaller chunk
