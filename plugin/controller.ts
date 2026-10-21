@@ -67,7 +67,7 @@ const FISH_STT_MODEL = "transcribe-1-pro"
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.8.1"
+export const PLUGIN_VERSION = "1.8.2"
 
 /**
  * How long a pause ends a live turn.

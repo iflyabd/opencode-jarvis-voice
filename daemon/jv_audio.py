@@ -1089,16 +1089,54 @@ def _stream(name: str, sr: int, device: str) -> int:
 # Playback
 # ----------------------------------------------------------------------------
 
+_pulse_play_seen = 0.0
+_pulse_play_ok = False
+
+
+def _pulse_can_play() -> bool:
+    """Is there a Pulse server for paplay right now? Cached: it changes rarely."""
+    global _pulse_play_seen, _pulse_play_ok
+    now = time.time()
+    if now - _pulse_play_seen < 30.0:
+        return _pulse_play_ok
+    ok = False
+    server = cfg.PULSE_SERVER
+    if server.startswith("tcp:"):
+        # A raw connect is as good as `pactl info` here and cannot hang for
+        # seconds on a dead server, which would delay the first words.
+        import socket
+
+        host, _, port = server[4:].partition(":")
+        try:
+            with socket.create_connection((host or "127.0.0.1", int(port or 4713)), timeout=0.2):
+                ok = True
+        except Exception:
+            ok = False
+    else:
+        try:
+            ok, _why = pulse_reachable(timeout=0.4)
+        except Exception:
+            ok = False
+    _pulse_play_seen = now
+    _pulse_play_ok = ok
+    return ok
+
+
 def _playback_candidates() -> list[str]:
     if cfg.FORCE_PLAYBACK_BACKEND:
         return [cfg.FORCE_PLAYBACK_BACKEND]
     c = []
-    if _which("paplay"):
+    # paplay without a Pulse server fails on every clip. The daemon may have
+    # PULSE_SERVER set for the SLES microphone while no server is running, so
+    # ask before adding it instead of burning a failed start each time.
+    if _which("paplay") and _pulse_can_play():
         c.append("paplay")
-    if _which("aplay"):
-        c.append("aplay")
+    # SDL/ffplay handles the Android ALSA device more gracefully than a raw
+    # aplay stream, which can die mid-clip with pcm_write I/O errors there.
     if _which("ffplay"):
         c.append("ffplay")
+    if _which("aplay"):
+        c.append("aplay")
     if _which("play"):
         c.append("play")
     c.append("sounddevice")

@@ -419,7 +419,9 @@ start quickly:
 - **A clip that already reached the speaker is never replayed.** If a player
   dies after part of a clip was heard, the daemon does not fall through to
   another player and start that clip over. It remembers the player that
-  worked last and tries that one first.
+  worked last and tries that one first. It also skips `paplay` when no Pulse
+  server is running, and prefers `ffplay` over a raw `aplay` stream on Android
+  audio hardware.
 - **Interrupting stops the whole read.** A new *read* request invalidates the
   reader, so the next paragraph cannot start over the newly requested voice.
 - **Every chunk is cached**, so reading the same reply again is instant.
