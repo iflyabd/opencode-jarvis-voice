@@ -19,9 +19,9 @@ idle CPU is zero and its memory goes back to the system.
 Works the same on **Parrot OS**, **Termux / Android**, and a **normal PC**
 (Linux, macOS, Windows).
 
-Built for **OpenCode 2.1.1** (the plugin SDK is pinned to
-`@opencode/plugin` 2.1.1 and OpenTUI 0.6.6). It also runs on 2.0.x: the
-plugin picks the prompt API shape that the running host expects.
+Built for **OpenCode 2.1.2** (the plugin SDK is pinned to
+`@opencode/plugin` 2.1.2 and OpenTUI 0.6.6). It also runs on 2.0.x and 2.1.0:
+the plugin picks the prompt API shape that the running host expects.
 
 ---
 
