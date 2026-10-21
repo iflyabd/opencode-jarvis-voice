@@ -165,29 +165,42 @@ function liveLabel(props: ButtonProps) {
 
 /**
  * The mic button's box, so the live toggle can be lined up with it.
- * The host's composer slot is narrower than the text box, so the toggle has
- * to be moved to the right edge of the box by hand. The box is used rather
- * than the text node, because a wide glyph (the microphone emoji) is drawn
- * two columns wide but measured as one.
+ * The box is used rather than the text node, because a wide glyph (the
+ * microphone emoji) is drawn two columns wide but measured as one.
  */
 let micBox: any = null
 
-function micRightEdge(): number | null {
-  const node = micBox
-  if (!node) return null
-  const x = node.x
-  const width = node.width
-  if (typeof x !== "number" || typeof width !== "number") return null
-  return x + width
+/**
+ * The prompt box: the element that holds both the text area and the footer.
+ * It is the common ancestor of the editor and the mic button, and its top
+ * edge is the top of the text box.
+ */
+function promptBox(editor: any, mic: any): any {
+  if (!editor || !mic) return null
+  const chain = (node: any) => {
+    const out: any[] = []
+    let current = node?.parent
+    while (current) {
+      out.push(current)
+      current = current.parent
+    }
+    return out
+  }
+  const micChain = new Set(chain(mic))
+  for (const node of chain(editor)) {
+    if (micChain.has(node)) return node
+  }
+  return null
 }
 
 /**
- * The prompt footer on the home screen, where a new chat starts.
+ * The prompt footer with the live toggle.
  *
- * That screen publishes no slot above the text box, so the live toggle is
- * anchored to the top-right of the text area instead: an absolutely
- * positioned box inside the footer row, moved up to the text area with the
- * measured offset. The mic button stays in the footer row where it always was.
+ * The toggle is anchored to the row just above the text box, on the same
+ * right edge as the mic button. It is rendered inside the footer (which is
+ * full width) instead of the composer slot above the box, because that slot
+ * is narrower than the text box and can swallow a button that is moved to
+ * the right edge.
  */
 export function PromptFooterLive(props: ButtonProps) {
   const live = liveLabel(props)
@@ -201,14 +214,13 @@ export function PromptFooterLive(props: ButtonProps) {
 
   const anchor: any = createElement("box")
   anchor.position = "absolute"
-  anchor.right = 0
+  anchor.left = 0
   anchor.top = -1
   anchor.zIndex = 2000
   anchor.flexShrink = 0
 
   const label: any = createElement("box")
   label.flexShrink = 0
-  label.paddingRight = 1
   label.onMouseOver = () => live.hover(true)
   label.onMouseOut = () => live.hover(false)
   label.onMouseUp = (event: any) => {
@@ -221,15 +233,26 @@ export function PromptFooterLive(props: ButtonProps) {
   anchor.add(label)
   wrapper.add(anchor)
 
-  // Keep the toggle just above the text box while it grows and shrinks.
+  // Keep the toggle on the row above the text box, on the mic's right edge.
   const sync = () => {
+    wrapper.position = "relative"
     const editor = props.voice.editor?.()
-    const top = editor?.y
+    const box = promptBox(editor, micBox)
     const base = wrapper.y
-    if (typeof top !== "number" || typeof base !== "number") return
-    // One row above the text area: the row that sits over the text box.
-    const offset = Math.round(top - base) - 1
+    if (!box || typeof box.y !== "number" || typeof base !== "number") return
+    // One row above the top edge of the text box.
+    const offset = Math.round(box.y - 1 - base)
+    if (!Number.isFinite(offset)) return
     if (anchor.top !== offset) anchor.top = offset
+
+    // The right edge of the mic button, so the two line up.
+    const mic = micBox
+    const width = anchor.width
+    const right = mic ? mic.x + mic.width : null
+    if (right === null || typeof right !== "number" || typeof width !== "number" || width <= 0) return
+    const left = Math.round(right - width - wrapper.x)
+    if (!Number.isFinite(left)) return
+    if (anchor.left !== left) anchor.left = left
   }
   const timer = setInterval(sync, 400)
   onCleanup(() => clearInterval(timer))
@@ -243,25 +266,20 @@ export function PromptFooterLive(props: ButtonProps) {
 }
 
 /**
- * The live toggle above the text box, in a session.
+ * The live toggle in the row above the text box, in a session.
  *
  * The host's composer slot is narrower than the text box, so the toggle is
- * moved to the right edge of the box - the same edge the mic button sits on.
+ * given the width that reaches the mic button's right edge and is right
+ * aligned inside it. It stays in the flow, so the row is never empty and the
+ * button can never be swallowed by a narrow slot.
  */
 export function ComposerLiveButton(props: ButtonProps) {
   const live = liveLabel(props)
 
-  const wrapper: any = createElement("box")
-  wrapper.flexShrink = 0
-  wrapper.flexDirection = "row"
-  wrapper.justifyContent = "flex-end"
-
-  const anchor: any = createElement("box")
-  anchor.position = "absolute"
-  anchor.left = 0
-  anchor.top = 0
-  anchor.zIndex = 2000
-  anchor.flexShrink = 0
+  const root: any = createElement("box")
+  root.flexShrink = 0
+  root.flexDirection = "row"
+  root.justifyContent = "flex-end"
 
   const label: any = createElement("box")
   label.flexShrink = 0
@@ -274,23 +292,21 @@ export function ComposerLiveButton(props: ButtonProps) {
     void props.voice.toggleLive(props.sessionID)
   }
   label.add(live.text)
-  anchor.add(label)
-  wrapper.add(anchor)
+  root.add(label)
 
-  // Line the toggle up with the mic button on the right edge of the box.
+  // Reach the mic button's right edge, so both buttons line up.
   const sync = () => {
-    wrapper.position = "relative"
-    const right = micRightEdge()
-    const width = anchor.width
-    const base = wrapper.x
-    if (right === null || typeof width !== "number" || typeof base !== "number") return
-    const offset = Math.round(right - width - base)
-    if (anchor.left !== offset) anchor.left = offset
+    const mic = micBox
+    const right = mic ? mic.x + mic.width : null
+    const x = root.x
+    if (right === null || typeof right !== "number" || typeof x !== "number") return
+    const width = Math.max(0, Math.round(right - x))
+    if (root.width !== width) root.width = width
   }
   const timer = setInterval(sync, 400)
   onCleanup(() => clearInterval(timer))
 
-  return <box flexShrink={0}>{wrapper}</box>
+  return <box flexShrink={0}>{root}</box>
 }
 
 /**

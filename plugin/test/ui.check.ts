@@ -192,7 +192,7 @@ async function mount(render: () => unknown, width = 40, height = 3) {
   const f = fakeVoice()
   const s = await mount(() => ComposerLiveButton({ context: { theme }, voice: f.voice, sessionID: "ses_xyz" }), 40, 3)
   check("live button renders the idle label", s.captureCharFrame().includes("live"), JSON.stringify(s.captureCharFrame()))
-  await s.mockMouse.click(2, 0)
+  await s.mockMouse.click(36, 0)
   await s.renderOnce()
   check("live click calls toggleLive with the slot's session", f.calls.includes("toggleLive:ses_xyz"), f.calls.join(","))
 

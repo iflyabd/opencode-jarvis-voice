@@ -50,11 +50,9 @@ export default Plugin.define({
         render: (input) => {
           const route = context.ui?.router?.current?.()
           if (route?.type === "home") {
-            // A brand new chat: the live toggle is anchored to the
-            // top-right of the text area, the mic stays in the footer.
-            return (
-              <PromptFooterLive context={context} voice={voice} sessionID={input.sessionID} />
-            )
+            // A brand new chat has no slot above the text box, so the toggle
+            // is anchored to the row over the box from the footer.
+            return <PromptFooterLive context={context} voice={voice} sessionID={input.sessionID} />
           }
           return <MicButton context={context} voice={voice} sessionID={input.sessionID} />
         },

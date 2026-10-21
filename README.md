@@ -209,8 +209,8 @@ Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 The mic sits at the **bottom** of the text box and the live toggle **above**
 it, both on the **right edge of the same box** - the same arrangement in a
 session and on the home screen where a new chat starts. (The host's composer
-slot is narrower than the text box, so the plugin measures the box and lines
-the toggle up with the mic button.)
+slot is narrower than the text box, so the plugin measures the box and the
+mic button and lines the toggle up with it.)
 
 All are theme-aware (colours come from the active theme's action and feedback
 tokens, with hover states) and drive the same state as the keybindings — a
