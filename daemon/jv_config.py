@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-DAEMON_VERSION = "1.1.1"
+DAEMON_VERSION = "1.2.0"
 
 # ----------------------------------------------------------------------------
 # Paths
@@ -168,6 +168,9 @@ WHISPER_BEAM = int(os.environ.get("JARVIS_VOICE_WHISPER_BEAM", "1"))
 # against dead/muted sources and Whisper's "thank you" hallucinations on
 # silence; normal quiet speech is far above this (-66 dBFS).
 STT_MIN_RMS = float(os.environ.get("JARVIS_VOICE_STT_MIN_RMS", "0.0005"))
+# Above this level the audio is loud enough to be speech. Only then is the
+# slower multilingual retry worth running when the English model heard nothing.
+STT_RESCUE_RMS = float(os.environ.get("JARVIS_VOICE_STT_RESCUE_RMS", "0.02"))
 # Explicit local model directory (offline use, e.g. a downloaded faster-whisper model).
 WHISPER_MODEL_DIR = os.environ.get("JARVIS_VOICE_WHISPER_DIR", "")
 # Models already on this machine, best first - avoids a download when offline.

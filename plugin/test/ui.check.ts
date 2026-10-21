@@ -216,7 +216,9 @@ async function mount(render: () => unknown, width = 40, height = 3) {
 /* ----------------------------------------------------------- answer picking */
 
 {
-  const { assistantAnswerText, latestAnswerText, speakable, FISH_STT_LANGUAGES } = await import("../controller.ts")
+  const { assistantAnswerText, latestAnswerText, speakable, transcriptText, insertIntoEditor, FISH_STT_LANGUAGES } = await import(
+    "../controller.ts"
+  )
 
   const withThinking = {
     type: "assistant",
@@ -263,6 +265,32 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     sttCodes.join(","),
   )
   check("Fish STT language codes are unique", new Set(sttCodes).size === sttCodes.length)
+
+  // The daemon nests the turn result under `result` and also sends a flat
+  // `text`. Reading the wrong one is what made every turn say "heard nothing".
+  check("transcript is read from the flat field", transcriptText({ text: "hello there" }) === "hello there")
+  check(
+    "transcript is read from the nested result",
+    transcriptText({ ok: true, result: { text: "hello there" } }) === "hello there",
+  )
+  check("an empty transcript stays empty", transcriptText({ result: { text: "  " } }) === "")
+  check("a missing transcript is empty", transcriptText({}) === "")
+
+  // The transcript has to land in the prompt box so it can be corrected.
+  const editor = {
+    plainText: "",
+    gotoBufferEnd() {
+      this.ended = true
+    },
+    insertText(text: string) {
+      this.plainText += text
+    },
+  }
+  check("the transcript is written into the prompt", insertIntoEditor(editor, "hello there") && editor.plainText === "hello there")
+  editor.plainText = "already typed"
+  insertIntoEditor(editor, "more words")
+  check("the transcript is appended to what is there", editor.plainText === "already typed more words", editor.plainText)
+  check("a missing editor is reported", insertIntoEditor(null, "hello") === false)
 }
 
 /* ----------------------------------------------------------- plugin wiring */

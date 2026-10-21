@@ -94,14 +94,18 @@ def _cached_model(name: str) -> str | None:
     return None
 
 
-def _resolve_model_ref() -> str:
-    """Prefer an explicit local dir, then an already-cached HF snapshot, then the name."""
+def _resolve_model_ref(model: str | None = None) -> str:
+    """Prefer an explicit local dir, then an already-cached HF snapshot, then the name.
+
+    `model` overrides the configured default for one request (the TUI can
+    pick "tiny" for multilingual speech without touching the environment).
+    """
     if cfg.WHISPER_MODEL_DIR:
         p = Path(cfg.WHISPER_MODEL_DIR).expanduser()
         if p.exists():
             return str(p)
-    name = (cfg.WHISPER_MODEL or "auto").strip()
-    if name in ("auto", "default"):
+    name = (model or cfg.WHISPER_MODEL or "auto").strip()
+    if name in ("auto", "default", ""):
         # Fast English model when it is already present, multilingual tiny
         # otherwise. Never download just because the user asked for auto.
         for candidate in ("tiny.en", "tiny", "base.en", "base"):
@@ -112,7 +116,7 @@ def _resolve_model_ref() -> str:
     hit = _cached_model(name)
     if hit:
         return hit
-    if name == "tiny.en" and not getattr(cfg, "WHISPER_MODEL_EXPLICIT", False):
+    if name == "tiny.en" and not getattr(cfg, "WHISPER_MODEL_EXPLICIT", False) and not model:
         # Keep upgrades offline-friendly: if the old multilingual tiny is
         # cached but tiny.en is not, use tiny rather than downloading silently.
         # Running `voice fetch-model tiny.en` (or setting the env var) opts in
@@ -121,46 +125,93 @@ def _resolve_model_ref() -> str:
     return name
 
 
-def _get_faster_whisper_model():
-    """Load (once) and return (model, resolved_ref)."""
+def _is_english_only(name: str) -> bool:
+    """True for the .en Whisper variants, which cannot transcribe other languages."""
+    return str(name or "").lower().endswith(".en")
+
+
+# The faster-whisper model names. An unknown name would be sent to the hub as
+# a download and fail with a network error, so it is rejected up front.
+_KNOWN_MODELS = (
+    "tiny", "tiny.en",
+    "base", "base.en",
+    "small", "small.en",
+    "medium", "medium.en",
+    "large-v1", "large-v2", "large-v3",
+    "distil-large-v3", "turbo",
+)
+
+
+def _multilingual_model() -> str | None:
+    """A cached multilingual model we can fall back to, smallest first."""
+    for candidate in ("tiny", "base", "small", "medium"):
+        if _cached_model(candidate):
+            return candidate
+    return None
+
+
+# The model that last produced a transcript. An English-only model returns an
+# empty string for other languages, so once a multilingual model has worked we
+# keep using it instead of paying the reload on every turn.
+_last_good_model: str | None = None
+
+
+def _get_faster_whisper_model(model: str | None = None):
+    """Load (once) and return (model, resolved_ref, model_name)."""
     from faster_whisper import WhisperModel
 
-    ref = _resolve_model_ref()
+    ref = _resolve_model_ref(model)
+    name = model.strip() if model else (cfg.WHISPER_MODEL or "auto").strip()
+    if model and not cfg.WHISPER_MODEL_DIR and name not in _KNOWN_MODELS and not _cached_model(name):
+        raise SttError(
+            f"unknown Whisper model '{name}'. Use one of: {', '.join(_KNOWN_MODELS)}"
+        )
     key = ("fw", ref, cfg.WHISPER_DEVICE, cfg.WHISPER_COMPUTE)
     with _lock:
-        model = _loaded.get(key)
-        if model is None:
+        model_obj = _loaded.get(key)
+        if model_obj is None:
             local_only = bool(cfg.WHISPER_MODEL_DIR) or os.environ.get("HF_HUB_OFFLINE") == "1"
             load: dict = {"device": cfg.WHISPER_DEVICE, "compute_type": cfg.WHISPER_COMPUTE}
             if cfg.WHISPER_THREADS > 0:
                 # Cap heat on phones; four threads keeps load + inference fast.
                 load["cpu_threads"] = cfg.WHISPER_THREADS
             try:
-                model = WhisperModel(ref, local_files_only=local_only, **load)
+                model_obj = WhisperModel(ref, local_files_only=local_only, **load)
             except Exception as e:
                 if not local_only:
                     # Retry pinned to the local cache so a flaky network does not break voice.
                     os.environ["HF_HUB_OFFLINE"] = "1"
-                    model = WhisperModel(ref, **load)
+                    model_obj = WhisperModel(ref, **load)
                 else:
                     raise SttError(
                         f"cannot load faster-whisper model '{ref}': {e}. "
                         f"Set JARVIS_VOICE_WHISPER_DIR to a local model, or run: voice fetch-model {cfg.WHISPER_MODEL}"
                     )
             _loaded.clear()
-            _loaded[key] = model
-    return model, ref
+            _loaded[key] = model_obj
+    return model_obj, ref, name
 
 
-def transcribe_faster_whisper(pcm: bytes, sr: int = cfg.SAMPLE_RATE) -> dict:
-    model, ref = _get_faster_whisper_model()
+def transcribe_faster_whisper(
+    pcm: bytes,
+    sr: int = cfg.SAMPLE_RATE,
+    model: str | None = None,
+    language: str | None = None,
+) -> dict:
+    whisper_model, ref, name = _get_faster_whisper_model(model)
 
     audio = _pcm_to_float(_norm(pcm, sr))
     if audio.size == 0:
-        return {"text": "", "backend": "faster-whisper", "model": ref, "duration_s": 0.0}
-    segments, info = model.transcribe(
+        return {"text": "", "backend": "faster-whisper", "model": str(ref),
+                "model_name": name, "duration_s": 0.0}
+    lang = (language or cfg.WHISPER_LANGUAGE or "").strip().lower() or None
+    if lang and _is_english_only(name):
+        # An English-only model cannot decode another language; asking it to
+        # would raise instead of transcribing.
+        lang = "en" if lang.startswith("en") else None
+    segments, info = whisper_model.transcribe(
         audio,
-        language=(cfg.WHISPER_LANGUAGE or None),
+        language=lang,
         beam_size=cfg.WHISPER_BEAM,
         vad_filter=False,
         condition_on_previous_text=False,
@@ -171,6 +222,7 @@ def transcribe_faster_whisper(pcm: bytes, sr: int = cfg.SAMPLE_RATE) -> dict:
         "text": text,
         "backend": "faster-whisper",
         "model": str(ref),
+        "model_name": name,
         "language": getattr(info, "language", None),
         "probability": round(float(getattr(info, "language_probability", 0.0) or 0.0), 3),
         "duration_s": round(float(getattr(info, "duration", 0.0) or 0.0), 2),
@@ -506,10 +558,10 @@ def transcribe(
     t0 = time.time()
     if backend == "fish":
         res = transcribe_fish(pcm, sr, _fish_opts(options))
+    elif backend in ("faster-whisper", "faster_whisper"):
+        res = _transcribe_local(pcm, sr, _local_opts(options), level)
     else:
         fn = {
-            "faster-whisper": transcribe_faster_whisper,
-            "faster_whisper": transcribe_faster_whisper,
             "whisper": transcribe_openai_whisper,
             "whispercpp": transcribe_whispercpp,
             "whisper.cpp": transcribe_whispercpp,
@@ -521,6 +573,52 @@ def transcribe(
     res["ms"] = int((time.time() - t0) * 1000)
     res["text"] = (res.get("text") or "").strip()
     return res
+
+
+def _local_opts(options: dict | None) -> dict:
+    if not isinstance(options, dict):
+        return {}
+    local = options.get("local")
+    return local if isinstance(local, dict) else {}
+
+
+def _transcribe_local(pcm: bytes, sr: int, local: dict, level: float | None = None) -> dict:
+    """Run the local Whisper backend, with a multilingual rescue.
+
+    The default model is the fast English-only `tiny.en`. It returns an empty
+    string for other languages, which used to look like "nothing was heard".
+    When the audio clearly had energy but the English model produced no text,
+    retry once with a cached multilingual model and remember it, so the next
+    turn goes straight to the model that works.
+    """
+    global _last_good_model
+
+    wanted = str(local.get("model") or "").strip()
+    language = str(local.get("language") or "").strip() or None
+    # An explicit model from the settings wins; otherwise reuse the model that
+    # last produced a transcript.
+    name = wanted or _last_good_model or None
+    res = transcribe_faster_whisper(pcm, sr, model=name, language=language)
+    if res.get("text"):
+        _last_good_model = res.get("model_name") or name
+        return res
+
+    # Nothing came out. If the model was English-only and the user did not
+    # ask for a specific one, try a multilingual model before giving up.
+    used = str(res.get("model_name") or name or "")
+    if wanted or not _is_english_only(used):
+        return res
+    if level is not None and level < cfg.STT_RESCUE_RMS:
+        # Too quiet to be speech: a second, slower pass would not help.
+        return res
+    alt = _multilingual_model()
+    if not alt:
+        return res
+    res2 = transcribe_faster_whisper(pcm, sr, model=alt, language=None)
+    res2["fallback"] = alt
+    if res2.get("text"):
+        _last_good_model = alt
+    return res2
 
 
 def warmup(options: dict | None = None, backend: str | None = None) -> dict:
@@ -538,7 +636,8 @@ def warmup(options: dict | None = None, backend: str | None = None) -> dict:
         if b in ("faster-whisper", "faster_whisper"):
             # Load the weights only. A dummy transcription would spend another
             # second decoding silence (and often hallucinate "thank you").
-            _get_faster_whisper_model()
+            local = _local_opts(options)
+            _get_faster_whisper_model(str(local.get("model") or "").strip() or None)
         else:
             # Other backends have no separate loader.
             transcribe(b"\x00\x00" * (cfg.SAMPLE_RATE // 4), cfg.SAMPLE_RATE, backend=b)

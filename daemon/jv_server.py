@@ -228,7 +228,7 @@ class PttSession:
         finally:
             self._done.set()
 
-    def stop_and_wait(self, timeout: float = 120.0) -> dict:
+    def stop_and_wait(self, timeout: float = 180.0) -> dict:
         self.stop_event.set()
         if not self._done.wait(timeout=timeout):
             raise audio.AudioError("push-to-talk did not finish in time")
@@ -494,9 +494,19 @@ class Handler(BaseHTTPRequestHandler):
                 if not sess:
                     return self._send(409, {"error": "no push-to-talk session running"})
                 out = sess.stop_and_wait()
-                if out.get("result") and out["result"].get("text"):
-                    _state["last_text"] = out["result"]["text"]
-                return self._send(200, {"ok": True, **out})
+                result = out.get("result") or {}
+                if result.get("text"):
+                    _state["last_text"] = result["text"]
+                # The transcript also goes to the top level: the plugin reads
+                # `text` directly, and older clients keep using `result`.
+                payload = {"ok": True, **out}
+                if result:
+                    payload["text"] = result.get("text", "")
+                    for key in ("backend", "model", "model_name", "language", "ms",
+                                "empty", "duration_s", "stats", "reason", "fallback"):
+                        if key in result:
+                            payload[key] = result[key]
+                return self._send(200, payload)
 
             if path == "/ptt/cancel":
                 sess = _state["ptt"]

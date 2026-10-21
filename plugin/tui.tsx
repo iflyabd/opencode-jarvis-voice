@@ -5,10 +5,11 @@
  *
  *   press the key  ->  "Listening..."
  *   speak          ->  voice-activity detection ends the turn on its own
- *   pause          ->  transcript is sent as your message
+ *   pause          ->  transcript is typed into the prompt box for review
  *   reply          ->  spoken back through the local Piper voice
  *
- * Pressing the key again while it is listening sends immediately.
+ * The transcript is never sent on its own unless auto-send is switched on
+ * (Voice: toggle auto-send). Pressing the key again stops the recording.
  *
  * UI buttons (all follow the host theme, clickable with the mouse):
  *   `prompt.footer`         bottom-right of the prompt box: the mic / PTT button
@@ -21,12 +22,13 @@
  *
  * Commands:  voice.pushToTalk (ctrl+alt+v), voice.pauseResume (ctrl+alt+p),
  *            voice.status, voice.cancel, voice.speakLast, voice.toggleAutoSpeak,
- *            /voice
+ *            voice.toggleAutoSend, /voice
  *
  * Options (plugin options in cli.json):
  *   { "mic": false }          hide the mic button
  *   { "speak": false }        hide the speaker button
  *   { "autoSpeak": false }    start with replies staying silent
+ *   { "autoSend": true }      send the transcript straight away (hands-free)
  */
 
 import { Plugin } from "@opencode/plugin/tui"
@@ -152,6 +154,15 @@ export default Plugin.define({
           palette: true,
           run: () => {
             voice.toggleAutoSpeak()
+          },
+        },
+        {
+          id: "voice.toggleAutoSend",
+          title: "Voice: toggle auto-send (transcript goes to the prompt box)",
+          group: "Jarvis Voice",
+          palette: true,
+          run: async () => {
+            await voice.toggleAutoSend()
           },
         },
       ],

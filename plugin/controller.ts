@@ -10,10 +10,11 @@
  *
  *   press the key  ->  "Listening..."
  *   speak          ->  voice-activity detection ends the turn on its own
- *   pause          ->  transcript is sent as your message
+ *   pause          ->  transcript is typed into the prompt box for review
  *   reply          ->  spoken back through the local Piper voice
  *
- * Pressing the key again while it is listening sends immediately.
+ * The transcript is never sent on its own unless auto-send is switched on
+ * (Voice: toggle auto-send). Pressing the key again stops the recording.
  */
 
 import { createSignal, type Accessor } from "solid-js"
@@ -43,12 +44,36 @@ type VoiceSettings = {
   fishSttModel: string
   /** Optional ISO 639-1 hint; "" means Fish auto-detects. */
   fishSttLanguage: string
+  /** Local Whisper model; "" = automatic (tiny.en plus a multilingual rescue). */
+  localModel: string
+  /** Optional ISO 639-1 hint for the local model; "" = auto-detect. */
+  localLanguage: string
+  /** Send the transcript to the agent straight away instead of the prompt box. */
+  autoSend: boolean
 }
 
 type FishVoice = { id: string; title: string; description?: string }
 
 const FISH_MODEL = "s2.1-pro-free"
 const FISH_STT_MODEL = "transcribe-1-pro"
+
+/** Local Whisper models the settings can pick. "" means automatic. */
+const LOCAL_MODELS: Array<{ id: string; title: string; description: string }> = [
+  {
+    id: "",
+    title: "Automatic (recommended)",
+    description: "tiny.en for English, with a multilingual retry when nothing comes back",
+  },
+  { id: "tiny.en", title: "tiny.en", description: "English only, fastest on a phone" },
+  { id: "tiny", title: "tiny", description: "Multilingual, a little slower" },
+  { id: "base", title: "base", description: "Multilingual, better accuracy, downloads on first use" },
+  { id: "small", title: "small", description: "Multilingual, best accuracy, slow on a phone" },
+]
+
+function normalizeLocalModel(value: unknown): string {
+  const name = String(value ?? "").trim().toLowerCase()
+  return LOCAL_MODELS.some((m) => m.id === name) ? name : ""
+}
 
 /**
  * Language hints accepted by Fish Audio ASR. Fish detects the language
@@ -239,6 +264,35 @@ export function latestAnswerText(messages: any[]): string {
   return latestAnswer(messages).text
 }
 
+/**
+ * Read the transcript out of a daemon turn.
+ *
+ * The daemon nests the turn result under `result` and also sends a flat
+ * `text` copy. Older daemons only send `result`, so read both: picking the
+ * wrong one is what made every push-to-talk turn report "heard nothing".
+ */
+export function transcriptText(res: any): string {
+  const raw = res?.text ?? res?.result?.text ?? ""
+  return String(raw ?? "").trim()
+}
+
+/**
+ * Put text into an editable prompt box (the host's focused editor).
+ * Returns false when the editor does not accept text.
+ */
+export function insertIntoEditor(editor: any, text: string): boolean {
+  if (!editor || typeof editor.insertText !== "function") return false
+  try {
+    const current = typeof editor.plainText === "string" ? editor.plainText : ""
+    const needsSpace = current.length > 0 && !/\s$/.test(current) && !/^\s/.test(text)
+    if (typeof editor.gotoBufferEnd === "function") editor.gotoBufferEnd()
+    editor.insertText(needsSpace ? ` ${text}` : text)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** Turn a markdown answer into something worth listening to. */
 export function speakable(text: string, limit = 0): string {
   let out = text
@@ -283,6 +337,19 @@ export function createVoiceController(context: any) {
   // from the plugin's node_modules, or the renderer lays the node out without
   // ever drawing it.
   let hostTextClass: any = null
+
+  // The host's prompt box is a focused text editor. Clicking the mic button
+  // can take the focus away from it, so remember the last editor that was
+  // focused: the transcript still has to land in the prompt box.
+  let lastPromptEditor: any = null
+  try {
+    const renderer: any = context.renderer
+    renderer?.on?.("focused_editor", (editor: any) => {
+      if (editor) lastPromptEditor = editor
+    })
+  } catch {
+    /* older hosts: the currently focused editor is enough */
+  }
 
   /**
    * State changes here repaint the on-screen buttons directly.
@@ -362,6 +429,9 @@ export function createVoiceController(context: any) {
     sttProvider: String(optionStt.provider ?? context.options?.sttProvider ?? optionFish.sttProvider ?? "local") === "fish" ? "fish" : "local",
     fishSttModel: normalizeSttModel(optionStt.model ?? context.options?.fishSttModel ?? optionFish.sttModel),
     fishSttLanguage: normalizeSttLanguage(optionStt.language ?? context.options?.fishSttLanguage ?? optionFish.sttLanguage),
+    localModel: normalizeLocalModel(optionStt.localModel ?? context.options?.localModel ?? optionFish.localModel),
+    localLanguage: normalizeSttLanguage(optionStt.localLanguage ?? context.options?.localLanguage ?? optionFish.localLanguage),
+    autoSend: context.options?.autoSend === true,
   }
 
   // context.storage is durable and shared between TUI instances; keep a plain
@@ -386,7 +456,10 @@ export function createVoiceController(context: any) {
       const needsMigration =
         (stored.sttProvider !== "local" && stored.sttProvider !== "fish") ||
         !stored.fishSttModel ||
-        typeof stored.fishSttLanguage !== "string"
+        typeof stored.fishSttLanguage !== "string" ||
+        typeof stored.localModel !== "string" ||
+        typeof stored.localLanguage !== "string" ||
+        typeof stored.autoSend !== "boolean"
       if (needsMigration) {
         void setStored((draft) => {
           if (draft.sttProvider !== "local" && draft.sttProvider !== "fish") {
@@ -394,6 +467,10 @@ export function createVoiceController(context: any) {
           }
           draft.fishSttModel = normalizeSttModel(draft.fishSttModel ?? seedSettings.fishSttModel)
           draft.fishSttLanguage = normalizeSttLanguage(draft.fishSttLanguage ?? seedSettings.fishSttLanguage)
+          draft.localModel = normalizeLocalModel(draft.localModel ?? seedSettings.localModel)
+          draft.localLanguage = normalizeSttLanguage(draft.localLanguage ?? seedSettings.localLanguage)
+          // Review first: the transcript lands in the prompt box.
+          if (typeof draft.autoSend !== "boolean") draft.autoSend = seedSettings.autoSend
         }).catch(() => {
           /* defaults still apply in memory */
         })
@@ -432,7 +509,15 @@ export function createVoiceController(context: any) {
   function sttRequest(): SttOptions {
     // Always send an explicit backend: it lets the TUI override a daemon
     // environment that defaults to Fish, and local selection must stay local.
-    if (settings.sttProvider !== "fish") return { backend: "local" }
+    if (settings.sttProvider !== "fish") {
+      return {
+        backend: "local",
+        local: {
+          model: normalizeLocalModel(settings.localModel),
+          language: normalizeSttLanguage(settings.localLanguage),
+        },
+      }
+    }
     return {
       backend: "fish",
       fish: {
@@ -448,11 +533,69 @@ export function createVoiceController(context: any) {
   }
 
   function sttLabel(): string {
-    if (settings.sttProvider !== "fish") return "Local Whisper · on-device"
+    if (settings.sttProvider !== "fish") {
+      const model = normalizeLocalModel(settings.localModel)
+      const language = sttLanguageName(normalizeSttLanguage(settings.localLanguage))
+      return `Local Whisper · ${model ? model : "auto"} · ${language}`
+    }
     const model = normalizeSttModel(settings.fishSttModel)
     const language = sttLanguageName(normalizeSttLanguage(settings.fishSttLanguage))
     const key = (settings.fishApiKey || "").trim()
     return `Fish Audio · ${model} · ${language}${key ? "" : " · key needed"}`
+  }
+
+  /* ------------------------------------------------------- prompt box */
+
+  function promptEditor(): any {
+    const renderer: any = context.renderer
+    const focused = renderer?.currentFocusedEditor
+    if (focused && typeof focused.insertText === "function" && !focused.isDestroyed) return focused
+    if (lastPromptEditor && typeof lastPromptEditor.insertText === "function" && !lastPromptEditor.isDestroyed) {
+      return lastPromptEditor
+    }
+    return null
+  }
+
+  /**
+   * Put the transcript into the host's prompt box so the user can correct it
+   * and send it with the usual key. Returns false when the TUI does not
+   * expose an editable prompt.
+   */
+  function insertIntoPrompt(text: string): boolean {
+    const editor = promptEditor()
+    if (!insertIntoEditor(editor, text)) return false
+    try {
+      const renderer: any = context.renderer
+      renderer?.requestRender?.()
+      // Hand the focus back to the prompt so the transcript can be edited.
+      try {
+        if (renderer?.currentFocusedEditor !== editor) editor.focus?.()
+      } catch {
+        /* focus is a nicety, the text is already in */
+      }
+    } catch {
+      /* rendering is best effort */
+    }
+    return true
+  }
+
+  /* --------------------------------------------------------- auto send */
+
+  function autoSendEnabled(): boolean {
+    return settings.autoSend === true
+  }
+
+  async function toggleAutoSend(): Promise<void> {
+    const next = !autoSendEnabled()
+    await persist((draft) => {
+      draft.autoSend = next
+    })
+    toast(
+      next
+        ? "Transcripts are sent to the agent automatically"
+        : "Transcripts land in the prompt box — review and send them yourself",
+      next ? "success" : "info",
+    )
   }
 
   function healthSummary(h: Health): string {
@@ -628,12 +771,23 @@ export function createVoiceController(context: any) {
     toast(`Fish Audio voice: ${voice?.title || picked}`, "success")
   }
 
-  async function chooseFishSttLanguage(): Promise<void> {
+  /**
+   * Pick a language hint. The same list works for the local Whisper model
+   * and for Fish ASR; only the wording differs.
+   */
+  async function chooseLanguageHint(opts: {
+    title: string
+    current: string
+    autoTitle: string
+    autoDescription: string
+    hintDescription: string
+    apply: (code: string) => Promise<void> | void
+  }): Promise<void> {
     const options: Array<{ title: string; value: string; description?: string }> = [
       {
-        title: "Auto-detect (recommended)",
+        title: opts.autoTitle,
         value: "__auto__",
-        description: "Fish detects the spoken language; works across its 80+ supported languages",
+        description: opts.autoDescription,
       },
       ...FISH_STT_LANGUAGES.map((item) => ({
         title: `${item.name} (${item.code})`,
@@ -647,18 +801,16 @@ export function createVoiceController(context: any) {
       },
     ]
     const picked: string | undefined = await context.ui.dialog.select({
-      title: "Fish Audio STT language",
+      title: opts.title,
       placeholder: "Type to filter, then choose a language",
       options,
-      current: settings.fishSttLanguage || "__auto__",
+      current: opts.current || "__auto__",
     })
     if (picked === undefined) return
 
     if (picked === "__auto__") {
-      await persist((draft) => {
-        draft.fishSttLanguage = ""
-      })
-      toast("Fish Audio will detect the language automatically", "success")
+      await opts.apply("")
+      toast("The language will be detected automatically", "success")
       return
     }
     if (picked === "__other__") {
@@ -667,19 +819,16 @@ export function createVoiceController(context: any) {
         return
       }
       const raw = await context.ui.dialog.prompt({
-        title: "Fish Audio STT language code",
-        description:
-          "Enter a lowercase ISO 639-1 code, e.g. en, es, zh, ja. Fish still auto-detects; this is only a hint.",
+        title: `${opts.title} code`,
+        description: "Enter a lowercase ISO 639-1 code, e.g. en, es, zh, ja.",
         placeholder: "two-letter code",
-        value: settings.fishSttLanguage || "",
+        value: opts.current || "",
       })
       if (raw === undefined) return
       const text = raw.trim().toLowerCase()
       if (!text || text === "auto") {
-        await persist((draft) => {
-          draft.fishSttLanguage = ""
-        })
-        toast("Fish Audio will detect the language automatically", "success")
+        await opts.apply("")
+        toast("The language will be detected automatically", "success")
         return
       }
       const code = normalizeSttLanguage(text)
@@ -687,19 +836,45 @@ export function createVoiceController(context: any) {
         toast("Use a two-letter ISO 639-1 code such as en, es, zh, or ja", "warning")
         return
       }
-      await persist((draft) => {
-        draft.fishSttLanguage = code
-      })
-      toast(`Fish Audio STT language hint: ${sttLanguageName(code)} (${code})`, "success")
+      await opts.apply(code)
+      toast(`${opts.hintDescription}: ${sttLanguageName(code)} (${code})`, "success")
       return
     }
 
     const code = normalizeSttLanguage(picked)
     if (!code) return
-    await persist((draft) => {
-      draft.fishSttLanguage = code
+    await opts.apply(code)
+    toast(`${opts.hintDescription}: ${sttLanguageName(code)} (${code})`, "success")
+  }
+
+  async function chooseFishSttLanguage(): Promise<void> {
+    await chooseLanguageHint({
+      title: "Fish Audio STT language",
+      current: settings.fishSttLanguage,
+      autoTitle: "Auto-detect (recommended)",
+      autoDescription: "Fish detects the spoken language; works across its 80+ supported languages",
+      hintDescription: "Fish Audio STT language hint",
+      apply: async (code) => {
+        await persist((draft) => {
+          draft.fishSttLanguage = code
+        })
+      },
     })
-    toast(`Fish Audio STT language hint: ${sttLanguageName(code)} (${code})`, "success")
+  }
+
+  async function chooseLocalLanguage(): Promise<void> {
+    await chooseLanguageHint({
+      title: "Local Whisper language",
+      current: settings.localLanguage,
+      autoTitle: "Auto-detect (recommended)",
+      autoDescription: "Whisper picks the language; needs a multilingual model",
+      hintDescription: "Local Whisper language hint",
+      apply: async (code) => {
+        await persist((draft) => {
+          draft.localLanguage = code
+        })
+      },
+    })
   }
 
   async function openSttSettings(): Promise<void> {
@@ -712,6 +887,8 @@ export function createVoiceController(context: any) {
       const provider = settings.sttProvider
       const model = normalizeSttModel(settings.fishSttModel)
       const language = sttLanguageName(normalizeSttLanguage(settings.fishSttLanguage))
+      const localModel = normalizeLocalModel(settings.localModel)
+      const localLanguage = sttLanguageName(normalizeSttLanguage(settings.localLanguage))
       const choice: string | undefined = await context.ui.dialog.select({
         title: "Speech-to-text",
         placeholder: "Choose how the microphone is transcribed",
@@ -727,6 +904,18 @@ export function createVoiceController(context: any) {
             description: key
               ? `Cloud ASR · key ${maskKey(key)} · audio is uploaded · uses API credit`
               : "Cloud ASR · needs an API key and API credit",
+          },
+          {
+            title: "Local Whisper model",
+            value: "localmodel",
+            description: localModel
+              ? `${localModel} · ${LOCAL_MODELS.find((m) => m.id === localModel)?.description ?? ""}`
+              : "Automatic · tiny.en, with a multilingual retry",
+          },
+          {
+            title: "Local Whisper language",
+            value: "locallanguage",
+            description: `${localLanguage} · auto-detect is recommended`,
           },
           {
             title: "Fish Audio ASR model",
@@ -791,6 +980,26 @@ export function createVoiceController(context: any) {
         }
       } else if (choice === "language") {
         await chooseFishSttLanguage()
+      } else if (choice === "localmodel") {
+        const picked: string | undefined = await context.ui.dialog.select({
+          title: "Local Whisper model",
+          placeholder: "Choose the on-device model",
+          current: localModel,
+          options: LOCAL_MODELS.map((m) => ({
+            title: m.title,
+            value: m.id,
+            description: m.description,
+          })),
+        })
+        if (picked !== undefined) {
+          await persist((draft) => {
+            draft.localModel = normalizeLocalModel(picked)
+          })
+          const name = normalizeLocalModel(picked) || "automatic"
+          toast(`Local Whisper model: ${name}`, "success")
+        }
+      } else if (choice === "locallanguage") {
+        await chooseLocalLanguage()
       } else if (choice === "key") {
         await setFishKey()
       }
@@ -826,7 +1035,13 @@ export function createVoiceController(context: any) {
       }
       const picked = h.stt?.backends?.find((b: any) => b.backend === h.stt?.picked)
       const model = picked?.model ? String(picked.model).split("/").pop() : ""
-      toast(`Transcription: ${h.stt?.picked ?? "none"}${model ? ` · ${model}` : ""} · local`, "info")
+      const chosen = normalizeLocalModel(settings.localModel)
+      const language = sttLanguageName(normalizeSttLanguage(settings.localLanguage))
+      toast(
+        `Transcription: ${h.stt?.picked ?? "none"}${model ? ` · ${model}` : ""} · local` +
+          `${chosen ? ` · ${chosen}` : ""} · ${language}`,
+        "info",
+      )
     } catch (e) {
       toast(errorText(e), "error")
     }
@@ -869,6 +1084,13 @@ export function createVoiceController(context: any) {
             description: "Automatic: direct phone mic on Android, default mic elsewhere",
           },
           { title: "Transcription", value: "stt", description: sttLabel() },
+          {
+            title: autoSendEnabled() ? "Auto-send transcripts (on)" : "Auto-send transcripts (off)",
+            value: "autosend",
+            description: autoSendEnabled()
+              ? "Transcripts are sent to the agent as soon as they are transcribed"
+              : "Transcripts land in the prompt box so you can correct them before sending",
+          },
           { title: "Show voice status", value: "status" },
         ],
       })
@@ -926,6 +1148,8 @@ export function createVoiceController(context: any) {
         }
       } else if (choice === "stt") {
         await openSttSettings()
+      } else if (choice === "autosend") {
+        await toggleAutoSend()
       } else if (choice === "mic" || choice === "status") {
         await showVoiceInfo(choice)
       }
@@ -1219,19 +1443,41 @@ export function createVoiceController(context: any) {
     }
   }
 
+  /**
+   * Wait for the user to send the transcript we put in the prompt box, then
+   * read the answer back. Used when auto-send is off but replies are spoken.
+   */
+  async function speakWhenAnswered(sessionID: string | undefined): Promise<void> {
+    if (!sessionID) return
+    for (let i = 0; i < 240; i++) {
+      await sleep(500)
+      let status: string | undefined
+      try {
+        status = context.data.session.status(sessionID)
+      } catch {
+        status = undefined
+      }
+      if (status === undefined) return // no session data: nothing to wait for
+      if (status === "busy") {
+        await speakReply(sessionID)
+        return
+      }
+    }
+  }
+
   /* -------------------------------------------------------- push to talk */
 
   async function toggleMic(forcedSessionID?: string): Promise<void> {
     const sessionID = forcedSessionID ?? currentSessionID(context)
 
     if (mic() !== "idle") {
-      // Second press: stop listening and send what we have. The loop below
-      // picks the transcript up from its own pttStop call.
+      // Second press: stop the recording. The loop below picks the
+      // transcript up from its own pttStop call.
       try {
         const info = await daemon(true)
         if (!info) return
-        await api.pttStop(info, 30000)
-        toast("Sending what I heard…")
+        await api.pttStop(info, 120000)
+        toast("Stopping…")
       } catch (e) {
         toast(errorText(e), "error")
       }
@@ -1250,7 +1496,7 @@ export function createVoiceController(context: any) {
       const info = await daemonOrToast()
       if (!info) return
       await api.pttStart(info, 30000, sttRequest())
-      toast("🎙 Listening… speak now (press again to send)")
+      toast("🎙 Listening… speak now")
 
       // Wait for the capture turn to end on its own (silence detection).
       for (let i = 0; i < 240; i++) {
@@ -1262,20 +1508,46 @@ export function createVoiceController(context: any) {
       }
 
       setMicState("transcribing")
-      const res = await api.pttStop(info, 60000).catch((e: unknown) => {
+      // A slow multilingual retry on a phone can take a while; give the turn
+      // enough time to finish instead of failing with a timeout.
+      const res = await api.pttStop(info, 150000).catch((e: unknown) => {
         toast(errorText(e), "error")
         return null
       })
       if (res === null) return // the failure was already reported
       if (micCancelled) return // cancel() asked for silence
-      const text = (res.text ?? "").trim()
+      const text = transcriptText(res)
       if (!text) {
-        toast("Heard nothing — check the mic with `voice doctor`", "warning")
+        // Say what the daemon actually saw, so "nothing" is diagnosable.
+        const stats = (res as any)?.stats ?? (res as any)?.result?.stats
+        const reason = (res as any)?.result?.reason ?? (res as any)?.reason ?? "no speech"
+        const level = typeof stats?.rms === "number" ? `, level ${Number(stats.rms).toFixed(3)}` : ""
+        const dur = typeof stats?.duration_s === "number" ? "" : ""
+        toast(
+          `Heard nothing (${reason}${level}${dur}) — check the mic with \`voice doctor\`, ` +
+            `or switch the local model in Voice: settings → Transcription`,
+          "warning",
+        )
         return
       }
-      toast(`📝 ${text}`, "success")
-      const sent = await submit(sessionID, text)
-      if (sent && autoSpeak) void speakReply(sessionID)
+
+      if (autoSendEnabled()) {
+        // Hands-free mode: the transcript goes straight to the agent.
+        toast(`📝 ${text}`, "success")
+        const sent = await submit(sessionID, text)
+        if (sent && autoSpeak) void speakReply(sessionID)
+        return
+      }
+
+      // Default: the transcript goes into the prompt box so it can be
+      // corrected before it is sent.
+      if (insertIntoPrompt(text)) {
+        toast("📝 Added to the prompt — review it and press send", "success")
+        if (autoSpeak) void speakWhenAnswered(sessionID)
+      } else {
+        toast(`📝 ${text}`, "success")
+        toast("Could not open the prompt box — copy the transcript above", "warning")
+      }
     } catch (e) {
       toast(errorText(e), "error")
     } finally {
@@ -1337,6 +1609,8 @@ export function createVoiceController(context: any) {
     addRepaint,
     removeRepaint,
     autoSpeak: () => autoSpeak,
+    /** True when transcripts are sent to the agent without a review step. */
+    autoSend: () => autoSendEnabled(),
     speakText,
     speakLast,
     speakMessage,
@@ -1348,6 +1622,7 @@ export function createVoiceController(context: any) {
     openSettings,
     preload,
     toggleAutoSpeak,
+    toggleAutoSend,
     refreshSpeech,
     dispose,
   }

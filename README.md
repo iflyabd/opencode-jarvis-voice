@@ -164,7 +164,7 @@ Or list several search folders: `JARVIS_VOICE_VOICE_DIRS=/sdcard/piper:~/voices`
 
 | | |
 |---|---|
-| `ctrl+alt+v` | start listening; press again to send immediately |
+| `ctrl+alt+v` | start listening; press again to stop |
 | `ctrl+alt+p` | read the last answer / pause / resume |
 | `/voice` | same thing from the prompt |
 | `/voice <text>` | say that text out loud |
@@ -173,13 +173,14 @@ Once you start talking, silence ends the turn on its own — no second press
 needed. Watch for:
 
 ```
-🎙 Listening... speak now (press again to send)
-📝 refactor the parser and run the tests
+🎙 Listening... speak now
+📝 Added to the prompt — review it and press send
 ```
 
-The transcript is sent as your message, and the answer is spoken back while it
-appears on screen. Turn that off with **Voice: toggle speaking replies** in the
-command palette (`ctrl+p`).
+The transcript lands in the prompt box so you can correct it before it is
+sent; the answer is spoken back while it appears on screen. Turn the spoken
+reply off with **Voice: toggle speaking replies** in the command palette
+(`ctrl+p`), and the review step off with **Voice: toggle auto-send**.
 
 Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 
@@ -196,7 +197,7 @@ Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 
 | Button | Where | Click |
 |---|---|---|
-| `🎙 mic` / `● listening` / `◌ transcribing` | bottom-right of the prompt box | start listening; click again to stop and send |
+| `🎙 mic` / `● listening` / `◌ transcribing` | bottom-right of the prompt box | start listening; click again to stop |
 | `🔊 read` / `⏸ pause` / `▶ resume` | directly under each assistant answer | read **that answer**; click again to pause it, again to resume |
 | `🔊 read` / `⏸ pause` / `▶ resume` | top-right of the composer | read the newest answer, even when older messages are scrolled away |
 
@@ -232,6 +233,28 @@ Reading rules:
 * long answers are read in full, with code blocks, tables and markdown
   symbols stripped first.
 
+### The transcript goes into the prompt box
+
+Push-to-talk does **not** send anything by default. When the turn ends, the
+transcript is typed into the prompt box so you can read it, fix a wrong word
+and then press send yourself. Nothing reaches the agent until you do.
+
+That is deliberate: speech-to-text is never perfect, and a wrong transcript
+that is sent immediately is a wrong prompt the agent has already answered.
+
+If you want the hands-free flow, turn **auto-send** on:
+
+* **`Voice: toggle auto-send (transcript goes to the prompt box)`** in the
+  command palette, or
+* **Voice: settings → Auto-send transcripts** in the settings dialog.
+
+With auto-send on, the transcript is submitted to the agent as soon as it is
+transcribed, and the reply is spoken back (when auto-speak is on). With
+auto-send off, the reply is still spoken once you send the transcript.
+
+If the host TUI does not expose an editable prompt box, the transcript is
+shown in a toast so it can be copied by hand.
+
 ### Other commands
 
 | Command | What it does |
@@ -244,6 +267,7 @@ Reading rules:
 | `Voice: cancel listening / stop speaking` | shut it up immediately |
 | `Voice: speak the last reply` | read the current answer out loud |
 | `Voice: toggle speaking replies` | auto-speak the assistant on/off |
+| `Voice: toggle auto-send (transcript goes to the prompt box)` | hands-free mode on/off: send the transcript straight away, or drop it in the prompt box for review |
 
 ### Optional Fish Audio voices
 
@@ -425,6 +449,7 @@ Everything is an environment variable, read at daemon start:
 | `JARVIS_VOICE_SLES` | `1` | set `0` to disable the direct Android phone-mic backend |
 | `JARVIS_VOICE_SLES_SOURCE` | `jarvis_mic` | PulseAudio source name used for the direct phone mic |
 | `JARVIS_VOICE_STT` | `auto` | `auto`, a local backend, `fish`, or `none`; the TUI setting wins per request |
+| `JARVIS_VOICE_STT_RESCUE_RMS` | `0.02` | level above which an empty transcript is retried with a multilingual model |
 | `JARVIS_VOICE_WHISPER_MODEL` | `tiny.en` | `tiny.en`, `tiny` (multilingual), `base`, `small`, `medium`, `large-v3` |
 | `JARVIS_VOICE_WHISPER_DIR` | — | local model folder, for purely offline use |
 | `JARVIS_VOICE_LANGUAGE` | auto | local Whisper hint, e.g. `en` to skip detection |
@@ -494,7 +519,7 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
   "plugins": [
     {
       "package": "/absolute/path/to/opencode-jarvis-voice",
-      "options": { "mic": true, "speak": true, "autoSpeak": true }
+      "options": { "mic": true, "speak": true, "autoSpeak": true, "autoSend": false }
     }
   ]
 }
@@ -505,8 +530,9 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
 | `mic` | `true` | show the 🎙 mic button in the prompt footer |
 | `speak` | `true` | show the 🔊 read / pause button above the text box |
 | `autoSpeak` | `true` | speak replies automatically after push-to-talk starts the turn |
+| `autoSend` | `false` | send the transcript to the agent as soon as it is transcribed; off means it lands in the prompt box for review |
 | `fishAudio` | — | optional `{ provider, apiKey, voiceId, voiceName, model, sttProvider, sttModel, sttLanguage }`; the settings dialog is safer for keys |
-| `stt` | — | optional `{ provider, model, language }` defaults for speech-to-text; normally set in the settings dialog |
+| `stt` | — | optional `{ provider, model, language, localModel, localLanguage }` defaults for speech-to-text; normally set in the settings dialog |
 
 The **`Voice: settings`** dialog is the normal way to configure Fish Audio:
 it stores the key in OpenCode's local plugin storage, masks it in the UI, and
@@ -551,7 +577,18 @@ Run `./bin/voice fetch-model tiny.en` once to get the faster English weights.
 Setting `JARVIS_VOICE_WHISPER_MODEL` explicitly always honours your choice.
 
 `tiny.en` is English-only. For another language use multilingual `tiny`, or a
-larger model for noisy rooms and accents. Alternatively select Fish Audio ASR
+larger model for noisy rooms and accents. Two ways to get there:
+
+* **Voice: settings → Transcription → Local Whisper model** picks the model
+  per turn (`tiny.en`, `tiny`, `base`, `small`) and **Local Whisper language**
+  sets a language hint.
+* **Automatic** (the default) does the same thing for you: it starts with the
+  fast `tiny.en`, and when that model hears nothing in audio that clearly had
+  energy, it retries once with a cached multilingual model and keeps using
+  that model afterwards. An English-only model simply cannot decode another
+  language, and that used to look like "nothing was heard".
+
+Alternatively select Fish Audio ASR
 in `/voice-settings` → **Transcription**; it supports 80+ languages and does
 the decoding on Fish's servers, at the cost of uploading the utterance and
 using paid API credit:
@@ -614,6 +651,8 @@ optional accelerants that the daemon reports on and degrades without.
 | `no local TTS backend` | `./bin/voice voice fetch en_GB-alan-medium` |
 | espeak voice instead of Piper | no voice found — `./bin/voice voice list` |
 | It hears you but the transcript is wrong | bigger model: `JARVIS_VOICE_WHISPER_MODEL=base`; `tiny.en` is English-only |
+| `Heard nothing` | the toast now shows what the daemon heard (reason and level). Check the mic with `voice doctor`; if you speak another language, pick a multilingual model in **Voice: settings → Transcription → Local Whisper model** — the automatic mode already retries with `tiny` when the English model comes back empty |
+| The transcript is not sent | that is the default: it lands in the prompt box so you can correct it. Press send, or turn on **Voice: toggle auto-send** for hands-free mode |
 | Fish Audio says key/voice not set | `ctrl+p` → **Voice: settings**, add the API key, then choose a voice |
 | Fish Audio HTTP 401/402 | check the key on fish.audio; the free TTS model may need credit for some voices. Fish **ASR** uses separate API credit — add it at `fish.audio/app/developers` |
 | Fish ASR reports the wrong language | leave the language on **Auto-detect**. A hint only sets the reported language when a very short clip cannot be detected; it does not force the transcript |

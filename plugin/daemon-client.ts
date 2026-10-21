@@ -26,9 +26,26 @@ export type Transcript = {
   empty?: boolean
   backend?: string
   model?: string
+  model_name?: string
   ms?: number
   language?: string
   language_code?: string
+  /** The daemon nests the turn result under `result`; `text` is the flat copy. */
+  result?: {
+    text?: string
+    backend?: string
+    model?: string
+    model_name?: string
+    language?: string
+    empty?: boolean
+    ms?: number
+    reason?: string
+    fallback?: string
+    stats?: Record<string, unknown>
+  }
+  reason?: string
+  /** Set when a multilingual model rescued an empty English-only transcript. */
+  fallback?: string
   stats?: Record<string, unknown>
 }
 
@@ -49,6 +66,11 @@ export type FishSttOptions = {
 export type SttOptions = {
   backend?: "local" | "fish"
   fish?: FishSttOptions
+  /** Local Whisper tweaks: model ("", "tiny.en", "tiny", "base", …) and language hint. */
+  local?: {
+    model?: string
+    language?: string
+  }
 }
 
 export type SpeechStatus = {
