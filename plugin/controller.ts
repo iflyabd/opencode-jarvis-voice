@@ -57,6 +57,12 @@ type FishVoice = { id: string; title: string; description?: string }
 const FISH_MODEL = "s2.1-pro-free"
 const FISH_STT_MODEL = "transcribe-1-pro"
 
+/**
+ * The plugin build that is running in this TUI. It is shown in the status
+ * line so a stale TUI (started before an update) is obvious at a glance.
+ */
+export const PLUGIN_VERSION = "1.2.1"
+
 /** Local Whisper models the settings can pick. "" means automatic. */
 const LOCAL_MODELS: Array<{ id: string; title: string; description: string }> = [
   {
@@ -1576,7 +1582,14 @@ export function createVoiceController(context: any) {
       const info = await daemonOrToast()
       if (!info) return
       const h: Health = await api.health(info, true)
-      toast(`${healthSummary(h)}${h.audio?.capture?.backend ? "" : " (no mic)"}`, "info")
+      const daemonVersion = String((h.daemon as any)?.version ?? info.version ?? "?")
+      const stale = daemonVersion !== PLUGIN_VERSION
+      toast(
+        `${healthSummary(h)}${h.audio?.capture?.backend ? "" : " (no mic)"} · ` +
+          `plugin ${PLUGIN_VERSION} · daemon ${daemonVersion}` +
+          (stale ? " — restart OpenCode to load the new plugin" : ""),
+        stale ? "warning" : "info",
+      )
       if (!h.audio?.capture?.backend) {
         const hint = h.audio?.capture?.hints?.[0]
         if (hint) toast(hint, "warning")

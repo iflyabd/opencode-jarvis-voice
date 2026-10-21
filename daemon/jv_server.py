@@ -497,6 +497,16 @@ class Handler(BaseHTTPRequestHandler):
                 result = out.get("result") or {}
                 if result.get("text"):
                     _state["last_text"] = result["text"]
+                # One line per turn: what the daemon heard, without the text.
+                st = result.get("stats") or {}
+                print(
+                    f"[jarvis-voice] ptt turn: {len(result.get('text') or '')} chars, "
+                    f"backend={result.get('backend')} model={result.get('model_name')} "
+                    f"fallback={result.get('fallback')} rms={st.get('rms')} "
+                    f"audio_ms={st.get('audio_ms')} reason={st.get('reason')} "
+                    f"stt_ms={result.get('ms')}",
+                    flush=True,
+                )
                 # The transcript also goes to the top level: the plugin reads
                 # `text` directly, and older clients keep using `result`.
                 payload = {"ok": True, **out}

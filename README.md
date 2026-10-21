@@ -263,7 +263,7 @@ shown in a toast so it can be copied by hand.
 | `Voice: read / pause / resume the reply` | one button for read, pause, resume (`ctrl+alt+p`) |
 | `Voice: settings (Fish Audio / transcription / microphone)` | choose the voice and speech-to-text providers, API key, voice, language; inspect mic/STT |
 | `Voice: preload the speech model` | load Whisper now so the next transcript is fast |
-| `Voice: status` | what mic, STT model, TTS voice are in use |
+| `Voice: status` | what mic, STT model, TTS voice are in use, plus the plugin and daemon versions |
 | `Voice: cancel listening / stop speaking` | shut it up immediately |
 | `Voice: speak the last reply` | read the current answer out loud |
 | `Voice: toggle speaking replies` | auto-speak the assistant on/off |
@@ -653,6 +653,7 @@ optional accelerants that the daemon reports on and degrades without.
 | It hears you but the transcript is wrong | bigger model: `JARVIS_VOICE_WHISPER_MODEL=base`; `tiny.en` is English-only |
 | `Heard nothing` | the toast now shows what the daemon heard (reason and level). Check the mic with `voice doctor`; if you speak another language, pick a multilingual model in **Voice: settings → Transcription → Local Whisper model** — the automatic mode already retries with `tiny` when the English model comes back empty |
 | The transcript is not sent | that is the default: it lands in the prompt box so you can correct it. Press send, or turn on **Voice: toggle auto-send** for hands-free mode |
+| The status line says "restart OpenCode" | the TUI is still running an older plugin build. Restart OpenCode so the new plugin is loaded |
 | Fish Audio says key/voice not set | `ctrl+p` → **Voice: settings**, add the API key, then choose a voice |
 | Fish Audio HTTP 401/402 | check the key on fish.audio; the free TTS model may need credit for some voices. Fish **ASR** uses separate API credit — add it at `fish.audio/app/developers` |
 | Fish ASR reports the wrong language | leave the language on **Auto-detect**. A hint only sets the reported language when a very short clip cannot be detected; it does not force the transcript |

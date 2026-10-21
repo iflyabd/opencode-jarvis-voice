@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-DAEMON_VERSION = "1.2.0"
+DAEMON_VERSION = "1.2.1"
 
 # ----------------------------------------------------------------------------
 # Paths
