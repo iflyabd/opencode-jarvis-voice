@@ -17,6 +17,7 @@ const cache = "/tmp/opencode/jarvis-voice-flow-cache"
 // A mock daemon that behaves like the real one.
 let polls = 0
 let startBody: any = null
+const spokenByDaemon: string[] = []
 const server = Bun.serve({
   port: 0,
   async fetch(req) {
@@ -44,7 +45,12 @@ const server = Bun.serve({
       })
     }
     if (url.pathname === "/ptt/cancel") return json({ ok: true, cancelled: true })
-    if (url.pathname === "/speak") return json({ ok: true, backend: "fake", spoken: true })
+    if (url.pathname === "/speak") {
+      const body = await req.json().catch(() => ({}))
+      spokenByDaemon.push(String((body as any)?.text ?? ""))
+      return json({ ok: true, backend: "fake", spoken: true })
+    }
+    if (url.pathname === "/speech") return json({ ok: true, active: false, paused: false })
     if (url.pathname === "/health") {
       return json({
         ok: true,
@@ -91,6 +97,8 @@ const sentRaw: any[] = []
 const dispatched: string[] = []
 let hostCommands: any[] = []
 let agentBusy = false
+let answerReady = false
+let eventHandler: any = undefined
 const context: any = {
   options: {},
   storage: { store: () => [store, setStore] },
@@ -117,7 +125,26 @@ const context: any = {
       list: () => [{ id: "ses_test" }],
       // The agent picks the message up right after it is sent.
       status: () => (agentBusy ? "busy" : "idle"),
-      message: { list: () => [], sync: async () => {} },
+      get: (id: string) => ({ id, title: "Weather in Berlin" }),
+      message: {
+        list: () => (answerReady
+          ? [
+              {
+                id: "msg_answer",
+                type: "assistant",
+                time: { created: Date.now() + 1000 },
+                content: [{ type: "text", text: "It is sunny in Berlin today" }],
+              },
+            ]
+          : []),
+        sync: async () => {},
+      },
+    },
+    listen: (handler: any) => {
+      eventHandler = handler
+      return () => {
+        eventHandler = undefined
+      }
     },
   },
   client: {
@@ -197,6 +224,37 @@ check("live mode sent the transcript", sent.length > sentBeforeLive, `${sentBefo
 await voice.toggleLive("ses_test")
 await liveRun
 check("live mode is off again", voice.live() === false)
+
+// 6. Auto-speak: a new answer is read out loud, with the session name first.
+answerReady = true
+spokenByDaemon.length = 0
+eventHandler?.({ details: { type: "message.updated" } })
+await new Promise((r) => setTimeout(r, 1200))
+check(
+  "the new answer is read out loud",
+  spokenByDaemon.length === 1,
+  `spoken=${JSON.stringify(spokenByDaemon)}`,
+)
+check(
+  "the session name comes before the answer",
+  (spokenByDaemon[0] ?? "").startsWith("Weather in Berlin.") &&
+    (spokenByDaemon[0] ?? "").includes("It is sunny in Berlin today"),
+  JSON.stringify(spokenByDaemon[0]),
+)
+
+// 7. The same answer is never read twice.
+eventHandler?.({ details: { type: "message.updated" } })
+await new Promise((r) => setTimeout(r, 1200))
+check("an answer is not read twice", spokenByDaemon.length === 1, `spoken=${JSON.stringify(spokenByDaemon)}`)
+
+// 8. With auto-speak off, nothing is read.
+setStore("autoSpeak", false)
+answerReady = false
+spokenByDaemon.length = 0
+answerReady = true
+eventHandler?.({ details: { type: "message.updated" } })
+await new Promise((r) => setTimeout(r, 1200))
+check("nothing is read with auto-speak off", spokenByDaemon.length === 0, `spoken=${JSON.stringify(spokenByDaemon)}`)
 
 server.stop(true)
 if (failures > 0) {

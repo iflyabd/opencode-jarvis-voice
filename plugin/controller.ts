@@ -52,6 +52,8 @@ type VoiceSettings = {
   localLanguage: string
   /** Send the transcript to the agent straight away instead of the prompt box. */
   autoSend: boolean
+  /** Read every new answer out loud. */
+  autoSpeak: boolean
   /** The microphone to record from; "" = let the daemon pick. */
   micSource: string
 }
@@ -65,7 +67,7 @@ const FISH_STT_MODEL = "transcribe-1-pro"
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.5.8"
+export const PLUGIN_VERSION = "1.6.0"
 
 /** Local Whisper models the settings can pick. "" means automatic. */
 const LOCAL_MODELS: Array<{ id: string; title: string; description: string }> = [
@@ -258,13 +260,15 @@ export function isReadableAnswer(message: any): boolean {
 }
 
 /** Newest assistant answer and its id, skipping in-flight ones with nothing yet. */
-export function latestAnswer(messages: any[]): { id?: string; text: string } {
+export function latestAnswer(messages: any[]): { id?: string; text: string; created?: number } {
   if (!Array.isArray(messages)) return { text: "" }
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
     if (roleOf(m) !== "assistant") continue
     const text = assistantAnswerText(m)
-    if (text) return { id: typeof m?.id === "string" ? m.id : undefined, text }
+    if (!text) continue
+    const created = Number(m?.time?.created ?? m?.timeCreated ?? 0) || undefined
+    return { id: typeof m?.id === "string" ? m.id : undefined, text, created }
   }
   return { text: "" }
 }
@@ -416,6 +420,13 @@ export function createVoiceController(context: any) {
   }
 
   let autoSpeak = context.options?.autoSpeak !== false
+  // The moment the plugin started: answers from before that were already
+  // seen (or already read) and must not be spoken again.
+  const startedAt = Date.now()
+  // Answers that were read out loud, so the watcher never repeats one.
+  const spokenAnswers = new Set<string>()
+  // The newest answer seen per session.
+  const seenAnswers = new Map<string, string>()
   let micBusy = false // guards double-starts while the first start is in flight
   let micCancelled = false // set by cancel() so the listen loop stays quiet
   let speechTimer: ReturnType<typeof setTimeout> | null = null
@@ -445,6 +456,7 @@ export function createVoiceController(context: any) {
     localModel: normalizeLocalModel(optionStt.localModel ?? context.options?.localModel ?? optionFish.localModel),
     localLanguage: normalizeSttLanguage(optionStt.localLanguage ?? context.options?.localLanguage ?? optionFish.localLanguage),
     autoSend: context.options?.autoSend === true,
+    autoSpeak: context.options?.autoSpeak !== false,
     micSource: String(context.options?.micSource ?? context.options?.mic ?? "").trim(),
   }
 
@@ -474,6 +486,7 @@ export function createVoiceController(context: any) {
         typeof stored.localModel !== "string" ||
         typeof stored.localLanguage !== "string" ||
         typeof stored.autoSend !== "boolean" ||
+        typeof stored.autoSpeak !== "boolean" ||
         typeof stored.micSource !== "string"
       if (needsMigration) {
         void setStored((draft) => {
@@ -486,6 +499,7 @@ export function createVoiceController(context: any) {
           draft.localLanguage = normalizeSttLanguage(draft.localLanguage ?? seedSettings.localLanguage)
           // Review first: the transcript lands in the prompt box.
           if (typeof draft.autoSend !== "boolean") draft.autoSend = seedSettings.autoSend
+          if (typeof draft.autoSpeak !== "boolean") draft.autoSpeak = seedSettings.autoSpeak
           if (typeof draft.micSource !== "string") draft.micSource = seedSettings.micSource
         }).catch(() => {
           /* defaults still apply in memory */
@@ -1210,6 +1224,13 @@ export function createVoiceController(context: any) {
               ? "Transcripts are sent to the agent as soon as they are transcribed"
               : "Transcripts land in the prompt box so you can correct them before sending",
           },
+          {
+            title: autoSpeak ? "Speaking replies (on)" : "Speaking replies (off)",
+            value: "autospeak",
+            description: autoSpeak
+              ? "Every new answer is read out loud, starting with the session name"
+              : "Answers stay silent",
+          },
           { title: "Show voice status", value: "status" },
         ],
       })
@@ -1269,6 +1290,8 @@ export function createVoiceController(context: any) {
         await openSttSettings()
       } else if (choice === "autosend") {
         await toggleAutoSend()
+      } else if (choice === "autospeak") {
+        toggleAutoSpeak()
       } else if (choice === "mic") {
         await openMicSettings()
       } else if (choice === "status") {
@@ -1648,10 +1671,198 @@ export function createVoiceController(context: any) {
     }
   }
 
-  async function speakReply(sessionID: string | undefined): Promise<void> {
+  /**
+   * Wait until the watcher has read the answer out loud.
+   *
+   * The live conversation must not open the microphone again while the
+   * speaker is still talking, or the voice hears itself.
+   */
+  async function awaitSpokenAnswer(sessionID: string | undefined): Promise<void> {
     if (!sessionID) return
+    // Wait for the turn to start and finish.
+    let started = false
+    for (let i = 0; i < 400; i++) {
+      let status: string | undefined
+      try {
+        status = context.data.session.status(sessionID)
+      } catch {
+        status = undefined
+      }
+      if (status === undefined) return
+      if (status === "busy") started = true
+      else if (started && status === "idle") break
+      await sleep(400)
+    }
+    if (!started) return
+    // The watcher reads the answer now; wait for the playback to finish.
+    await sleep(1200)
     const info = await daemon(false)
     if (!info) return
+    for (let i = 0; i < 750; i++) {
+      const state = await api.speech(info).catch(() => null)
+      if (state && !state.active) return
+      await sleep(400)
+    }
+  }
+
+  /* ------------------------------------------------- reading the answers */
+
+  /**
+   * One voice at a time.
+   *
+   * A new answer waits for the current reading instead of cutting it off, so
+   * two answers never talk over each other and the order is kept.
+   */
+  const readQueue: Array<() => Promise<void>> = []
+  let reading = false
+
+  async function runReadQueue(): Promise<void> {
+    if (reading) return
+    reading = true
+    try {
+      while (readQueue.length) {
+        const job = readQueue.shift()
+        if (!job) break
+        try {
+          await job()
+        } catch (e) {
+          toast(errorText(e), "error")
+        }
+      }
+    } finally {
+      reading = false
+    }
+  }
+
+  function enqueueRead(job: () => Promise<void>): void {
+    readQueue.push(job)
+    void runReadQueue()
+  }
+
+  /** Wait until the speaker is free, so nothing is read on top of anything. */
+  async function waitForSpeaker(timeoutMs = 300000): Promise<void> {
+    const info = await daemon(false)
+    if (!info) return
+    const steps = Math.max(1, Math.round(timeoutMs / 400))
+    for (let i = 0; i < steps; i++) {
+      const state = await api.speech(info).catch(() => null)
+      if (!state) return
+      if (!state.active) return
+      await sleep(400)
+    }
+  }
+
+  /** The name of the session, read out before its answer. */
+  function sessionLabel(sessionID: string): string {
+    try {
+      const info: any = context.data.session.get?.(sessionID)
+      const title = String(info?.title ?? "").trim()
+      if (!title) return ""
+      return title.length > 80 ? `${title.slice(0, 79)}…` : title
+    } catch {
+      return ""
+    }
+  }
+
+  /** Read an answer out loud, with the session name in front of it. */
+  async function readAnswer(sessionID: string, answer: { id?: string; text: string }): Promise<void> {
+    await waitForSpeaker()
+    const body = speakable(answer.text)
+    if (!body) return
+    const label = sessionLabel(sessionID)
+    const toSay = label ? `${label}. ${body}` : body
+    const info = await daemon(false)
+    if (!info) return
+    await api.speak(info, toSay, { async: true, ...ttsRequest() })
+    setSpeakingMessage(answer.id ?? null)
+    setSpeechState("playing")
+    watchSpeech()
+  }
+
+  /* ------------------------------------------------------ auto speak watcher */
+
+  let answerTimer: ReturnType<typeof setTimeout> | undefined
+  let answerCheck: Promise<void> | undefined
+
+  /** Look for a new answer in the session that is on screen and read it. */
+  async function checkForNewAnswer(): Promise<void> {
+    const sessionID = currentSessionID(context)
+    if (!sessionID) return
+    let answer: { id?: string; text: string; created?: number }
+    try {
+      await context.data.session.message.sync(sessionID)
+      answer = latestAnswer(context.data.session.message.list(sessionID) ?? [])
+    } catch {
+      return
+    }
+    const id = answer.id
+    if (!id || !answer.text) return
+    if (seenAnswers.get(sessionID) === id) return
+    if (spokenAnswers.has(id)) {
+      seenAnswers.set(sessionID, id)
+      return
+    }
+    if (answer.created && answer.created < startedAt) {
+      // An answer that was already there when the plugin started: it was
+      // seen, and probably read, before.
+      seenAnswers.set(sessionID, id)
+      return
+    }
+    let status: string | undefined
+    try {
+      status = context.data.session.status(sessionID)
+    } catch {
+      status = undefined
+    }
+    if (status === "busy") return // the answer is still being written
+    seenAnswers.set(sessionID, id)
+    if (!autoSpeak) return
+    spokenAnswers.add(id)
+    // The session name is read first, then the answer. The read waits for
+    // the speaker, so a new answer never interrupts the one being read.
+    enqueueRead(() => readAnswer(sessionID, answer))
+  }
+
+  function scheduleAnswerCheck(delay = 400): void {
+    if (answerTimer) clearTimeout(answerTimer)
+    answerTimer = setTimeout(() => {
+      answerTimer = undefined
+      if (answerCheck) return
+      answerCheck = checkForNewAnswer().finally(() => {
+        answerCheck = undefined
+      })
+    }, delay)
+  }
+
+  /**
+   * Watch the session for new answers and read them out loud.
+   *
+   * The TUI plugin lives in the session view, so this follows the session the
+   * user is working in - including after switching to another one.
+   */
+  let stopAnswers: (() => void) | undefined
+  function watchAnswers(): () => void {
+    let off: (() => void) | undefined
+    try {
+      off = context.data?.listen?.((event: any) => {
+        const type = String(event?.details?.type ?? "")
+        if (!type) return
+        if (type.startsWith("message.") || type.startsWith("session.")) scheduleAnswerCheck()
+      })
+    } catch {
+      off = undefined
+    }
+    // Catch answers that arrive without an event we listen to.
+    const poll = setInterval(() => scheduleAnswerCheck(200), 2000)
+    return () => {
+      if (answerTimer) clearTimeout(answerTimer)
+      clearInterval(poll)
+      off?.()
+    }
+  }
+
+  async function speakReply(sessionID: string | undefined): Promise<void> {
+    if (!sessionID) return
 
     // Wait for the turn to finish, using the session status the TUI already tracks.
     for (let i = 0; i < 900; i++) {
@@ -1673,7 +1884,7 @@ export function createVoiceController(context: any) {
       await sleep(300)
     }
 
-    let answer: { id?: string; text: string } = { text: "" }
+    let answer: { id?: string; text: string; created?: number } = { text: "" }
     try {
       await context.data.session.message.sync(sessionID)
       answer = latestAnswer(context.data.session.message.list(sessionID) ?? [])
@@ -1683,14 +1894,15 @@ export function createVoiceController(context: any) {
     if (!answer.text) return
     const toSay = speakable(answer.text)
     if (!toSay) return
-    try {
+    // Queue it, so it waits for the speaker instead of talking over it.
+    await enqueueRead(async () => {
+      const info = await daemon(false)
+      if (!info) return
       await api.speak(info, toSay, { async: true, ...ttsRequest() })
       setSpeakingMessage(answer.id ?? null)
       setSpeechState("playing")
       watchSpeech()
-    } catch (e) {
-      toast(`Could not speak the reply: ${errorText(e)}`, "error")
-    }
+    })
   }
 
   /** The current session, waiting for one to show up (a new chat has none). */
@@ -1702,31 +1914,6 @@ export function createVoiceController(context: any) {
       await sleep(200)
     }
     return undefined
-  }
-
-  /**
-   * Wait for the user to send the transcript we put in the prompt box, then
-   * read the answer back. Used when auto-send is off but replies are spoken.
-   */
-  async function speakWhenAnswered(sessionID: string | undefined): Promise<void> {
-    let sid = sessionID
-    for (let i = 0; i < 300; i++) {
-      if (!sid) sid = currentSessionID(context)
-      if (sid) {
-        let status: string | undefined
-        try {
-          status = context.data.session.status(sid)
-        } catch {
-          status = undefined
-        }
-        if (status === undefined) return // no session data: nothing to wait for
-        if (status === "busy") {
-          await speakReply(sid)
-          return
-        }
-      }
-      await sleep(400)
-    }
   }
 
   /* ------------------------------------------------------- live voice mode */
@@ -1793,7 +1980,7 @@ export function createVoiceController(context: any) {
       if (!sid) sid = await resolveSessionID()
       // Read the answer back, then listen again. The small pause keeps the
       // tail of the playback out of the next recording.
-      if (autoSpeak && sid) await speakAnswerAfterSend(sid)
+      if (autoSpeak && sid) await awaitSpokenAnswer(sid)
       await sleep(600)
     }
   }
@@ -1895,14 +2082,15 @@ export function createVoiceController(context: any) {
       }
 
       if (autoSendEnabled()) {
-        // Hands-free mode: the transcript goes straight to the agent.
+        // Hands-free mode: the transcript goes straight to the agent. The
+        // watcher reads the answer when it arrives.
         const sent = await submit(sessionID, text)
         if (sent) {
           toast("📤 Sent", "success")
           // A brand new chat only gets a session id when the first message
           // is sent, so look it up again before waiting for the reply.
           const sid = sessionID ?? (await resolveSessionID())
-          if (sid && autoSpeak) void speakReply(sid)
+          if (sid) scheduleAnswerCheck(300)
         }
         return
       }
@@ -1911,7 +2099,6 @@ export function createVoiceController(context: any) {
       // corrected before it is sent.
       if (insertIntoPrompt(text)) {
         toast("📝 Added to the prompt — review it and press send", "success")
-        if (autoSpeak) void speakWhenAnswered(sessionID)
       } else {
         toast(`📝 ${text}`, "success")
         toast("Could not open the prompt box — copy the transcript above", "warning")
@@ -1963,12 +2150,19 @@ export function createVoiceController(context: any) {
 
   function toggleAutoSpeak(): void {
     autoSpeak = !autoSpeak
+    void persist((draft) => {
+      draft.autoSpeak = autoSpeak
+    })
     toast(autoSpeak ? "Replies will be spoken" : "Replies will stay silent", autoSpeak ? "success" : "info")
   }
 
   function dispose(): void {
     stopSpeechWatch()
+    stopAnswers?.()
   }
+
+  // Read every new answer of the session that is on screen.
+  stopAnswers = watchAnswers()
 
   return {
     mic: mic as Accessor<MicState>,

@@ -183,9 +183,27 @@ needed. Watch for:
 ```
 
 The transcript lands in the prompt box so you can correct it before it is
-sent; the answer is spoken back while it appears on screen. Turn the spoken
-reply off with **Voice: toggle speaking replies** in the command palette
-(`ctrl+p`), and the review step off with **Voice: toggle auto-send**.
+sent. Turn the spoken reply off with **Voice: toggle speaking replies** in the
+command palette (`ctrl+p`) or in **Voice: settings → Speaking replies**, and
+the review step off with **Voice: toggle auto-send**.
+
+### Reading the answers
+
+With **speaking replies** on (the default), every new answer of the session
+you are working in is read out loud:
+
+- the **session name comes first**, so you know which conversation the answer
+  belongs to: *"Weather in Berlin. It is sunny in Berlin today."*
+- answers are read **one at a time**. A new answer waits for the one being
+  read instead of cutting it off, so two voices never talk over each other and
+  the order is kept.
+- an answer is never read twice, and an answer that was already on screen
+  when the plugin started is not read out of the blue.
+- the setting is **remembered** (it survives a restart and is shared between
+  TUI windows) and follows the session you switch to.
+
+Clicking *read* on an answer still reads that answer right away - that is an
+explicit request, so it replaces whatever was being read.
 
 Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 
@@ -302,7 +320,7 @@ shown in a toast so it can be copied by hand.
 | `Voice: cancel listening / stop speaking` | shut it up immediately |
 | `Voice: speak the last reply` | read the current answer out loud |
 | `Voice: live voice conversation (listen, send, read back)` | switch the live conversation on or off |
-| `Voice: toggle speaking replies` | auto-speak the assistant on/off |
+| `Voice: toggle speaking replies` | read every new answer out loud, session name first (on/off, remembered) |
 | `Voice: toggle auto-send (transcript goes to the prompt box)` | hands-free mode on/off: send the transcript straight away, or drop it in the prompt box for review |
 
 ### Optional Fish Audio voices
@@ -613,7 +631,7 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
 |---|---|---|
 | `mic` | `true` | show the 🎙 mic button in the prompt footer |
 | `speak` | `true` | show the ◉ live button above the text box |
-| `autoSpeak` | `true` | speak replies automatically after push-to-talk starts the turn |
+| `autoSpeak` | `true` | read every new answer out loud, starting with the session name |
 | `autoSend` | `false` | send the transcript to the agent as soon as it is transcribed; off means it lands in the prompt box for review |
 | `fishAudio` | — | optional `{ provider, apiKey, voiceId, voiceName, model, sttProvider, sttModel, sttLanguage }`; the settings dialog is safer for keys |
 | `micSource` | — | the microphone to record from, e.g. `pulse:jarvis_mic`; the settings dialog is easier |
