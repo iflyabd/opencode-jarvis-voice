@@ -321,9 +321,9 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     slots.map((s) => s.append).join(","),
   )
   check(
-    "live button appends to home.footer for a new chat",
-    slots.some((s) => s.append === "home.footer" && typeof s.render === "function"),
-    slots.map((s) => s.append).join(","),
+    "live button joins the prompt box on the home screen",
+    slots.some((s) => s.prepend === "prompt.footer" && typeof s.render === "function"),
+    slots.map((s) => s.append ?? s.prepend).join(","),
   )
   const layer = layers[0]
   const ids = (layer?.commands ?? []).map((c: any) => c.id)

@@ -60,11 +60,16 @@ export default Plugin.define({
         },
       })
       // A brand new chat is the home screen, which has no session composer
-      // slot: the toggle is mounted in the home footer as well, so the live
-      // button is there in both places.
+      // slot: the top of the text box is not a slot there. The toggle is
+      // mounted in the prompt box instead, so it sits with the text box and
+      // not in the page's status bar.
       context.ui.slot({
-        append: "home.footer",
-        render: () => <LiveButton context={context} voice={voice} />,
+        prepend: "prompt.footer",
+        render: () => {
+          const route = context.ui?.router?.current?.()
+          if (route?.type !== "home") return null
+          return <LiveButton context={context} voice={voice} />
+        },
       })
     }
 
