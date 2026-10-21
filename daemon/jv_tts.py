@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import threading
 import time
@@ -217,6 +218,49 @@ def _fish_request(text: str, api_key: str, voice_id: str, model: str,
     return data
 
 
+def _fix_wav_sizes(path: Path) -> None:
+    """Repair streaming WAV headers that advertise a size beyond EOF.
+
+    Fish Audio returns a WAV whose RIFF/data sizes are placeholders
+    (0xFFFFFF00-ish) while the payload simply ends at EOF. libsndfile, sox,
+    aplay and Python's wave module then believe the clip lasts hours. Rewrite
+    the two size fields from the real file length; leave normal WAVs alone.
+    """
+    try:
+        total = path.stat().st_size
+        with path.open("rb+") as f:
+            head = f.read(12)
+            if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+                return
+            off = 12
+            data_at = data_size = None
+            while off + 8 <= total:
+                f.seek(off)
+                chunk = f.read(8)
+                if len(chunk) < 8:
+                    break
+                cid, size = struct.unpack("<4sI", chunk)
+                if cid == b"data":
+                    data_at, data_size = off + 8, size
+                    break
+                off += 8 + size + (size & 1)
+            if data_at is None:
+                return
+            actual = total - data_at
+            if actual <= 0:
+                return
+            if data_size is None or data_size > actual:
+                f.seek(data_at - 4)
+                f.write(struct.pack("<I", actual))
+            riff_size = struct.unpack("<I", head[4:8])[0]
+            if riff_size != total - 8:
+                f.seek(4)
+                f.write(struct.pack("<I", total - 8))
+    except Exception:
+        # A broken header is less bad than failing a clip that may still play.
+        return
+
+
 def synth_fish(text: str, out: Path, fish: dict | None = None) -> dict:
     """Cloud voice via Fish Audio. Requires an API key and a voice model id."""
     fish = fish or {}
@@ -234,6 +278,7 @@ def synth_fish(text: str, out: Path, fish: dict | None = None) -> dict:
     try:
         data = _fish_request(text, api_key, voice_id, model, "wav", latency)
         out.write_bytes(data)
+        _fix_wav_sizes(out)
         return {"backend": "fish", "voice": voice_id, "model": model,
                 "format": "wav", "path": str(out)}
     except TtsError as e:
