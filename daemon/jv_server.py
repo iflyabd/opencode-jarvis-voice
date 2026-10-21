@@ -8,13 +8,13 @@ talks to it on 127.0.0.1, so the plugin never needs a native audio stack.
 Endpoints (JSON unless noted):
   GET  /health            capability report: audio, stt, tts, voice, pulse
   GET  /devices           input devices / pulse sources
-  POST /ptt/start         begin push-to-talk capture        {max_ms?, stt?}
+  POST /ptt/start         begin capture                     {max_ms?, silence_ms?, partial?, keep_warm?, stt?, mic?}
   POST /ptt/stop          end capture, transcribe, return   {}   -> {text,...}
   POST /ptt/cancel        discard the current capture
-  GET  /ptt/state         current push-to-talk state
+  GET  /ptt/state         current capture state (partial caption, level)
   POST /listen            blocking capture + transcribe     {max_ms?, silence_ms?, stt?, ...}
   POST /transcribe        raw 16-bit mono PCM or WAV body   -> {text}
-  POST /speak             synthesize + play locally         {text, async?, backend?, fish?}
+  POST /speak             synthesize + play locally         {text, async?, backend?, fish?, append?}
   POST /synth             synthesize only, returns audio/wav or audio/mpeg
   POST /warmup            load the local STT model now      {stt?}
   GET  /speech            what the speakers are doing now (playing/paused)
@@ -36,6 +36,7 @@ UI do not count, playing speech does. The plugin starts it again on demand.
 from __future__ import annotations
 
 import argparse
+import collections
 import io
 import json
 import os
@@ -47,6 +48,7 @@ import time
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -79,11 +81,20 @@ def record_utterance(
     min_speech_ms: int | None = None,
     stop_event: threading.Event | None = None,
     device: str | None = None,
+    preroll_ms: int | None = None,
+    on_level: "Callable[[float, bool], None] | None" = None,
+    on_audio: "Callable[[bytes], None] | None" = None,
+    gate: "audio.VoiceGate | None" = None,
 ) -> Utterance:
     """
     Record until the speaker stops, a hard limit is hit, or stop_event is set.
 
     Never hangs: every read has a timeout and the loop has an absolute deadline.
+
+    `on_level(level, speech)` is called for every block (the live meter) and
+    `on_audio(block)` for every block that belongs to the utterance, including
+    the pre-roll, so a caller can transcribe the turn while it is still being
+    spoken. Both are optional and must return quickly.
     """
     max_ms = int(max_ms or cfg.VAD_MAX_MS)
     silence_ms = int(silence_ms if silence_ms is not None else cfg.VAD_SILENCE_MS)
@@ -95,17 +106,29 @@ def record_utterance(
     block_samples = max(1, int(sr * cfg.BLOCK_MS / 1000))
     block_bytes = block_samples * 2
 
-    silence_blocks_needed = max(1, int(silence_ms / cfg.BLOCK_MS))
-    min_speech_blocks = max(1, int(min_speech_ms / cfg.BLOCK_MS))
+    gate = gate or audio.VoiceGate(
+        threshold=threshold,
+        block_ms=cfg.BLOCK_MS,
+        silence_ms=silence_ms,
+        min_speech_ms=min_speech_ms,
+        noise_mult=cfg.VAD_NOISE_MULT,
+        preroll_ms=(cfg.VAD_PREROLL_MS if preroll_ms is None else preroll_ms),
+    )
 
     t_start = time.time()
     frames: list[bytes] = []
-    speech_blocks = 0
-    silent_run = 0
+    preroll: "collections.deque[bytes]" = collections.deque(maxlen=max(0, gate.preroll_blocks))
     peak = 0.0
     started = False
-    peak_floor = 0.0
+    speech_at = 0.0
     reason = "max"
+
+    def emit(block: bytes) -> None:
+        if on_audio is not None:
+            try:
+                on_audio(block)
+            except Exception:
+                pass
 
     with _rec_lock:
         # Load the phone mic before starting the recording clock. Otherwise the
@@ -125,12 +148,25 @@ def record_utterance(
                 block = cap.read(block_bytes, timeout=cfg.PROBE_TIMEOUT)
                 lvl = audio.rms(block)
                 peak = max(peak, lvl)
-                peak_floor = max(peak_floor, lvl)
-                if lvl >= threshold:
+                state = gate.push(lvl)
+                if on_level is not None:
+                    try:
+                        on_level(lvl, state in ("start", "speech"))
+                    except Exception:
+                        pass
+                if state == "start":
                     started = True
+                    speech_at = time.time()
+                    # Keep the blocks from just before the onset: the first
+                    # phoneme of a word is usually the quietest part of it.
+                    for held in preroll:
+                        frames.append(held)
+                        emit(held)
+                    preroll.clear()
                     frames.append(block)
-                    speech_blocks += 1
+                    emit(block)
                     break
+                preroll.append(block)
             if not started and reason == "max":
                 reason = "silence"
             # -- capture the utterance ---------------------------------------
@@ -145,32 +181,45 @@ def record_utterance(
                 block = cap.read(block_bytes, timeout=cfg.PROBE_TIMEOUT)
                 lvl = audio.rms(block)
                 peak = max(peak, lvl)
+                state = gate.push(lvl)
+                if on_level is not None:
+                    try:
+                        on_level(lvl, state != "end")
+                    except Exception:
+                        pass
                 frames.append(block)
-                if lvl >= threshold:
-                    speech_blocks += 1
-                    silent_run = 0
-                else:
-                    silent_run += 1
-                    if silent_run >= silence_blocks_needed and speech_blocks >= min_speech_blocks:
-                        reason = "silence_end"
-                        break
+                emit(block)
+                if state == "end":
+                    reason = "silence_end"
+                    break
         finally:
             try:
                 cap.close()
             except Exception:
                 pass
 
-    pcm = b"".join(frames)
+    raw = b"".join(frames)
+    pcm = raw
+    if raw:
+        # The hangover and the room noise are not speech: trimming them makes
+        # the final transcription faster without touching the words.
+        pcm = audio.trim_silence(raw, threshold=max(0.003, gate.base * 0.5), sr=sr)
+        if len(pcm) < 320:
+            pcm = raw
     stats = {
         "reason": reason,
         "ms": int((time.time() - t_start) * 1000),
         "open_ms": int((t0 - t_start) * 1000),
         "record_ms": int((time.time() - t0) * 1000),
+        "speech_at_ms": int((speech_at - t0) * 1000) if speech_at else None,
         "audio_ms": int(len(pcm) / 2 / sr * 1000),
+        "raw_ms": int(len(raw) / 2 / sr * 1000),
         "rms": round(audio.rms(pcm), 5),
         "peak": round(peak, 5),
-        "noise_floor": round(peak_floor, 5),
-        "threshold": threshold,
+        "noise_floor": round(gate.noise_floor, 5),
+        "threshold": round(gate.threshold, 5),
+        "gate_threshold": round(gate.base, 5),
+        "speech_ms": gate.speech_ms,
         "sr": sr,
         "bytes": len(pcm),
     }
@@ -194,35 +243,105 @@ def _mic_device(body: dict) -> str:
 
 
 class PttSession:
-    """One push-to-talk recording, owned by a background thread."""
+    """One push-to-talk recording, owned by a background thread.
+
+    In live mode the session also transcribes the words *while* they are
+    being spoken (`partial`) and exposes the input level, so the caller can
+    show a caption as it grows instead of waiting for the whole utterance.
+    """
 
     def __init__(self, max_ms: int | None = None, stt_options: dict | None = None,
-                 device: str | None = None):
+                 device: str | None = None, silence_ms: int | None = None,
+                 start_timeout_ms: int | None = None, preroll_ms: int | None = None,
+                 partial: bool = False, keep_warm: bool = False):
         self.id = f"ptt-{int(time.time() * 1000)}"
         self.started_at = time.time()
         self.stt_options = stt_options if isinstance(stt_options, dict) else None
         self.device = (device or "").strip()
+        self.silence_ms = int(silence_ms) if silence_ms is not None else None
+        self.start_timeout_ms = int(start_timeout_ms) if start_timeout_ms is not None else None
+        self.preroll_ms = int(preroll_ms) if preroll_ms is not None else None
+        self.partial_enabled = bool(partial)
+        self.keep_warm = bool(keep_warm)
         self.stop_event = threading.Event()
         self.state = "listening"      # listening -> transcribing -> done | error | cancelled
         self.result: dict | None = None
         self.error: str | None = None
+        # Live caption + meter, read by /ptt/state while the user speaks.
+        self.partial = ""
+        self.level = 0.0
+        self.speaking = False
         self._cancelled = False
         self._done = threading.Event()
+        self._pcm = bytearray()
+        self._pcm_lock = threading.Lock()
+        self._partial_stop = threading.Event()
+        self._partial_thread: threading.Thread | None = None
+        if self.partial_enabled:
+            self._partial_thread = threading.Thread(target=self._partial_loop, daemon=True,
+                                                   name=f"{self.id}-partial")
+            self._partial_thread.start()
         self._thread = threading.Thread(target=self._run, args=(max_ms,), daemon=True)
         self._thread.start()
 
+    # -- live caption ------------------------------------------------------
+    def _on_level(self, level: float, speech: bool) -> None:
+        self.level = round(float(level), 5)
+        self.speaking = bool(speech)
+
+    def _on_audio(self, block: bytes) -> None:
+        with self._pcm_lock:
+            self._pcm.extend(block)
+
+    def _partial_loop(self) -> None:
+        """Transcribe the utterance so far, over and over, while it grows.
+
+        The caption is a preview: it is replaced by the final transcript the
+        moment the turn ends, so a small model on a phone never has to be
+        perfect twice.
+        """
+        interval = max(0.35, float(cfg.LIVE_PARTIAL_S))
+        while not self._partial_stop.wait(interval):
+            if self.state != "listening":
+                return
+            with self._pcm_lock:
+                pcm = bytes(self._pcm)
+            # Do not pay for a caption on a cough.
+            if len(pcm) < int(cfg.SAMPLE_RATE * 2 * 0.45):
+                continue
+            # Only the recent words matter for a caption, and Whisper has a
+            # 30 s window: a long monologue keeps its last seconds on screen.
+            limit = int(cfg.SAMPLE_RATE * 2 * cfg.LIVE_PARTIAL_WINDOW_S)
+            if len(pcm) > limit:
+                pcm = pcm[-limit:]
+            try:
+                res = stt.transcribe(pcm, cfg.SAMPLE_RATE, options=self.stt_options)
+            except Exception:
+                continue
+            text = (res.get("text") or "").strip()
+            if text and self.state == "listening":
+                self.partial = text
+
     def _run(self, max_ms: int | None) -> None:
         try:
-            utt = record_utterance(max_ms=max_ms, stop_event=self.stop_event, device=self.device)
+            utt = record_utterance(
+                max_ms=max_ms,
+                silence_ms=self.silence_ms,
+                start_timeout_ms=self.start_timeout_ms,
+                preroll_ms=self.preroll_ms,
+                stop_event=self.stop_event,
+                device=self.device,
+                on_level=self._on_level if self.partial_enabled else None,
+                on_audio=self._on_audio if self.partial_enabled else None,
+            )
+            self._partial_stop.set()
             if self._cancelled or utt.stats.get("reason") == "cancelled":
                 self.state = "cancelled"
-                self._done.set()
                 return
             if utt.stats["audio_ms"] < 120:
                 self.state = "done"
                 self.result = {"text": "", "stats": utt.stats, "empty": True,
                                "reason": utt.stats.get("reason")}
-                self._done.set()
                 return
             self.state = "transcribing"
             res = stt.transcribe(utt.pcm, utt.sr, options=self.stt_options)
@@ -234,7 +353,6 @@ class PttSession:
                 # words are already here. Keep them: the client that is
                 # waiting for this turn must not end up with nothing.
                 self.state = "done"
-                self._done.set()
                 return
             self.state = "done"
         except Exception as e:
@@ -244,7 +362,15 @@ class PttSession:
             self.error = f"{type(e).__name__}: {e}"
             self.state = "error"
         finally:
+            self._partial_stop.set()
             self._done.set()
+            # Live mode: keep the microphone stream open for the next turn,
+            # so the next sentence starts without a device-open pause.
+            if self.keep_warm and not self._cancelled:
+                try:
+                    audio.warm_capture(cfg.SAMPLE_RATE, self.device)
+                except Exception:
+                    pass
 
     def stop_and_wait(self, timeout: float = 180.0) -> dict:
         self.stop_event.set()
@@ -260,13 +386,18 @@ class PttSession:
         self._done.wait(timeout=10)
 
     def snapshot(self) -> dict:
-        return {
+        payload = {
             "id": self.id,
             "state": self.state,
             "elapsed_ms": int((time.time() - self.started_at) * 1000),
             "result": self.result,
             "error": self.error,
+            "level": self.level,
+            "speaking": self.speaking,
         }
+        if self.partial_enabled:
+            payload["partial"] = self.partial
+        return payload
 
 
 _state = {
@@ -502,15 +633,32 @@ class Handler(BaseHTTPRequestHandler):
                 # buffering by the time the user starts speaking. prepare_sles
                 # keeps the module parent-owned between turns, so later PTT
                 # presses do not pay the module-load cost again.
-                # Start each PTT turn with a fresh buffered stream.
-                audio.drop_warm_capture()
+                # Start each PTT turn with a fresh buffered stream. A live
+                # conversation keeps the device open instead: the microphone
+                # is already listening when the answer ends, so the next
+                # turn starts without a device-open pause.
+                keep_warm = bool(body.get("keep_warm"))
+                if not keep_warm:
+                    audio.drop_warm_capture()
                 if cfg.IS_ANDROID:
                     audio.prepare_sles()
-                audio.warm_capture(cfg.SAMPLE_RATE, device)
+                cap = audio.warm_capture(cfg.SAMPLE_RATE, device)
+                if keep_warm:
+                    # Audio captured while the answer was playing belongs to
+                    # the speaker, not to the user: do not transcribe it.
+                    try:
+                        cap.drain()
+                    except Exception:
+                        pass
                 _state["ptt"] = PttSession(
                     max_ms=body.get("max_ms") or body.get("maxMs"),
                     stt_options=stt_options,
                     device=device,
+                    silence_ms=body.get("silence_ms"),
+                    start_timeout_ms=body.get("start_timeout_ms"),
+                    preroll_ms=body.get("preroll_ms"),
+                    partial=bool(body.get("partial")),
+                    keep_warm=keep_warm,
                 )
                 _maybe_warm_stt(stt_options)
                 return self._send(200, {"ok": True, "ptt": _state["ptt"].snapshot()})
@@ -548,6 +696,9 @@ class Handler(BaseHTTPRequestHandler):
                 sess = _state["ptt"]
                 if sess:
                     sess.cancel()
+                # The live conversation is over (or the turn was dropped):
+                # nothing needs the microphone stream kept open any more.
+                audio.drop_warm_capture()
                 return self._send(200, {"ok": True, "cancelled": bool(sess)})
 
             if path == "/listen":
@@ -588,8 +739,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not text:
                     return self._send(400, {"error": "text required"})
                 fish = body.get("fish") if isinstance(body.get("fish"), dict) else None
+                # `append` queues the sentence behind what is being read, so
+                # a reply that streams in is spoken in order instead of each
+                # sentence cutting off the one before it.
                 out = tts.speak(text, backend=body.get("backend"),
-                                wait=not bool(body.get("async")), fish=fish)
+                                wait=not bool(body.get("async")), fish=fish,
+                                append=bool(body.get("append")))
                 _state["speech"] = {"text": text, "backend": out.get("backend"), "started_at": time.time()}
                 return self._send(200, {"ok": True, **out})
 
@@ -624,7 +779,9 @@ class Handler(BaseHTTPRequestHandler):
                 sess = _state["ptt"]
                 if sess:
                     sess.cancel()
+                tts.clear_speech_queue()
                 audio.stop_playback()
+                audio.drop_warm_capture()
                 _state["speech"] = {"text": "", "backend": None, "started_at": 0.0}
                 return self._send(200, {"ok": True})
 

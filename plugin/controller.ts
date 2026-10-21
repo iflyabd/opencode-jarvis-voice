@@ -67,7 +67,16 @@ const FISH_STT_MODEL = "transcribe-1-pro"
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.6.0"
+export const PLUGIN_VERSION = "1.7.0"
+
+/**
+ * How long a pause ends a live turn.
+ *
+ * 900 ms is comfortable when you press a key to talk; in a conversation it
+ * feels like a broken line. 450 ms still leaves room to breathe between
+ * sentences and sends the words while the answer is being thought about.
+ */
+export const LIVE_SILENCE_MS = 450
 
 /** Local Whisper models the settings can pick. "" means automatic. */
 const LOCAL_MODELS: Array<{ id: string; title: string; description: string }> = [
@@ -337,6 +346,47 @@ export function speakable(text: string, limit = 0): string {
   return out
 }
 
+/**
+ * How much of a streaming answer can be read out loud right now.
+ *
+ * Only whole sentences count, and nothing inside a fenced code block, so a
+ * half-written word or a fragment of code is never spoken. The rest of the
+ * answer follows as soon as the model writes it.
+ */
+export function speechCut(text: string): number {
+  if (!text) return 0
+  let fence = false
+  let inlineCode = false
+  let cut = 0
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    // A fence only opens at the start of a line.
+    if (ch === "`" && text.startsWith("```", i) && (i === 0 || text[i - 1] === "\n")) {
+      fence = !fence
+      const lineEnd = text.indexOf("\n", i)
+      if (lineEnd < 0) break // the fence line is not finished yet
+      i = lineEnd
+      continue
+    }
+    if (fence) continue
+    if (ch === "`") {
+      inlineCode = !inlineCode
+      continue
+    }
+    if (inlineCode) continue
+    if (ch === "\n") {
+      // A paragraph break is a natural place to start speaking.
+      if (text[i + 1] === "\n") cut = i + 1
+      continue
+    }
+    if (ch === "." || ch === "!" || ch === "?" || ch === "…") {
+      const next = text[i + 1] ?? ""
+      if (next === "" || /\s/.test(next)) cut = i + 1
+    }
+  }
+  return cut
+}
+
 /* ------------------------------------------------------------------ controller */
 
 export function createVoiceController(context: any) {
@@ -345,6 +395,9 @@ export function createVoiceController(context: any) {
   // Live voice: the mic keeps listening, every turn is sent on its own and
   // the answer is read back, until the user switches it off again.
   const [live, setLive] = createSignal(false)
+  // What the microphone is hearing right now, as the live caption. Empty
+  // while nothing is being said.
+  const [liveCaption, setLiveCaptionSignal] = createSignal("")
   // Which message the current playback belongs to. The composer button and
   // the per-message buttons read this to decide between read/pause/resume.
   const [speakingMessage, setSpeakingMessage] = createSignal<string | null>(null)
@@ -416,6 +469,14 @@ export function createVoiceController(context: any) {
 
   function setMicState(value: MicState): void {
     setMic(value)
+    repaint()
+  }
+
+  /** The live caption: what the microphone is hearing, as it hears it. */
+  function setLiveCaption(value: string): void {
+    const next = String(value ?? "").replace(/\s+/g, " ").trim()
+    if (liveCaption() === next) return
+    setLiveCaptionSignal(next)
     repaint()
   }
 
@@ -536,7 +597,7 @@ export function createVoiceController(context: any) {
     return {}
   }
 
-  function sttRequest(): SttOptions {
+  function sttRequest(live = false): SttOptions {
     // Always send an explicit backend: it lets the TUI override a daemon
     // environment that defaults to Fish, and local selection must stay local.
     if (settings.sttProvider !== "fish") {
@@ -545,6 +606,9 @@ export function createVoiceController(context: any) {
         local: {
           model: normalizeLocalModel(settings.localModel),
           language: normalizeSttLanguage(settings.localLanguage),
+          // Live: understand whatever language is spoken on the first try,
+          // with the fastest decoding settings.
+          ...(live ? { live: true, beam: 1 } : {}),
         },
       }
     }
@@ -1648,109 +1712,42 @@ export function createVoiceController(context: any) {
   /* ------------------------------------------------------- speak the reply */
 
   /**
-   * Wait for the agent to pick the message up, then read the answer back.
+   * Wait until the answer has been read out loud.
    *
-   * Right after a message is sent the session is still idle for a moment, so
-   * waiting for "idle" alone would give up before the answer exists.
+   * A live conversation must not open the microphone again while the speaker
+   * is still talking, or the voice hears itself. The answer is read while it
+   * streams, so this waits for the *last* sentence, not the first.
    */
-  async function speakAnswerAfterSend(sessionID: string | undefined): Promise<void> {
+  async function waitUntilRead(sessionID: string | undefined): Promise<void> {
     if (!sessionID) return
-    for (let i = 0; i < 60; i++) {
-      await sleep(300)
-      let status: string | undefined
-      try {
-        status = context.data.session.status(sessionID)
-      } catch {
-        status = undefined
-      }
-      if (status === undefined) return // no session data: nothing to wait for
-      if (status === "busy") {
-        await speakReply(sessionID)
-        return
-      }
-    }
-  }
-
-  /**
-   * Wait until the watcher has read the answer out loud.
-   *
-   * The live conversation must not open the microphone again while the
-   * speaker is still talking, or the voice hears itself.
-   */
-  async function awaitSpokenAnswer(sessionID: string | undefined): Promise<void> {
-    if (!sessionID) return
-    // Wait for the turn to start and finish.
     let started = false
-    for (let i = 0; i < 400; i++) {
+    let quiet = 0
+    for (let i = 0; i < 1600; i++) {
+      if (liveStop) return
       let status: string | undefined
       try {
         status = context.data.session.status(sessionID)
       } catch {
         status = undefined
       }
-      if (status === undefined) return
       if (status === "busy") started = true
-      else if (started && status === "idle") break
-      await sleep(400)
-    }
-    if (!started) return
-    // The watcher reads the answer now; wait for the playback to finish.
-    await sleep(1200)
-    const info = await daemon(false)
-    if (!info) return
-    for (let i = 0; i < 750; i++) {
+      // The agent never picked the message up: nothing will be read.
+      if (!started && i > 40) return
+      const info = await daemon(false)
+      if (!info) return
       const state = await api.speech(info).catch(() => null)
-      if (state && !state.active) return
-      await sleep(400)
+      const speaking = state?.active === true
+      if (started && status !== "busy" && !speaking && !answerCheck && !answerAgain) {
+        quiet += 1
+        if (quiet >= 2) return
+      } else {
+        quiet = 0
+      }
+      await sleep(250)
     }
   }
 
   /* ------------------------------------------------- reading the answers */
-
-  /**
-   * One voice at a time.
-   *
-   * A new answer waits for the current reading instead of cutting it off, so
-   * two answers never talk over each other and the order is kept.
-   */
-  const readQueue: Array<() => Promise<void>> = []
-  let reading = false
-
-  async function runReadQueue(): Promise<void> {
-    if (reading) return
-    reading = true
-    try {
-      while (readQueue.length) {
-        const job = readQueue.shift()
-        if (!job) break
-        try {
-          await job()
-        } catch (e) {
-          toast(errorText(e), "error")
-        }
-      }
-    } finally {
-      reading = false
-    }
-  }
-
-  function enqueueRead(job: () => Promise<void>): void {
-    readQueue.push(job)
-    void runReadQueue()
-  }
-
-  /** Wait until the speaker is free, so nothing is read on top of anything. */
-  async function waitForSpeaker(timeoutMs = 300000): Promise<void> {
-    const info = await daemon(false)
-    if (!info) return
-    const steps = Math.max(1, Math.round(timeoutMs / 400))
-    for (let i = 0; i < steps; i++) {
-      const state = await api.speech(info).catch(() => null)
-      if (!state) return
-      if (!state.active) return
-      await sleep(400)
-    }
-  }
 
   /** The name of the session, read out before its answer. */
   function sessionLabel(sessionID: string): string {
@@ -1764,25 +1761,42 @@ export function createVoiceController(context: any) {
     }
   }
 
-  /** Read an answer out loud, with the session name in front of it. */
-  async function readAnswer(sessionID: string, answer: { id?: string; text: string }): Promise<void> {
-    await waitForSpeaker()
-    const body = speakable(answer.text)
+  /**
+   * Speak one piece of a reply.
+   *
+   * The piece is *appended* to the daemon's speech queue, so the parts of an
+   * answer that is still being written are read in order, without one
+   * sentence cutting off the one before it and without any gap.
+   */
+  async function speakChunk(sessionID: string, text: string, messageID?: string): Promise<void> {
+    const body = speakable(text)
     if (!body) return
-    const label = sessionLabel(sessionID)
-    const toSay = label ? `${label}. ${body}` : body
     const info = await daemon(false)
     if (!info) return
-    await api.speak(info, toSay, { async: true, ...ttsRequest() })
-    setSpeakingMessage(answer.id ?? null)
-    setSpeechState("playing")
-    watchSpeech()
+    try {
+      await api.speak(info, body, { async: true, append: true, ...ttsRequest() })
+      setSpeakingMessage(messageID ?? null)
+      setSpeechState("playing")
+      watchSpeech()
+    } catch (e) {
+      toast(`Could not speak the reply: ${errorText(e)}`, "error")
+    }
   }
 
   /* ------------------------------------------------------ auto speak watcher */
 
   let answerTimer: ReturnType<typeof setTimeout> | undefined
   let answerCheck: Promise<void> | undefined
+  let answerAgain = false
+
+  /**
+   * How much of each answer has already been handed to the speaker.
+   *
+   * Live mode reads a reply while it is being written; this remembers where
+   * the last sentence ended, so the next check continues from there instead
+   * of reading the same words twice.
+   */
+  const readProgress = new Map<string, { spoken: number; labelDone: boolean }>()
 
   /** Look for a new answer in the session that is on screen and read it. */
   async function checkForNewAnswer(): Promise<void> {
@@ -1797,40 +1811,86 @@ export function createVoiceController(context: any) {
     }
     const id = answer.id
     if (!id || !answer.text) return
-    if (seenAnswers.get(sessionID) === id) return
-    if (spokenAnswers.has(id)) {
-      seenAnswers.set(sessionID, id)
-      return
-    }
-    if (answer.created && answer.created < startedAt) {
-      // An answer that was already there when the plugin started: it was
-      // seen, and probably read, before.
-      seenAnswers.set(sessionID, id)
-      return
-    }
+
     let status: string | undefined
     try {
       status = context.data.session.status(sessionID)
     } catch {
       status = undefined
     }
-    if (status === "busy") return // the answer is still being written
+    const writing = status === "busy"
+    // A live conversation reads the answer while it is written, the way a
+    // phone call would: the first sentence starts long before the last one
+    // exists. Everywhere else the whole answer is read once it is complete.
+    const streaming = live() && autoSpeak
+    const progress = readProgress.get(id)
+
+    if (!progress) {
+      if (seenAnswers.get(sessionID) === id) return
+      if (spokenAnswers.has(id)) {
+        seenAnswers.set(sessionID, id)
+        return
+      }
+      if (answer.created && answer.created < startedAt) {
+        // An answer that was already there when the plugin started: it was
+        // seen, and probably read, before.
+        seenAnswers.set(sessionID, id)
+        return
+      }
+      if (writing && !streaming) return // the answer is still being written
+    }
+
+    if (!autoSpeak) {
+      if (!writing) {
+        seenAnswers.set(sessionID, id)
+        spokenAnswers.add(id)
+      }
+      return
+    }
+
+    // Speak up to the last complete sentence, never a half-written one and
+    // never a piece of code.
+    const cut = writing && streaming ? speechCut(answer.text) : answer.text.length
+    const next = progress ?? { spoken: 0, labelDone: false }
+    if (cut > next.spoken) {
+      const piece = answer.text.slice(next.spoken, cut)
+      const label = next.labelDone ? "" : sessionLabel(sessionID)
+      next.spoken = cut
+      next.labelDone = true
+      seenAnswers.set(sessionID, id)
+      if (writing) readProgress.set(id, next)
+      await speakChunk(sessionID, label ? `${label}. ${piece}` : piece, id)
+    }
+
+    if (writing) {
+      // More is coming: look again as soon as the next sentence lands.
+      scheduleAnswerCheck(350)
+      return
+    }
+
+    readProgress.delete(id)
     seenAnswers.set(sessionID, id)
-    if (!autoSpeak) return
     spokenAnswers.add(id)
-    // The session name is read first, then the answer. The read waits for
-    // the speaker, so a new answer never interrupts the one being read.
-    enqueueRead(() => readAnswer(sessionID, answer))
   }
 
   function scheduleAnswerCheck(delay = 400): void {
     if (answerTimer) clearTimeout(answerTimer)
     answerTimer = setTimeout(() => {
       answerTimer = undefined
-      if (answerCheck) return
-      answerCheck = checkForNewAnswer().finally(() => {
-        answerCheck = undefined
-      })
+      if (answerCheck) {
+        // A check is already reading; ask it to look again when it is done.
+        answerAgain = true
+        return
+      }
+      answerCheck = checkForNewAnswer()
+        .catch(() => undefined)
+        .finally(() => {
+          answerCheck = undefined
+          if (answerAgain) {
+            answerAgain = false
+            scheduleAnswerCheck(150)
+          }
+        })
     }, delay)
   }
 
@@ -1894,15 +1954,13 @@ export function createVoiceController(context: any) {
     if (!answer.text) return
     const toSay = speakable(answer.text)
     if (!toSay) return
-    // Queue it, so it waits for the speaker instead of talking over it.
-    await enqueueRead(async () => {
-      const info = await daemon(false)
-      if (!info) return
-      await api.speak(info, toSay, { async: true, ...ttsRequest() })
-      setSpeakingMessage(answer.id ?? null)
-      setSpeechState("playing")
-      watchSpeech()
-    })
+    // An explicit request: it takes the speaker from whatever was being read.
+    const info = await daemon(false)
+    if (!info) return
+    await api.speak(info, toSay, { async: true, ...ttsRequest() })
+    setSpeakingMessage(answer.id ?? null)
+    setSpeechState("playing")
+    watchSpeech()
   }
 
   /** The current session, waiting for one to show up (a new chat has none). */
@@ -1924,6 +1982,7 @@ export function createVoiceController(context: any) {
   /** Switch the live conversation off and drop the capture in progress. */
   function stopLive(): void {
     liveStop = true
+    setLiveCaption("")
     setLive(false)
     void (async () => {
       try {
@@ -1936,24 +1995,42 @@ export function createVoiceController(context: any) {
   }
 
   /**
-   * Record one turn and hand back the transcript.
+   * Record one live turn and hand back the transcript.
+   *
+   * The turn ends on a short silence (a phone call does not wait a full
+   * second after a sentence), the words are transcribed while they are spoken
+   * for the caption, and the microphone stream stays open for the next turn.
    * Returns "" when nothing was heard or the turn was cancelled.
    */
   async function recordOneTurn(info: DaemonInfo): Promise<string> {
-    await api.pttStart(info, 30000, sttRequest(), micRequest())
-    for (let i = 0; i < 240; i++) {
+    setLiveCaption("")
+    await api.pttStart(info, 120000, sttRequest(true), micRequest(), {
+      silenceMs: LIVE_SILENCE_MS,
+      startTimeoutMs: 120000,
+      partial: true,
+      keepWarm: true,
+    })
+    for (let i = 0; i < 4800; i++) {
       if (liveStop) return ""
-      await sleep(250)
+      await sleep(120)
       const state = await api.pttState(info).catch(() => null)
-      const st = state?.ptt?.state
-      if (st === "transcribing") setMicState("transcribing")
+      const ptt = state?.ptt
+      const st = ptt?.state
+      if (typeof ptt?.partial === "string" && ptt.partial) setLiveCaption(ptt.partial)
+      if (st === "transcribing") {
+        setMicState("transcribing")
+        // The final words replace the caption, so nothing flickers twice.
+        setLiveCaption("")
+      }
       if (!st || (st !== "listening" && st !== "transcribing")) break
     }
     if (liveStop) {
+      setLiveCaption("")
       await api.pttCancel(info).catch(() => undefined)
       return ""
     }
     const res = await api.pttStop(info, 150000).catch(() => null)
+    setLiveCaption("")
     if (res === null) return ""
     return transcriptText(res)
   }
@@ -1978,10 +2055,10 @@ export function createVoiceController(context: any) {
       // A chat that started on the home screen only gets a session id when
       // the first message is sent.
       if (!sid) sid = await resolveSessionID()
-      // Read the answer back, then listen again. The small pause keeps the
-      // tail of the playback out of the next recording.
-      if (autoSpeak && sid) await awaitSpokenAnswer(sid)
-      await sleep(600)
+      // The answer is read while it streams. Wait for the last sentence to
+      // finish, then listen again immediately: the microphone was kept open,
+      // so there is no device pause between the turns.
+      if (sid) await waitUntilRead(sid)
     }
   }
 
@@ -1997,7 +2074,10 @@ export function createVoiceController(context: any) {
     liveBusy = true
     liveStop = false
     setLive(true)
-    toast("Live voice on — talk, it sends your words and reads the answer. Click again to stop.", "success")
+    toast(
+      "Live voice on — like a phone call: pause to send, the answer is spoken as it arrives. Click again to stop.",
+      "success",
+    )
     try {
       await liveConversation(forcedSessionID ?? currentSessionID(context))
     } catch (e) {
@@ -2180,6 +2260,8 @@ export function createVoiceController(context: any) {
     autoSpeak: () => autoSpeak,
     /** True while the live conversation is running. */
     live: () => live(),
+    /** What the microphone is hearing right now (live mode), else "". */
+    liveCaption: () => liveCaption(),
     /** The host's prompt editor, used to anchor the live button on the home screen. */
     editor: () => promptEditor(),
     /** True when transcripts are sent to the agent without a review step. */

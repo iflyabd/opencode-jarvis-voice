@@ -70,12 +70,40 @@ export type SttOptions = {
   local?: {
     model?: string
     language?: string
+    /** Live conversation: one pass that understands any language, fewer beams. */
+    live?: boolean
+    /** Decoding beams for this request (1 is the fast setting). */
+    beam?: number
   }
 }
 
 /** The microphone to record from. "" (or omitted) keeps the daemon's choice. */
 export type MicOptions = {
   device?: string
+}
+
+/** Per-turn capture tuning. The live conversation uses a short hangover. */
+export type PttOptions = {
+  /** Silence that ends the utterance, in ms (default: the daemon setting). */
+  silenceMs?: number
+  /** How long to wait for the first word, in ms. */
+  startTimeoutMs?: number
+  /** Audio kept from just before the onset, in ms. */
+  prerollMs?: number
+  /** Transcribe while the user is still speaking (the live caption). */
+  partial?: boolean
+  /** Keep the microphone stream open for the next turn (live mode). */
+  keepWarm?: boolean
+}
+
+/** A live turn: its state, the caption so far and the input level. */
+export type PttSnapshot = {
+  id: string
+  state: string
+  partial?: string
+  level?: number
+  speaking?: boolean
+  elapsed_ms?: number
 }
 
 /** One entry of the daemon's list of microphones. */
@@ -306,14 +334,33 @@ export async function request<T = unknown>(
 
 export const api = {
   health: (info: DaemonInfo, deep = false) => getJsonWithAuth<Health>(info, `/health${deep ? "?deep=1" : ""}`),
-  pttStart: (info: DaemonInfo, maxMs?: number, stt?: SttOptions, mic?: MicOptions) =>
-    request(info, "/ptt/start", { body: { max_ms: maxMs, ...(stt ? { stt } : {}), ...(mic ? { mic } : {}) } }),
+  pttStart: (info: DaemonInfo, maxMs?: number, stt?: SttOptions, mic?: MicOptions,
+             opts: PttOptions = {}) =>
+    request(info, "/ptt/start", {
+      body: {
+        max_ms: maxMs,
+        ...(stt ? { stt } : {}),
+        ...(mic ? { mic } : {}),
+        ...(opts.silenceMs !== undefined ? { silence_ms: opts.silenceMs } : {}),
+        ...(opts.startTimeoutMs !== undefined ? { start_timeout_ms: opts.startTimeoutMs } : {}),
+        ...(opts.prerollMs !== undefined ? { preroll_ms: opts.prerollMs } : {}),
+        ...(opts.partial ? { partial: true } : {}),
+        ...(opts.keepWarm ? { keep_warm: true } : {}),
+      },
+    }),
   pttStop: (info: DaemonInfo, timeoutMs = 190000) => request<Transcript>(info, "/ptt/stop", { timeoutMs }),
-  pttState: (info: DaemonInfo) => getJsonWithAuth<{ ptt: { id: string; state: string } | null }>(info, "/ptt/state"),
+  pttState: (info: DaemonInfo) => getJsonWithAuth<{ ptt: PttSnapshot | null }>(info, "/ptt/state"),
   pttCancel: (info: DaemonInfo) => request(info, "/ptt/cancel"),
   listen: (info: DaemonInfo, body: Record<string, unknown> = {}, timeoutMs = 190000) =>
     request<Transcript>(info, "/listen", { body, timeoutMs }),
-  speak: (info: DaemonInfo, text: string, opts: { async?: boolean; backend?: string; fish?: FishOptions; timeoutMs?: number } = {}) =>
+  speak: (info: DaemonInfo, text: string, opts: {
+    async?: boolean
+    backend?: string
+    fish?: FishOptions
+    timeoutMs?: number
+    /** Queue behind what is playing instead of taking the speaker. */
+    append?: boolean
+  } = {}) =>
     request(info, "/speak", { body: { text, ...opts }, timeoutMs: opts.timeoutMs ?? 190000 }),
   synth: (info: DaemonInfo, text: string, fish?: FishOptions) =>
     request<ArrayBuffer>(info, "/synth", { body: { text, fish }, raw: true }),

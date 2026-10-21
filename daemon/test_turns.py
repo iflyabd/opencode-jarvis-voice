@@ -225,6 +225,181 @@ def _pipeline_checks() -> None:
 
 _pipeline_checks()
 
+
+# --------------------------------------------------------------- live captions
+
+def _live_caption_checks() -> None:
+    """A live turn captions the words while it is still listening."""
+    def fake_record(**kw):
+        on_level = kw.get("on_level")
+        on_audio = kw.get("on_audio")
+        if on_level:
+            on_level(0.2, True)
+        if on_audio:
+            on_audio(b"\x01\x00" * 16000)      # one second of audio
+        # Keep "listening" until the caller stops the turn, like a real
+        # capture would while the user is still speaking.
+        stop = kw.get("stop_event")
+        deadline = time.time() + 3.0
+        while stop is not None and not stop.is_set() and time.time() < deadline:
+            time.sleep(0.02)
+        return _Utt()
+
+    def fake_transcribe(pcm, sr, backend=None, options=None):
+        return {"text": "a partial caption", "backend": "faster-whisper"}
+
+    real_record = jv_server.record_utterance
+    real_transcribe = jv_server.stt.transcribe
+    jv_server.record_utterance = fake_record
+    jv_server.stt.transcribe = fake_transcribe
+    try:
+        sess = jv_server.PttSession(max_ms=1000, silence_ms=450, partial=True)
+        time.sleep(1.3)
+        snap = sess.snapshot()
+        check("a live turn captions the words while it listens",
+              snap.get("partial") == "a partial caption", f"partial={snap.get('partial')!r}")
+        check("a live turn reports the input level", snap.get("speaking") is True and snap.get("level") == 0.2,
+              f"speaking={snap.get('speaking')} level={snap.get('level')}")
+        out = sess.stop_and_wait(10)
+        check("the final transcript replaces the caption",
+              (out.get("result") or {}).get("text") == "a partial caption",
+              str(out.get("result"))[:120])
+
+        plain = jv_server.PttSession(max_ms=1000, silence_ms=450)
+        time.sleep(0.15)
+        plain.stop_and_wait(10)
+        check("a normal turn does not pay for a caption", "partial" not in plain.snapshot(),
+              str(plain.snapshot()))
+    finally:
+        jv_server.record_utterance = real_record
+        jv_server.stt.transcribe = real_transcribe
+
+
+_live_caption_checks()
+
+
+# ------------------------------------------------------------------ the gate
+
+def _gate_checks() -> None:
+    """The live voice gate: start fast, end fast, ignore the room."""
+    gate = jv_audio.VoiceGate(threshold=0.012, block_ms=30, silence_ms=450,
+                              min_speech_ms=250, noise_mult=2.4, preroll_ms=300)
+    quiet, voice = 0.001, 0.05
+    states = [gate.push(quiet) for _ in range(20)]
+    states += [gate.push(voice) for _ in range(30)]
+    states += [gate.push(quiet) for _ in range(40)]
+
+    check("the gate notices the voice at once", states.index("start") == 20, str(states.index("start")))
+    first_end = states.index("end")
+    check("the gate ends after a short hangover",
+          first_end == 20 + 30 + 14, f"end at {first_end}")
+    check("the gate knows how long the speech was", gate.speech_ms == 900, str(gate.speech_ms))
+    check("the gate keeps the audio before the onset", gate.preroll_blocks == 10, str(gate.preroll_blocks))
+
+    # A steady fan or a fridge must not be mistaken for a person.
+    noisy = jv_audio.VoiceGate(threshold=0.012, block_ms=30, silence_ms=450)
+    noisy_states = [noisy.push(0.006 + (0.002 if i % 3 == 0 else 0.0)) for i in range(120)]
+    check("a noisy room does not start a turn", "start" not in noisy_states,
+          f"floor={noisy.noise_floor:.4f} threshold={noisy.threshold:.4f}")
+    check("the threshold follows the room", noisy.threshold > 0.012,
+          f"{noisy.threshold:.4f}")
+
+    # A short cough is not a turn either: the minimum speech length applies.
+    cough = jv_audio.VoiceGate(threshold=0.012, block_ms=30, silence_ms=450, min_speech_ms=250)
+    out = [cough.push(0.05)] + [cough.push(0.001) for _ in range(30)]
+    check("a cough does not end as a turn", "end" not in out, str(out[:5]))
+
+    # Trimming what Whisper does not need: a quiet edge around the words.
+    tone = b"".join(int(0.2 * 32767 * (1 if i % 2 else -1)).to_bytes(2, "little", signed=True)
+                    for i in range(1600))
+    silence = b"\x00\x00" * 4800
+    trimmed = jv_audio.trim_silence(silence + tone + silence)
+    check("the silence around an utterance is trimmed", len(trimmed) < len(silence + tone + silence),
+          f"{len(trimmed)} of {len(silence + tone + silence)}")
+    check("the words survive the trim", len(trimmed) >= len(tone), str(len(trimmed)))
+
+
+_gate_checks()
+
+
+# ------------------------------------------------------------ the voice queue
+
+def _queue_checks() -> None:
+    """A reply that streams in is spoken in order, never on top of itself."""
+    events: list[tuple[str, str]] = []
+
+    def fake_synth(text: str, backend=None, use_cache=True, fish=None):
+        events.append(("synth", text))
+        time.sleep(0.05)
+        out = Path(f"/tmp/opencode/jv-q-{text[:20].replace(' ', '_')}.wav")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"RIFF" + b"\0" * 64)
+        return {"path": str(out), "backend": backend or "fish", "cached": False, "ms": 50}
+
+    def fake_play(path, timeout=120):
+        events.append(("play", Path(path).stem))
+        return {"backend": "fake", "ok": True}
+
+    real_synth = jv_tts.synthesize
+    real_play = jv_tts.audio.play_wav
+    jv_tts.synthesize = fake_synth
+    jv_tts.audio.play_wav = fake_play
+    try:
+        fish = {"apiKey": "k", "voiceId": "v"}
+        events.clear()
+        jv_tts.speak("alpha sentence", backend="fish", append=True, fish=fish)
+        jv_tts.speak("beta sentence", backend="fish", append=True, fish=fish)
+        time.sleep(0.8)
+        played = [e[1] for e in events if e[0] == "play"]
+        check("a streamed answer is read in order",
+              played == ["jv-q-alpha_sentence", "jv-q-beta_sentence"], str(played))
+
+        # A queued sentence must not cut the voice that is already talking.
+        def slow_play(path, timeout=120):
+            events.append(("play", Path(path).stem))
+            time.sleep(0.25)
+            return {"backend": "fake", "ok": True}
+
+        jv_tts.audio.play_wav = slow_play
+        events.clear()
+        jv_tts.speak("manual reply", backend="fish", wait=False, fish=fish)
+        time.sleep(0.12)
+        jv_tts.speak("queued tail", backend="fish", append=True, fish=fish)
+        time.sleep(1.0)
+        played = [e[1] for e in events if e[0] == "play"]
+        check("a queued sentence waits for the voice that is playing",
+              played == ["jv-q-manual_reply", "jv-q-queued_tail"], str(played))
+        jv_tts.audio.play_wav = fake_play
+
+        # The queue is inclusive: `speaking()` stays true between the parts,
+        # so the live loop does not open the microphone over its own voice.
+        events.clear()
+        jv_tts.speak("one part", backend="fish", append=True, fish=fish)
+        active = jv_tts.speaking()
+        time.sleep(0.4)
+        check("a queued utterance counts as speaking", active is True and jv_tts.speaking() is False,
+              f"before={active} after={jv_tts.speaking()}")
+
+        # A new, explicit utterance takes the speaker: the waiting reply is
+        # dropped instead of being read after the new one.
+        events.clear()
+        for i in range(5):
+            jv_tts.speak(f"waiting part {i}", backend="fish", append=True, fish=fish)
+        jv_tts.speak("fresh answer", backend="fish", fish=fish)
+        time.sleep(1.2)
+        played = [e[1] for e in events if e[0] == "play"]
+        check("a new utterance drops the queued reply",
+              played == ["jv-q-fresh_answer"], str(played))
+        check("the queue is empty after a normal utterance", jv_tts.queue_size() == 0,
+              str(jv_tts.queue_size()))
+    finally:
+        jv_tts.synthesize = real_synth
+        jv_tts.audio.play_wav = real_play
+        jv_tts.clear_speech_queue()
+
+
+_queue_checks()
+
 if FAILURES:
     print(f"\n{len(FAILURES)} check(s) failed")
     raise SystemExit(1)

@@ -63,6 +63,102 @@ def _run(cmd: list[str], timeout: float = 8, input_bytes: bytes | None = None) -
         return 1, b"", str(e).encode()
 
 
+class VoiceGate:
+    """Energy voice-activity detector tuned for a live conversation.
+
+    Three things make it feel instant instead of "press, wait, wait":
+
+    * an **adaptive noise floor** - the threshold follows a fan, a fridge or
+      the phone's own speaker bleed, so a quiet room does not need a hand
+      tuned constant and a noisy one does not trigger on everything;
+    * **pre-roll** - the blocks just before the detected onset are kept, so
+      the first phoneme (a "s", a "t") is not clipped off the utterance;
+    * **fast endpointing** - the caller chooses the hangover, and live mode
+      uses a short one so the answer starts while the pause still feels
+      natural.
+
+    The gate is a pure state machine over block levels: no audio, no clock.
+    Feed it one block RMS at a time and act on the return value.
+    """
+
+    WAITING = "waiting"
+    SPEECH = "speech"
+    DONE = "done"
+
+    def __init__(self, threshold: float = 0.012, block_ms: int = 30,
+                 silence_ms: int = 900, min_speech_ms: int = 250,
+                 noise_mult: float = 2.4, preroll_ms: int = 300) -> None:
+        self.base = max(0.0, float(threshold))
+        self.block_ms = max(1, int(block_ms))
+        self.silence_blocks = max(1, int(round(silence_ms / self.block_ms)))
+        self.min_speech_blocks = max(1, int(round(min_speech_ms / self.block_ms)))
+        self.noise_mult = max(1.0, float(noise_mult))
+        self.preroll_blocks = max(0, int(round(preroll_ms / self.block_ms)))
+        self.state = self.WAITING
+        self.noise_floor = 0.0
+        self.threshold = self.base
+        self.speech_blocks = 0
+        self.silent_blocks = 0
+
+    def push(self, level: float) -> str:
+        """Feed one block level; returns 'waiting'|'start'|'speech'|'end'."""
+        level = max(0.0, float(level or 0.0))
+        triggered = level >= self.threshold
+
+        if self.state == self.WAITING:
+            if triggered:
+                self.state = self.SPEECH
+                self.speech_blocks = 1
+                self.silent_blocks = 0
+                return "start"
+            # Track the room, not the speaker: only quiet blocks lower the
+            # floor, so a long sentence cannot teach the gate to ignore it.
+            self.noise_floor = (0.85 * self.noise_floor + 0.15 * level
+                                if self.noise_floor else level)
+            self.threshold = max(self.base, self.noise_floor * self.noise_mult)
+            return "waiting"
+
+        if triggered:
+            self.speech_blocks += 1
+            self.silent_blocks = 0
+            return "speech"
+
+        self.silent_blocks += 1
+        if (self.silent_blocks >= self.silence_blocks
+                and self.speech_blocks >= self.min_speech_blocks):
+            self.state = self.DONE
+            return "end"
+        return "speech"
+
+    @property
+    def speech_ms(self) -> int:
+        return self.speech_blocks * self.block_ms
+
+
+def trim_silence(pcm: bytes, threshold: float = 0.006,
+                 block_ms: int = 30, sr: int = 16000,
+                 keep_ms: int = 120) -> bytes:
+    """Drop quiet blocks from both ends of an utterance.
+
+    The endpoint hangover and the pre-roll are useful while recording, but
+    sending them to Whisper only makes the model work longer. One quiet block
+    is kept on each side so a soft first or last consonant survives.
+    """
+    if not pcm:
+        return b""
+    block = max(2, int(sr * block_ms / 1000) * 2)
+    blocks = [pcm[i:i + block] for i in range(0, len(pcm) - block + 1, block)]
+    if not blocks:
+        return pcm
+    keep = max(1, int(round(keep_ms / block_ms)))
+    voiced = [i for i, b in enumerate(blocks) if rms(b) >= threshold]
+    if not voiced:
+        return b""
+    start = max(0, voiced[0] - keep)
+    end = min(len(blocks), voiced[-1] + 1 + keep)
+    return b"".join(blocks[start:end])
+
+
 def rms(block: bytes) -> float:
     """RMS of a signed 16-bit little-endian mono block, normalised to 0..1."""
     if not block:
@@ -319,6 +415,23 @@ class Capture:
         if not detail:
             detail = "no output"
         return f"exited rc={self.proc.returncode}: {detail[:240]}"
+
+    def drain(self) -> int:
+        """Throw away audio buffered while nobody was listening.
+
+        A live conversation keeps the stream open between turns; whatever was
+        captured during the spoken answer is the speaker's voice, not the
+        user's, and must not become the next transcript.
+        """
+        dropped = 0
+        while True:
+            try:
+                self._q.get_nowait()
+                dropped += 1
+            except queue.Empty:
+                break
+        self._buf.clear()
+        return dropped
 
     def close(self) -> None:
         if self.proc.poll() is None:

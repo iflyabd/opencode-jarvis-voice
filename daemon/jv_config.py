@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-DAEMON_VERSION = "1.6.0"
+DAEMON_VERSION = "1.7.0"
 
 # ----------------------------------------------------------------------------
 # Paths
@@ -134,6 +134,20 @@ VAD_MIN_SPEECH_MS = int(os.environ.get("JARVIS_VOICE_VAD_MIN_SPEECH_MS", "250"))
 VAD_MAX_MS = int(os.environ.get("JARVIS_VOICE_VAD_MAX_MS", "30000"))
 VAD_START_TIMEOUT_MS = int(os.environ.get("JARVIS_VOICE_VAD_START_TIMEOUT_MS", "12000"))
 BLOCK_MS = int(os.environ.get("JARVIS_VOICE_BLOCK_MS", "30"))
+# Audio kept from just before the detected onset, so the first phoneme of the
+# first word is not clipped. 0 disables the pre-roll.
+VAD_PREROLL_MS = int(os.environ.get("JARVIS_VOICE_VAD_PREROLL_MS", "300"))
+# How much of the noise floor the gate tolerates before it calls it speech.
+# The floor itself follows the room; this only sets how far above it a voice
+# has to be.
+VAD_NOISE_MULT = float(os.environ.get("JARVIS_VOICE_VAD_NOISE_MULT", "2.4"))
+
+# Live conversation: a shorter hangover feels like a phone call, and the
+# caption is refreshed while the user is still speaking.
+LIVE_SILENCE_MS = int(os.environ.get("JARVIS_VOICE_LIVE_SILENCE_MS", "450"))
+LIVE_START_TIMEOUT_MS = int(os.environ.get("JARVIS_VOICE_LIVE_START_TIMEOUT_MS", "120000"))
+LIVE_PARTIAL_S = float(os.environ.get("JARVIS_VOICE_LIVE_PARTIAL_S", "0.9"))
+LIVE_PARTIAL_WINDOW_S = int(os.environ.get("JARVIS_VOICE_LIVE_PARTIAL_WINDOW_S", "18"))
 
 # Explicit device override: an integer index, a name substring, or a pulse/alsa device id.
 INPUT_DEVICE = os.environ.get("JARVIS_VOICE_INPUT_DEVICE") or os.environ.get("JARVIS_INPUT_DEVICE") or ""

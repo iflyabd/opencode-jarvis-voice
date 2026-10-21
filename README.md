@@ -10,8 +10,9 @@ spoken back in a JARVIS-style voice while it types.
 
 Mouse controls do the same: a **🎙 mic** at the bottom-right of the prompt box,
 and a **🔊 read / ⏸ pause / ▶ resume** control under every answer, plus a
-**◉ live** toggle above the text box for a hands-free voice conversation, all
-drawn with your OpenCode theme.
+**◉ live** toggle above the text box for a hands-free voice conversation that
+behaves like a phone call - a 450 ms pause ends your turn, the words appear as
+you speak, and the answer starts playing while it is still being written.
 
 It is built to keep a phone cold: the daemon starts **only when you use voice**,
 warms the model **while you speak** (never at boot), and **exits when idle**, so
@@ -266,13 +267,27 @@ Reading rules:
 
 The `◉ live` button at the top-right of the text box switches a hands-free
 conversation on. It sits in the same place in a session and on the home
-screen, where a new chat starts:
+screen, where a new chat starts. It is meant to feel like a phone call, not
+like a walkie-talkie:
 
-1. The microphone keeps listening. Each turn ends on silence, exactly like a
-   push-to-talk turn.
-2. What you said is sent to the agent on its own.
-3. The answer is read back to you.
-4. The microphone listens again - and again, for as long as live mode is on.
+1. **The microphone keeps listening.** A pause of only **450 ms** ends your
+   turn, so you can talk in sentences instead of waiting for a full second
+   after every one. The audio from just before you started is kept, so the
+   first letter of the first word is never clipped.
+2. **The words appear while you speak.** The turn is transcribed every
+   ~0.9 s and the caption grows in the mic button (`● so how do I…`). When
+   you stop, the final transcript replaces it.
+3. **Any language, first try.** Live mode asks the local model for the
+   multilingual pass (and Fish ASR detects the language on its own), so
+   Spanish, Arabic or Japanese do not need an English attempt first.
+4. **The answer is spoken while it is still being written.** The first
+   complete sentence starts playing long before the model has finished;
+   the rest is appended to the same voice, so the sentences run into each
+   other instead of cutting each other off.
+5. **The microphone is already open when the answer ends.** The device
+   stream is kept between turns, so there is no "device opening" gap - the
+   next sentence starts instantly.
+6. Then it listens again, for as long as live mode is on.
 
 Click `● live` (or the mic button, or run **Voice: live voice conversation**
 from the palette) to stop and go back to the manual mode: the mic button then
@@ -280,7 +295,10 @@ records one turn at a time again, and the transcript lands in the prompt box
 for review.
 
 Live mode uses the same microphone and speech-to-text settings as everything
-else, and it honours the auto-send and auto-speak switches.
+else, and it honours the auto-send and auto-speak switches. The new voice
+gate (adaptive noise floor, pre-roll, short hangover) is also used by
+push-to-talk, which keeps its comfortable 900 ms pause; the numbers are
+adjustable with `JARVIS_VOICE_VAD_*` and `JARVIS_VOICE_LIVE_*`.
 
 ### The transcript goes into the prompt box
 
@@ -564,8 +582,13 @@ Everything is an environment variable, read at daemon start:
 | `JARVIS_VOICE_FISH_ASR_MODEL` | `transcribe-1-pro` | Fish ASR model header (`transcribe-1-pro` or `transcribe-1`) |
 | `JARVIS_VOICE_FISH_ASR_URL` | `https://api.fish.audio/v1/asr` | override for testing a proxy or mock |
 | `JARVIS_VOICE_FISH_ASR_TIMEOUT` | `60` | seconds to wait for a Fish ASR response |
-| `JARVIS_VOICE_VAD_THRESHOLD` | `0.012` | raise it in a noisy room |
-| `JARVIS_VOICE_VAD_SILENCE_MS` | `900` | silence that ends a turn |
+| `JARVIS_VOICE_VAD_THRESHOLD` | `0.012` | the *quiet-room* floor; the gate adapts above it |
+| `JARVIS_VOICE_VAD_NOISE_MULT` | `2.4` | how far above the measured room noise a voice must be |
+| `JARVIS_VOICE_VAD_PREROLL_MS` | `300` | audio kept from just before the onset (never clip the first word) |
+| `JARVIS_VOICE_VAD_SILENCE_MS` | `900` | silence that ends a push-to-talk turn |
+| `JARVIS_VOICE_LIVE_SILENCE_MS` | `450` | silence that ends a live turn (the phone-call pause) |
+| `JARVIS_VOICE_LIVE_PARTIAL_S` | `0.9` | how often the live caption is refreshed while you speak |
+| `JARVIS_VOICE_LIVE_PARTIAL_WINDOW_S` | `18` | audio window a caption decodes (long monologues caption the recent part) |
 | `JARVIS_VOICE_LENGTH_SCALE` | `1.0` | Piper speed; `1.1` is a touch slower |
 | `JARVIS_VOICE_IDLE_EXIT_S` | `300` | exit after this long with nothing to do; `0` stays resident |
 | `JARVIS_VOICE_WARMUP` | `lazy` | `lazy` \| `boot` \| `off` — when the STT model is loaded |
@@ -652,7 +675,8 @@ token from `~/.cache/jarvis-voice/daemon.json`:
 | `POST /ptt/start` · `POST /ptt/stop` · `POST /ptt/cancel` · `GET /ptt/state` | push-to-talk session; `/ptt/start` accepts `{max_ms?, stt?, mic?}` |
 | `POST /listen` | record one utterance, return the transcript; accepts `{max_ms?, silence_ms?, stt?}` |
 | `POST /transcribe` | raw PCM/WAV in, text out |
-| `POST /speak` | synthesize + play (`{text, async?, backend?, fish?}`) |
+| `POST /speak` | synthesize + play (`{text, async?, backend?, fish?, append?}`; `append` queues behind the voice instead of cutting it off) |
+| `POST /ptt/start` | `{max_ms?, silence_ms?, start_timeout_ms?, partial?, keep_warm?, stt?, mic?}`; `partial` captions while recording, `keep_warm` keeps the device open |
 | `POST /synth` | synthesize only, returns `audio/wav` or `audio/mpeg` |
 | `POST /warmup` | load the local STT model now (no audio); accepts `{stt?}` and is a no-op for Fish |
 | `GET /speech` | what the speakers are doing now (`active`, `paused`, `elapsed_ms`) |

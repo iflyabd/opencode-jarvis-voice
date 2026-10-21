@@ -37,6 +37,8 @@ class SttError(RuntimeError):
 
 
 _lock = threading.Lock()
+# One decode at a time: a live caption and the final turn share the model.
+_infer_lock = threading.Lock()
 _loaded: dict = {}
 
 
@@ -197,6 +199,7 @@ def transcribe_faster_whisper(
     sr: int = cfg.SAMPLE_RATE,
     model: str | None = None,
     language: str | None = None,
+    beam_size: int | None = None,
 ) -> dict:
     whisper_model, ref, name = _get_faster_whisper_model(model)
 
@@ -209,15 +212,19 @@ def transcribe_faster_whisper(
         # An English-only model cannot decode another language; asking it to
         # would raise instead of transcribing.
         lang = "en" if lang.startswith("en") else None
-    segments, info = whisper_model.transcribe(
-        audio,
-        language=lang,
-        beam_size=cfg.WHISPER_BEAM,
-        vad_filter=False,
-        condition_on_previous_text=False,
-        without_timestamps=True,
-    )
-    text = " ".join(s.text.strip() for s in segments).strip()
+    # A live caption and the final turn can be decoded at the same time; the
+    # CTranslate2 model itself is shared, so serialize the inference instead
+    # of letting two decodes race inside it.
+    with _infer_lock:
+        segments, info = whisper_model.transcribe(
+            audio,
+            language=lang,
+            beam_size=int(beam_size if beam_size is not None else cfg.WHISPER_BEAM),
+            vad_filter=False,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+        )
+        text = " ".join(s.text.strip() for s in segments).strip()
     return {
         "text": text,
         "backend": "faster-whisper",
@@ -595,10 +602,21 @@ def _transcribe_local(pcm: bytes, sr: int, local: dict, level: float | None = No
 
     wanted = str(local.get("model") or "").strip()
     language = str(local.get("language") or "").strip() or None
+    live = bool(local.get("live"))
+    beam = local.get("beam")
     # An explicit model from the settings wins; otherwise reuse the model that
     # last produced a transcript.
     name = wanted or _last_good_model or None
-    res = transcribe_faster_whisper(pcm, sr, model=name, language=language)
+    if live and not wanted and not language:
+        # A live conversation must understand whatever language is spoken on
+        # the first try. The default tiny.en hears nothing at all in Spanish
+        # or Arabic, and the retry costs a whole extra decode; start from a
+        # cached multilingual model instead.
+        alt = _multilingual_model()
+        if alt:
+            name = alt
+    res = transcribe_faster_whisper(pcm, sr, model=name, language=language,
+                                    beam_size=beam)
     if res.get("text"):
         _last_good_model = res.get("model_name") or name
         return res

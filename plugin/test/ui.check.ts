@@ -259,6 +259,33 @@ async function mount(render: () => unknown, width = 40, height = 3) {
   check("an explicit speech limit still clips", speakable(longText, 600).length <= 601)
   check("markdown fences are not read", !speakable("Hi ```code here``` bye").includes("code here"))
 
+  const { speechCut } = await import("../controller.ts")
+  check(
+    "a streamed answer is cut after a whole sentence",
+    speechCut("First sentence. Second one is still bei") === "First sentence.".length,
+    String(speechCut("First sentence. Second one is still bei")),
+  )
+  check(
+    "a streamed answer is not cut inside a word",
+    speechCut("No full stop yet and the mod") === 0,
+    String(speechCut("No full stop yet and the mod")),
+  )
+  check(
+    "a streamed answer is not cut inside a code block",
+    speechCut("Look:\n```js\nconst x = 1\n```\nAnd done. Tail") === "Look:\n```js\nconst x = 1\n```\nAnd done.".length,
+    String(speechCut("Look:\n```js\nconst x = 1\n```\nAnd done. Tail")),
+  )
+  check(
+    "an unfinished code block is never read",
+    speechCut("Look:\n```js\nconst x = 1") === 0,
+    String(speechCut("Look:\n```js\nconst x = 1")),
+  )
+  check(
+    "an inline code stop does not count as a sentence",
+    speechCut("Use `a.b` here") === 0,
+    String(speechCut("Use `a.b` here")),
+  )
+
   const sttCodes = FISH_STT_LANGUAGES.map((item) => item.code)
   check("Fish STT exposes a broad language list", sttCodes.length >= 60, `codes=${sttCodes.length}`)
   check(

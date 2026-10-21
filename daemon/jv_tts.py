@@ -11,6 +11,7 @@ perceived latency in a live voice loop.
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import os
@@ -361,7 +362,7 @@ def synthesize(text: str, backend: str | None = None, use_cache: bool = True,
 
 
 def speak(text: str, backend: str | None = None, wait: bool = True,
-          fish: dict | None = None) -> dict:
+          fish: dict | None = None, append: bool = False) -> dict:
     """Synthesize and play through the local speakers.
 
     One voice at a time. A new utterance takes the speaker: the current
@@ -369,13 +370,39 @@ def speak(text: str, backend: str | None = None, wait: bool = True,
     can take seconds to synthesize and two voices must never talk over each
     other. An utterance that is superseded while it renders is dropped
     instead of playing later.
+
+    `append=True` is the polite form used for a reply that is being read as
+    it streams in: the utterance is put *behind* whatever is playing and the
+    speaker reads it in order, so the sentences of one answer never cut each
+    other off. A normal call (the read button, a new answer) still takes the
+    speaker and drops the waiting queue.
     """
     backend = backend or pick_backend()
-    gen = _take_speak_generation()
-    try:
-        audio.stop_playback()
-    except Exception:
-        pass
+    if append:
+        return enqueue_speech(text, backend=backend, fish=fish)
+    clear_speech_queue()
+    return _speak_now(text, backend=backend, wait=wait, fish=fish)
+
+
+def _speak_now(text: str, backend: str | None = None, wait: bool = True,
+               fish: dict | None = None, gen: int | None = None,
+               stop: bool = True) -> dict:
+    """Take the speaker right now and play this utterance.
+
+    The queue worker passes the generation it already claimed (under the
+    queue lock) and `stop=False`: it starts only when the previous utterance
+    finished, so there is nothing to cut and nothing that could cut it.
+    """
+    backend = backend or pick_backend()
+    if gen is None:
+        gen = _take_speak_generation()
+    elif not _speak_current(gen):
+        return {"backend": backend, "spoken": False, "superseded": True}
+    if stop:
+        try:
+            audio.stop_playback()
+        except Exception:
+            pass
     if backend == "fish":
         return _speak_chunked(text, gen, wait, "fish", fish or {})
     # A local voice is rendered in one go, but a long reply still takes a
@@ -417,9 +444,106 @@ def _finish_speak(gen: int) -> None:
 
 
 def speaking() -> bool:
-    """True while an utterance is being rendered or played."""
+    """True while an utterance is being rendered, played or waiting to play."""
     with _speak_lock:
-        return _speak_active
+        active = _speak_active
+    if active:
+        return True
+    with _queue_lock:
+        return bool(_queue)
+
+
+# ----------------------------------------------------------------------------
+# The speech queue: append a streamed reply instead of cutting it off
+# ----------------------------------------------------------------------------
+
+_queue_lock = threading.Lock()
+# Bumped whenever the queue is dropped, so an utterance that was already
+# popped by the worker cannot start playing over the newer one.
+_queue_gen = 0
+_queue: "collections.deque[tuple[int, str, str | None, dict | None]]" = collections.deque()
+_queue_thread: threading.Thread | None = None
+QUEUE_MAX = 64
+
+
+def _wait_speaker_idle(timeout: float = 300.0) -> bool:
+    """Wait for the utterance that is playing now to finish."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with _speak_lock:
+            if not _speak_active:
+                return True
+        time.sleep(0.03)
+    return False
+
+
+def _queue_run() -> None:
+    """Play the queued utterances one after another, in order."""
+    global _queue_thread
+    while True:
+        with _queue_lock:
+            if not _queue:
+                _queue_thread = None
+                return
+            token, text, backend, fish = _queue.popleft()
+        if token != _queue_gen:
+            continue
+        # A queued sentence follows what is playing, it never cuts it.
+        if not _wait_speaker_idle():
+            continue
+        with _queue_lock:
+            if token != _queue_gen:
+                continue
+            # Claim the speaker while the queue lock is held: a normal
+            # utterance that arrives after this point takes the generation
+            # and drops this item instead of being cut by it.
+            gen = _take_speak_generation()
+        try:
+            _speak_now(text, backend=backend, wait=True, fish=fish, gen=gen, stop=False)
+        except Exception:
+            # A failed utterance must not stop the ones behind it - and must
+            # not leave the speaker marked as busy either.
+            try:
+                _finish_speak(gen)
+            except Exception:
+                pass
+
+
+def enqueue_speech(text: str, backend: str | None = None,
+                   fish: dict | None = None) -> dict:
+    """Queue an utterance behind what is already being said."""
+    global _queue_thread
+    text = (text or "").strip()
+    if not text:
+        return {"backend": backend, "spoken": False, "queued": False, "pending": 0}
+    with _queue_lock:
+        pending = len(_queue)
+        if pending >= QUEUE_MAX:
+            # A runaway stream must not grow without bound.
+            return {"backend": backend, "spoken": False, "queued": False,
+                    "pending": pending, "full": True}
+        _queue.append((_queue_gen, text, backend, fish))
+        pending = len(_queue)
+        if _queue_thread is None or not _queue_thread.is_alive():
+            _queue_thread = threading.Thread(target=_queue_run, daemon=True, name="tts-queue")
+            _queue_thread.start()
+    return {"backend": backend or pick_backend(), "spoken": True, "queued": True,
+            "pending": pending, "chars": len(text)}
+
+
+def clear_speech_queue() -> int:
+    """Drop everything that is waiting to be read."""
+    global _queue_gen
+    with _queue_lock:
+        _queue_gen += 1
+        dropped = len(_queue)
+        _queue.clear()
+    return dropped
+
+
+def queue_size() -> int:
+    with _queue_lock:
+        return len(_queue)
 
 
 def _speak_single(text: str, gen: int, wait: bool, backend: str | None,

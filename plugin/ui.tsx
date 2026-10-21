@@ -77,9 +77,19 @@ export function MicButton(props: ButtonProps) {
   const theme = () => props.context.theme
   const state = () => props.voice.mic()
   const live = () => props.voice.live?.() === true
+  // The live caption: what the microphone is hearing, as it hears it.
+  const caption = () => {
+    const heard = String(props.voice.liveCaption?.() ?? "").trim()
+    if (!heard) return ""
+    return heard.length > 38 ? `${heard.slice(0, 37)}…` : heard
+  }
 
   const label = () => {
-    if (live()) return "● live"
+    if (live()) {
+      const heard = caption()
+      if (heard) return `● ${heard}`
+      return state() === "transcribing" ? "◌ transcribing" : "● live"
+    }
     switch (state()) {
       case "listening":
         return "● listening"
