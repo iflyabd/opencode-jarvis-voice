@@ -65,7 +65,7 @@ const FISH_STT_MODEL = "transcribe-1-pro"
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.5.0"
+export const PLUGIN_VERSION = "1.5.1"
 
 /** Local Whisper models the settings can pick. "" means automatic. */
 const LOCAL_MODELS: Array<{ id: string; title: string; description: string }> = [
@@ -1788,9 +1788,12 @@ export function createVoiceController(context: any) {
       if (!text) continue // nothing was heard: keep listening
       const sent = await submit(sid, text)
       if (!sent) continue
+      // A chat that started on the home screen only gets a session id when
+      // the first message is sent.
+      if (!sid) sid = await resolveSessionID()
       // Read the answer back, then listen again. The small pause keeps the
       // tail of the playback out of the next recording.
-      if (autoSpeak) await speakAnswerAfterSend(sid)
+      if (autoSpeak && sid) await speakAnswerAfterSend(sid)
       await sleep(600)
     }
   }

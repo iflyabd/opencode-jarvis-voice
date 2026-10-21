@@ -204,7 +204,7 @@ Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 |---|---|---|
 | `🎙 mic` / `● listening` / `◌ transcribing` | bottom-right of the prompt box | start listening; click again to stop |
 | `🔊 read` / `⏸ pause` / `▶ resume` | directly under each assistant answer | read **that answer**; click again to pause it, again to resume |
-| `◉ live` / `● live` | top-right of the composer | switch the live voice conversation on or off |
+| `◉ live` / `● live` | top-right of the composer | switch the live voice conversation on or off (also shown on the home screen, where a new chat starts) |
 
 All are theme-aware (colours come from the active theme's action and feedback
 tokens, with hover states) and drive the same state as the keybindings — a
@@ -241,7 +241,8 @@ Reading rules:
 ### Live voice conversation
 
 The `◉ live` button at the top-right of the text box switches a hands-free
-conversation on:
+conversation on. It is shown in a session and on the home screen, where a new
+chat starts:
 
 1. The microphone keeps listening. Each turn ends on silence, exactly like a
    push-to-talk turn.

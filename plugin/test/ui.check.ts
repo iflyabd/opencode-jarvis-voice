@@ -309,7 +309,7 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     client: {},
   }
   const cleanup = await plugin.default.setup(context)
-  check("plugin registers two slots", slots.length === 2, `got ${slots.length}`)
+  check("plugin registers three slots", slots.length === 3, `got ${slots.length}`)
   check(
     "mic button appends to prompt.footer",
     slots.some((s) => s.append === "prompt.footer" && typeof s.render === "function"),
@@ -318,6 +318,11 @@ async function mount(render: () => unknown, width = 40, height = 3) {
   check(
     "live button appends to session.composer.top",
     slots.some((s) => s.append === "session.composer.top" && typeof s.render === "function"),
+    slots.map((s) => s.append).join(","),
+  )
+  check(
+    "live button appends to home.footer for a new chat",
+    slots.some((s) => s.append === "home.footer" && typeof s.render === "function"),
     slots.map((s) => s.append).join(","),
   )
   const layer = layers[0]

@@ -59,6 +59,13 @@ export default Plugin.define({
           return <LiveButton context={context} voice={voice} sessionID={input.sessionID} />
         },
       })
+      // A brand new chat is the home screen, which has no session composer
+      // slot: the toggle is mounted in the home footer as well, so the live
+      // button is there in both places.
+      context.ui.slot({
+        append: "home.footer",
+        render: () => <LiveButton context={context} voice={voice} />,
+      })
     }
 
     // Messages may already be on screen when the plugin loads (--continue,
