@@ -8,6 +8,7 @@ No audio and no network: the capture and the transcription are stubbed.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -286,6 +287,8 @@ _device_checks()
 
 def _live_caption_checks() -> None:
     """A live turn captions the words while it is still listening."""
+    final_options: list = []
+
     def fake_record(**kw):
         on_level = kw.get("on_level")
         on_audio = kw.get("on_audio")
@@ -301,13 +304,20 @@ def _live_caption_checks() -> None:
             time.sleep(0.02)
         return _Utt()
 
+    def fake_caption(pcm, sr, options=None):
+        return {"text": "a partial caption", "backend": "faster-whisper",
+                "language": "en", "probability": 0.92, "caption_model": "tiny"}
+
     def fake_transcribe(pcm, sr, backend=None, options=None):
+        final_options.append(options)
         return {"text": "a partial caption", "backend": "faster-whisper"}
 
     real_record = jv_server.record_utterance
     real_transcribe = jv_server.stt.transcribe
+    real_caption = jv_server.stt.transcribe_caption
     jv_server.record_utterance = fake_record
     jv_server.stt.transcribe = fake_transcribe
+    jv_server.stt.transcribe_caption = fake_caption
     try:
         sess = jv_server.PttSession(max_ms=1000, silence_ms=450, partial=True)
         time.sleep(1.3)
@@ -316,10 +326,18 @@ def _live_caption_checks() -> None:
               snap.get("partial") == "a partial caption", f"partial={snap.get('partial')!r}")
         check("a live turn reports the input level", snap.get("speaking") is True and snap.get("level") == 0.2,
               f"speaking={snap.get('speaking')} level={snap.get('level')}")
+        check("the caption uses the small caption model",
+              snap.get("caption_model") == "tiny", str(snap.get("caption_model")))
+        check("the caption reports how long it took",
+              isinstance(snap.get("partial_ms"), int) and snap.get("partial_ms") >= 0,
+              str(snap.get("partial_ms")))
         out = sess.stop_and_wait(10)
         check("the final transcript replaces the caption",
               (out.get("result") or {}).get("text") == "a partial caption",
               str(out.get("result"))[:120])
+        opts = final_options[-1] or {}
+        check("the final decode reuses the language the caption heard",
+              (opts.get("local") or {}).get("language") == "en", str(opts))
 
         plain = jv_server.PttSession(max_ms=1000, silence_ms=450)
         time.sleep(0.15)
@@ -329,9 +347,85 @@ def _live_caption_checks() -> None:
     finally:
         jv_server.record_utterance = real_record
         jv_server.stt.transcribe = real_transcribe
+        jv_server.stt.transcribe_caption = real_caption
 
 
 _live_caption_checks()
+
+
+# ------------------------------------------------------- fast local transcription
+
+def _stt_speed_checks() -> None:
+    """The local decoder is set up to be fast: tiny detects, big decodes fixed."""
+    import jv_stt as stt
+
+    pcm24 = b"\x00\x01" * 24000
+    out = stt._norm(pcm24, 24000)
+    seconds = len(out) / 2 / 16000
+    check("audio is resampled to 16 kHz on Python 3.13", abs(seconds - 1.0) < 0.02,
+          f"{seconds:.3f}s")
+
+    real_cached = stt._cached_model
+    try:
+        stt._cached_model = lambda name: "/tmp/model" if name in ("tiny", "small") else None
+        check("live captions prefer the tiny model",
+              stt._caption_model_name("small") == "tiny", stt._caption_model_name("small"))
+    finally:
+        stt._cached_model = real_cached
+
+    loud = b"\x00\x10" * 16000
+    # The final decode runs on another thread; hold the model there while the
+    # caption thread asks for it.
+    held, release = threading.Event(), threading.Event()
+
+    def hold_model():
+        stt._infer_lock.acquire()
+        held.set()
+        release.wait(5)
+        stt._infer_lock.release()
+
+    holder = threading.Thread(target=hold_model, daemon=True)
+    holder.start()
+    held.wait(2)
+    try:
+        skipped = stt.transcribe_caption(loud, 16000, {})
+    finally:
+        release.set()
+        holder.join(2)
+    check("a caption is skipped while the final decode owns the model",
+          skipped.get("skipped") is True, str(skipped))
+
+    captured: dict = {}
+
+    class _Info:
+        language = "ar"
+        language_probability = 0.9
+        duration = 1.0
+
+    class _Model:
+        def transcribe(self, audio, **kw):
+            captured["language"] = kw.get("language")
+            return [], _Info()
+
+    real_get = stt._get_faster_whisper_model
+    real_detect = stt.detect_language
+    stt._get_faster_whisper_model = lambda model=None: (_Model(), "/tmp/model", model or "tiny")
+    stt.detect_language = lambda pcm, sr=16000, model=None, fallback=None: ("ar", 0.9)
+    try:
+        res = stt.transcribe_faster_whisper(loud, 16000, model="small")
+    finally:
+        stt._get_faster_whisper_model = real_get
+        stt.detect_language = real_detect
+    check("tiny detects the language before the big model decodes",
+          captured.get("language") == "ar", str(captured))
+    check("the final decode knows where the language came from",
+          res.get("language_source") == "tiny", str(res.get("language_source")))
+
+    check("both the caption and final models stay loaded",
+          stt._LOADED_MAX >= 2, str(stt._LOADED_MAX))
+
+
+_stt_speed_checks()
 
 
 # ------------------------------------------------------------------ the gate

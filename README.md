@@ -274,12 +274,15 @@ like a walkie-talkie:
    turn, so you can talk in sentences instead of waiting for a full second
    after every one. The audio from just before you started is kept, so the
    first letter of the first word is never clipped.
-2. **The words appear while you speak.** The turn is transcribed every
-   ~0.9 s and the caption grows in the mic button (`● so how do I…`). When
-   you stop, the final transcript replaces it.
-3. **Any language, first try.** Live mode asks the local model for the
-   multilingual pass (and Fish ASR detects the language on its own), so
-   Spanish, Arabic or Japanese do not need an English attempt first.
+2. **The words appear while you speak.** A caption is decoded with the
+   small `tiny` model every ~2 s (faster on an idle phone) and grows in the
+   mic button (`● so how do I…`). When you stop, the final transcript from
+   your chosen model replaces it. Captions never queue in front of the final
+   turn: if the final is decoding, the next preview is simply skipped.
+3. **Any language, first try.** The caption detects the language during the
+   first pass; the final decode reuses that language instead of paying for
+   detection again, so Spanish, Arabic or Japanese do not need an English
+   attempt first (and Fish ASR detects the language on its own).
 4. **The answer is spoken while it is still being written.** The first
    complete sentence starts playing long before the model has finished;
    the rest is appended to the same voice, so the sentences run into each
@@ -589,8 +592,11 @@ Everything is an environment variable, read at daemon start:
 | `JARVIS_VOICE_VAD_PREROLL_MS` | `300` | audio kept from just before the onset (never clip the first word) |
 | `JARVIS_VOICE_VAD_SILENCE_MS` | `900` | silence that ends a push-to-talk turn |
 | `JARVIS_VOICE_LIVE_SILENCE_MS` | `450` | silence that ends a live turn (the phone-call pause) |
-| `JARVIS_VOICE_LIVE_PARTIAL_S` | `0.9` | how often the live caption is refreshed while you speak |
-| `JARVIS_VOICE_LIVE_PARTIAL_WINDOW_S` | `18` | audio window a caption decodes (long monologues caption the recent part) |
+| `JARVIS_VOICE_LIVE_PARTIAL_S` | `0.6` | minimum gap between live caption passes; it stretches itself when a pass is slow |
+| `JARVIS_VOICE_LIVE_PARTIAL_WINDOW_S` | `12` | audio window a caption decodes (long monologues caption the recent part) |
+| `JARVIS_VOICE_WHISPER_CAPTION_MODEL` | `auto` | model for live previews: `auto` picks cached `tiny`, or name one explicitly |
+| `JARVIS_VOICE_WHISPER_DETECT_MODEL` | `tiny` | model that detects the language in auto mode |
+| `JARVIS_VOICE_WHISPER_DETECT_MIN_PROB` | `0.35` | below this confidence the main model detects the language itself |
 | `JARVIS_VOICE_LENGTH_SCALE` | `1.0` | Piper speed; `1.1` is a touch slower |
 | `JARVIS_VOICE_IDLE_EXIT_S` | `300` | exit after this long with nothing to do; `0` stays resident |
 | `JARVIS_VOICE_WARMUP` | `lazy` | `lazy` \| `boot` \| `off` — when the STT model is loaded |
@@ -705,6 +711,26 @@ If an older install only has multilingual `tiny` cached, the daemon uses that
 instead of downloading `tiny.en` silently, so upgrades keep working offline.
 Run `./bin/voice fetch-model tiny.en` once to get the faster English weights.
 Setting `JARVIS_VOICE_WHISPER_MODEL` explicitly always honours your choice.
+
+**Automatic language mode is now cheap.** Letting a big model detect the
+language costs a full encoder pass on every turn: on the reference phone
+`small` spent ~4 s on detection alone for a 4 s clip. Auto mode therefore
+detects with `tiny` (~0.7 s) and then decodes `small` with that language
+fixed. Measured on the same 4 s clip: **8.1 s before, 5.2 s after**; with the
+language set explicitly in the settings it is ~4.3 s. A 23.7 s live utterance
+now finishes in ~9.2 s, and live finals reuse the language the captions
+already heard, so they skip detection entirely. Set **Local Whisper language**
+for the fastest possible decodes; leave it on **Automatic** to switch
+languages freely.
+
+**Live captions use their own model.** Previews are decoded with the cached
+`tiny` model while the final turn uses your chosen model. Both stay loaded
+(LRU of three models), so switching between a caption and a final no longer
+reloads `small` from disk. The caption window is the last 12 s, which is both
+faster and more accurate for the tail of a long sentence, and each pass waits
+for the previous one to finish instead of piling up decodes that used to turn
+a 10 s question into a 30 s wait. If `tiny` is not cached yet, run
+`./bin/voice fetch-model tiny` once for instant live captions.
 
 `tiny.en` is English-only. For another language use multilingual `tiny`, or a
 larger model for noisy rooms and accents. Two ways to get there:

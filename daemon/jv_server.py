@@ -273,6 +273,12 @@ class PttSession:
         self.partial = ""
         self.level = 0.0
         self.speaking = False
+        # Caption diagnostics, and the language the captions heard: the final
+        # decode reuses it instead of paying for detection again.
+        self.partial_ms = 0
+        self.caption_model = ""
+        self.caption_language = ""
+        self.caption_probability = 0.0
         self._cancelled = False
         self._done = threading.Event()
         self._pcm = bytearray()
@@ -283,6 +289,10 @@ class PttSession:
             self._partial_thread = threading.Thread(target=self._partial_loop, daemon=True,
                                                    name=f"{self.id}-partial")
             self._partial_thread.start()
+            # Load tiny now, while the user is still speaking: the first
+            # caption should not pay for a model load.
+            threading.Thread(target=stt.warm_caption, args=(self.stt_options,),
+                             daemon=True, name=f"{self.id}-caption-warm").start()
         self._thread = threading.Thread(target=self._run, args=(max_ms,), daemon=True)
         self._thread.start()
 
@@ -298,31 +308,74 @@ class PttSession:
     def _partial_loop(self) -> None:
         """Transcribe the utterance so far, over and over, while it grows.
 
-        The caption is a preview: it is replaced by the final transcript the
-        moment the turn ends, so a small model on a phone never has to be
-        perfect twice.
+        The caption is a preview, so it uses the tiny model and is replaced by
+        the final transcript. Each pass waits for the previous one to finish
+        (plus a short breather), so a slow phone never builds a queue of
+        caption decodes in front of the final one - that queue used to turn a
+        10 s question into a 30 s wait.
         """
-        interval = max(0.35, float(cfg.LIVE_PARTIAL_S))
-        while not self._partial_stop.wait(interval):
+        base = max(0.3, float(cfg.LIVE_PARTIAL_S))
+        last_audio = 0
+        while not self._partial_stop.wait(base):
             if self.state != "listening":
                 return
             with self._pcm_lock:
                 pcm = bytes(self._pcm)
-            # Do not pay for a caption on a cough.
-            if len(pcm) < int(cfg.SAMPLE_RATE * 2 * 0.45):
+            # Do not pay for a caption on a cough, and do not re-decode the
+            # same words when nothing new was said.
+            if len(pcm) < int(cfg.SAMPLE_RATE * 2 * 0.45) or len(pcm) <= last_audio:
+                base = 0.25
                 continue
-            # Only the recent words matter for a caption, and Whisper has a
-            # 30 s window: a long monologue keeps its last seconds on screen.
+            # Only the recent words matter for a caption, and a shorter window
+            # is both faster and more accurate for the tail of a monologue.
             limit = int(cfg.SAMPLE_RATE * 2 * cfg.LIVE_PARTIAL_WINDOW_S)
             if len(pcm) > limit:
                 pcm = pcm[-limit:]
+            opts = self._options_with_language()
+            t0 = time.time()
             try:
-                res = stt.transcribe(pcm, cfg.SAMPLE_RATE, options=self.stt_options)
+                res = stt.transcribe_caption(pcm, cfg.SAMPLE_RATE, options=opts)
             except Exception:
+                base = 0.5
                 continue
+            took = time.time() - t0
+            if res.get("skipped"):
+                # The final decode owns the model; come back soon.
+                base = 0.2
+                continue
+            self.partial_ms = int(took * 1000)
+            model = str(res.get("caption_model") or "")
+            if model:
+                self.caption_model = model
+            lang = str(res.get("language") or "")
+            prob = float(res.get("probability") or 0.0)
+            if lang and prob >= float(cfg.WHISPER_DETECT_MIN_PROB) and not self.caption_language:
+                self.caption_language = lang
+                self.caption_probability = prob
             text = (res.get("text") or "").strip()
             if text and self.state == "listening":
                 self.partial = text
+            last_audio = len(pcm)
+            # Leave room between passes: a caption that took 1 s should not be
+            # followed by another one immediately on a busy phone.
+            base = max(0.3, min(1.2, took * 0.5 + 0.15))
+
+    def _options_with_language(self) -> dict | None:
+        """The turn options, with the language the captions already heard.
+
+        Only fills an empty language: an explicit setting from the user always
+        wins, and English-only models ignore it.
+        """
+        opts = self.stt_options
+        local = dict((opts or {}).get("local") or {})
+        if self.caption_language and not str(local.get("language") or "").strip() \
+                and not (cfg.WHISPER_LANGUAGE or "").strip():
+            local["language"] = self.caption_language
+        if not local:
+            return opts
+        merged = dict(opts or {})
+        merged["local"] = local
+        return merged
 
     def _run(self, max_ms: int | None) -> None:
         try:
@@ -346,7 +399,7 @@ class PttSession:
                                "reason": utt.stats.get("reason")}
                 return
             self.state = "transcribing"
-            res = stt.transcribe(utt.pcm, utt.sr, options=self.stt_options)
+            res = stt.transcribe(utt.pcm, utt.sr, options=self._options_with_language())
             res["stats"] = utt.stats
             res["empty"] = not res.get("text")
             self.result = res
@@ -397,6 +450,8 @@ class PttSession:
             "level": self.level,
             "speaking": self.speaking,
             "device": self.device,
+            "partial_ms": self.partial_ms,
+            "caption_model": self.caption_model,
         }
         if self.partial_enabled:
             payload["partial"] = self.partial

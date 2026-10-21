@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-DAEMON_VERSION = "1.7.1"
+DAEMON_VERSION = "1.8.0"
 
 # ----------------------------------------------------------------------------
 # Paths
@@ -146,8 +146,8 @@ VAD_NOISE_MULT = float(os.environ.get("JARVIS_VOICE_VAD_NOISE_MULT", "2.4"))
 # caption is refreshed while the user is still speaking.
 LIVE_SILENCE_MS = int(os.environ.get("JARVIS_VOICE_LIVE_SILENCE_MS", "450"))
 LIVE_START_TIMEOUT_MS = int(os.environ.get("JARVIS_VOICE_LIVE_START_TIMEOUT_MS", "120000"))
-LIVE_PARTIAL_S = float(os.environ.get("JARVIS_VOICE_LIVE_PARTIAL_S", "0.9"))
-LIVE_PARTIAL_WINDOW_S = int(os.environ.get("JARVIS_VOICE_LIVE_PARTIAL_WINDOW_S", "18"))
+LIVE_PARTIAL_S = float(os.environ.get("JARVIS_VOICE_LIVE_PARTIAL_S", "0.6"))
+LIVE_PARTIAL_WINDOW_S = int(os.environ.get("JARVIS_VOICE_LIVE_PARTIAL_WINDOW_S", "12"))
 
 # Explicit device override: an integer index, a name substring, or a pulse/alsa device id.
 INPUT_DEVICE = os.environ.get("JARVIS_VOICE_INPUT_DEVICE") or os.environ.get("JARVIS_INPUT_DEVICE") or ""
@@ -178,6 +178,13 @@ WHISPER_COMPUTE = os.environ.get("JARVIS_VOICE_WHISPER_COMPUTE", "int8")
 WHISPER_THREADS = int(os.environ.get("JARVIS_VOICE_WHISPER_THREADS", "4" if IS_ANDROID else "0") or 0)
 WHISPER_LANGUAGE = os.environ.get("JARVIS_VOICE_LANGUAGE", "")             # "" = auto-detect
 WHISPER_BEAM = int(os.environ.get("JARVIS_VOICE_WHISPER_BEAM", "1"))
+# Live captions use a tiny model: fast beats perfect for a preview that is
+# replaced by the final transcript. "auto" = tiny if cached, else the main model.
+WHISPER_CAPTION_MODEL = os.environ.get("JARVIS_VOICE_WHISPER_CAPTION_MODEL", "auto").strip()
+# Auto language mode detects with tiny first, then decodes the main model with
+# the language fixed. The big model's own detection costs a full encoder pass.
+WHISPER_DETECT_MODEL = os.environ.get("JARVIS_VOICE_WHISPER_DETECT_MODEL", "tiny").strip()
+WHISPER_DETECT_MIN_PROB = float(os.environ.get("JARVIS_VOICE_WHISPER_DETECT_MIN_PROB", "0.35"))
 # Reject near-digital-silence before touching the model. This is only a guard
 # against dead/muted sources and Whisper's "thank you" hallucinations on
 # silence; normal quiet speech is far above this (-66 dBFS).

@@ -27,6 +27,7 @@ import urllib.error
 import urllib.request
 import uuid
 import wave
+from collections import OrderedDict
 from pathlib import Path
 
 import jv_config as cfg
@@ -38,8 +39,12 @@ class SttError(RuntimeError):
 
 _lock = threading.Lock()
 # One decode at a time: a live caption and the final turn share the model.
-_infer_lock = threading.Lock()
-_loaded: dict = {}
+# Reentrant: a caption pass holds it while the shared decode helper runs.
+_infer_lock = threading.RLock()
+# The caption model (tiny) and the final model (small) must both stay resident:
+# reloading a 500 MB model between turns cost more than the decode itself.
+_loaded: "OrderedDict[tuple, object]" = OrderedDict()
+_LOADED_MAX = 3
 
 
 def _norm(pcm: bytes, sr: int) -> bytes:
@@ -47,10 +52,22 @@ def _norm(pcm: bytes, sr: int) -> bytes:
     if sr == cfg.SAMPLE_RATE:
         return pcm
     try:
-        import audioop
+        import audioop  # Python <= 3.12; removed in 3.13
 
         out, _ = audioop.ratecv(pcm, 2, 1, sr, cfg.SAMPLE_RATE, None)
         return out
+    except Exception:
+        pass
+    try:
+        import numpy as np
+
+        a = np.frombuffer(pcm, dtype="<i2").astype("float32")
+        if a.size < 2:
+            return pcm
+        n = max(1, int(round(a.size * cfg.SAMPLE_RATE / sr)))
+        idx = np.linspace(0.0, float(a.size - 1), n)
+        out = np.interp(idx, np.arange(a.size, dtype="float32"), a)
+        return np.clip(out, -32768, 32767).astype("<i2").tobytes()
     except Exception:
         return pcm
 
@@ -152,6 +169,22 @@ def _multilingual_model() -> str | None:
     return None
 
 
+def _caption_model_name(main: str | None = None) -> str:
+    """A small cached model for live captions: fast beats perfect.
+
+    A caption is replaced by the final transcript, so spending the final
+    model's decode budget on a preview is wasted work - and on a phone it
+    blocks the final decode behind the same lock.
+    """
+    prefer = (cfg.WHISPER_CAPTION_MODEL or "auto").strip()
+    if prefer not in ("", "auto", "default"):
+        return prefer
+    for candidate in ("tiny", "tiny.en"):
+        if _cached_model(candidate):
+            return candidate
+    return (main or cfg.WHISPER_MODEL or "tiny").strip() or "tiny"
+
+
 # The model that last produced a transcript. An English-only model returns an
 # empty string for other languages, so once a multilingual model has worked we
 # keep using it instead of paying the reload on every turn.
@@ -171,7 +204,9 @@ def _get_faster_whisper_model(model: str | None = None):
     key = ("fw", ref, cfg.WHISPER_DEVICE, cfg.WHISPER_COMPUTE)
     with _lock:
         model_obj = _loaded.get(key)
-        if model_obj is None:
+        if model_obj is not None:
+            _loaded.move_to_end(key)
+        else:
             local_only = bool(cfg.WHISPER_MODEL_DIR) or os.environ.get("HF_HUB_OFFLINE") == "1"
             load: dict = {"device": cfg.WHISPER_DEVICE, "compute_type": cfg.WHISPER_COMPUTE}
             if cfg.WHISPER_THREADS > 0:
@@ -189,9 +224,89 @@ def _get_faster_whisper_model(model: str | None = None):
                         f"cannot load faster-whisper model '{ref}': {e}. "
                         f"Set JARVIS_VOICE_WHISPER_DIR to a local model, or run: voice fetch-model {cfg.WHISPER_MODEL}"
                     )
-            _loaded.clear()
             _loaded[key] = model_obj
+            # Keep the last few models (live caption + final, and the language
+            # detector). Loading small costs seconds on a phone; evicting it
+            # every time a caption loads tiny would add that to every turn.
+            while len(_loaded) > _LOADED_MAX:
+                _loaded.popitem(last=False)
     return model_obj, ref, name
+
+
+def detect_language(pcm: bytes, sr: int = cfg.SAMPLE_RATE,
+                    model: str | None = None,
+                    fallback: str | None = None) -> tuple[str | None, float]:
+    """Detect the spoken language with a tiny model, cheaply.
+
+    The full model's built-in detection is a whole encoder pass: on this phone
+    it cost ~4 s for a 6 s clip with `small`, while `tiny` answers in ~0.7 s.
+    Decoding with the language fixed is also ~2.5x faster than letting the
+    big model detect it on every turn.
+    """
+    audio = _pcm_to_float(_norm(pcm, sr))
+    if audio.size == 0:
+        return None, 0.0
+    name = (model or cfg.WHISPER_DETECT_MODEL or "tiny").strip()
+    if not _cached_model(name) and not cfg.WHISPER_MODEL_DIR:
+        # No detector downloaded: use the model that is actually decoding, so
+        # an English-only default never guesses the language of Arabic audio.
+        name = (fallback or cfg.WHISPER_MODEL or "tiny").strip()
+    try:
+        detector, _, _ = _get_faster_whisper_model(name)
+        with _infer_lock:
+            lang, prob, _all = detector.detect_language(audio)
+        return (str(lang) if lang else None), float(prob or 0.0)
+    except Exception:
+        return None, 0.0
+
+
+def caption_model(options: dict | None = None) -> str:
+    """The model a live caption should use (tiny when it is cached)."""
+    local = _local_opts(options)
+    main = str(local.get("model") or "").strip() or None
+    return str(local.get("caption_model") or "").strip() or _caption_model_name(main)
+
+
+def warm_caption(options: dict | None = None) -> None:
+    """Load the caption model while the user is speaking, not at the first caption."""
+    name = caption_model(options)
+    if resolve_backend(options, None) == "fish" and not _cached_model(name) and not cfg.WHISPER_MODEL_DIR:
+        return
+    try:
+        _get_faster_whisper_model(name)
+    except Exception:
+        pass
+
+
+def transcribe_caption(pcm: bytes, sr: int = cfg.SAMPLE_RATE,
+                       options: dict | None = None) -> dict:
+    """Transcribe a live caption with the small caption model.
+
+    Non-blocking on purpose: if the final turn is decoding, the caption is
+    skipped instead of queueing in front of it. A caption is only a preview.
+    """
+    local = _local_opts(options)
+    model = caption_model(options)
+    language = str(local.get("language") or "").strip() or None
+    if resolve_backend(options, None) == "fish" and not _cached_model(model) and not cfg.WHISPER_MODEL_DIR:
+        # Fish users asked for cloud STT: do not download a local model just
+        # to draw a preview caption.
+        return {"text": "", "backend": "fish", "skipped": True,
+                "caption": True, "caption_model": model}
+    level = _pcm_rms(pcm)
+    if not pcm or (level is not None and level < cfg.STT_MIN_RMS):
+        return {"text": "", "backend": "faster-whisper", "empty": True,
+                "caption": True, "caption_model": model}
+    if not _infer_lock.acquire(blocking=False):
+        return {"text": "", "backend": "faster-whisper", "skipped": True,
+                "caption": True, "caption_model": model}
+    try:
+        res = transcribe_faster_whisper(pcm, sr, model=model, language=language, beam_size=1)
+    finally:
+        _infer_lock.release()
+    res["caption"] = True
+    res["caption_model"] = res.get("model_name") or model
+    return res
 
 
 def transcribe_faster_whisper(
@@ -208,10 +323,19 @@ def transcribe_faster_whisper(
         return {"text": "", "backend": "faster-whisper", "model": str(ref),
                 "model_name": name, "duration_s": 0.0}
     lang = (language or cfg.WHISPER_LANGUAGE or "").strip().lower() or None
-    if lang and _is_english_only(name):
-        # An English-only model cannot decode another language; asking it to
-        # would raise instead of transcribing.
-        lang = "en" if lang.startswith("en") else None
+    english_only = _is_english_only(name)
+    detected: tuple[str, float] | None = None
+    if english_only:
+        # The .en models can only produce English: forcing the language skips
+        # a pointless detection pass and is faster.
+        lang = "en"
+    elif not lang:
+        # Auto mode: detect with tiny, then decode the big model with the
+        # language fixed. The big model's built-in detection is 4-7x slower.
+        guess, prob = detect_language(pcm, sr, fallback=name)
+        if guess and prob >= float(cfg.WHISPER_DETECT_MIN_PROB):
+            lang = guess
+            detected = (guess, prob)
     # A live caption and the final turn can be decoded at the same time; the
     # CTranslate2 model itself is shared, so serialize the inference instead
     # of letting two decodes race inside it.
@@ -230,8 +354,9 @@ def transcribe_faster_whisper(
         "backend": "faster-whisper",
         "model": str(ref),
         "model_name": name,
-        "language": getattr(info, "language", None),
-        "probability": round(float(getattr(info, "language_probability", 0.0) or 0.0), 3),
+        "language": detected[0] if detected else getattr(info, "language", None),
+        "probability": round(detected[1] if detected else float(getattr(info, "language_probability", 0.0) or 0.0), 3),
+        "language_source": "tiny" if detected else ("forced" if lang else "auto"),
         "duration_s": round(float(getattr(info, "duration", 0.0) or 0.0), 2),
     }
 
@@ -607,11 +732,12 @@ def _transcribe_local(pcm: bytes, sr: int, local: dict, level: float | None = No
     # An explicit model from the settings wins; otherwise reuse the model that
     # last produced a transcript.
     name = wanted or _last_good_model or None
-    if live and not wanted and not language:
-        # A live conversation must understand whatever language is spoken on
-        # the first try. The default tiny.en hears nothing at all in Spanish
-        # or Arabic, and the retry costs a whole extra decode; start from a
-        # cached multilingual model instead.
+    if live and not wanted:
+        # A live conversation must understand whatever language is spoken.
+        # The daemon default may be English-only (tiny.en), which hears
+        # nothing at all in Spanish or Arabic; start from a cached
+        # multilingual model instead. The language the captions heard then
+        # makes the final decode fast.
         alt = _multilingual_model()
         if alt:
             name = alt
