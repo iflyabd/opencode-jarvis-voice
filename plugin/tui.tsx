@@ -34,7 +34,7 @@
 import { Plugin } from "@opencode/plugin/tui"
 import { createVoiceController } from "./controller"
 import { createMessageButtons } from "./message-buttons"
-import { LiveButton, MicButton, PromptFooterLive } from "./ui"
+import { ComposerLiveButton, MicButton, PromptFooterLive } from "./ui"
 
 export default Plugin.define({
   id: "jarvis-voice.cli",
@@ -68,7 +68,7 @@ export default Plugin.define({
           // Mounting this slot means a session view just appeared; the
           // transcript below it is laid out on the next frames.
           messages?.schedule(350)
-          return <LiveButton context={context} voice={voice} sessionID={input.sessionID} />
+          return <ComposerLiveButton context={context} voice={voice} sessionID={input.sessionID} />
         },
       })
     }

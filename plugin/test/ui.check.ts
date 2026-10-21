@@ -29,7 +29,7 @@ ensureRuntimePluginSupport({
 })
 
 const { testRender } = await import("@opentui/solid")
-const { LiveButton, MicButton } = await import("../ui.tsx")
+const { ComposerLiveButton, MicButton } = await import("../ui.tsx")
 const plugin = await import("../tui.tsx")
 // The same Solid runtime the components use; the live-update checks below
 // exercise the real signal path instead of re-mounting with a fixed state.
@@ -190,9 +190,9 @@ async function mount(render: () => unknown, width = 40, height = 3) {
 
 {
   const f = fakeVoice()
-  const s = await mount(() => LiveButton({ context: { theme }, voice: f.voice, sessionID: "ses_xyz" }), 40, 3)
+  const s = await mount(() => ComposerLiveButton({ context: { theme }, voice: f.voice, sessionID: "ses_xyz" }), 40, 3)
   check("live button renders the idle label", s.captureCharFrame().includes("live"), JSON.stringify(s.captureCharFrame()))
-  await s.mockMouse.click(34, 0)
+  await s.mockMouse.click(2, 0)
   await s.renderOnce()
   check("live click calls toggleLive with the slot's session", f.calls.includes("toggleLive:ses_xyz"), f.calls.join(","))
 

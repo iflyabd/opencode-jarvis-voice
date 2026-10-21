@@ -116,6 +116,9 @@ export function MicButton(props: ButtonProps) {
     <box
       flexShrink={0}
       paddingLeft={1}
+      ref={(el: any) => {
+        micBox = el
+      }}
       onMouseOver={() => hover(true)}
       onMouseOut={() => hover(false)}
       onMouseUp={(event: any) => {
@@ -158,6 +161,24 @@ function liveLabel(props: ButtonProps) {
       paint()
     },
   }
+}
+
+/**
+ * The mic button's box, so the live toggle can be lined up with it.
+ * The host's composer slot is narrower than the text box, so the toggle has
+ * to be moved to the right edge of the box by hand. The box is used rather
+ * than the text node, because a wide glyph (the microphone emoji) is drawn
+ * two columns wide but measured as one.
+ */
+let micBox: any = null
+
+function micRightEdge(): number | null {
+  const node = micBox
+  if (!node) return null
+  const x = node.x
+  const width = node.width
+  if (typeof x !== "number" || typeof width !== "number") return null
+  return x + width
 }
 
 /**
@@ -219,6 +240,57 @@ export function PromptFooterLive(props: ButtonProps) {
       <MicButton context={props.context} voice={props.voice} sessionID={props.sessionID} />
     </box>
   )
+}
+
+/**
+ * The live toggle above the text box, in a session.
+ *
+ * The host's composer slot is narrower than the text box, so the toggle is
+ * moved to the right edge of the box - the same edge the mic button sits on.
+ */
+export function ComposerLiveButton(props: ButtonProps) {
+  const live = liveLabel(props)
+
+  const wrapper: any = createElement("box")
+  wrapper.flexShrink = 0
+  wrapper.flexDirection = "row"
+  wrapper.justifyContent = "flex-end"
+
+  const anchor: any = createElement("box")
+  anchor.position = "absolute"
+  anchor.left = 0
+  anchor.top = 0
+  anchor.zIndex = 2000
+  anchor.flexShrink = 0
+
+  const label: any = createElement("box")
+  label.flexShrink = 0
+  label.onMouseOver = () => live.hover(true)
+  label.onMouseOut = () => live.hover(false)
+  label.onMouseUp = (event: any) => {
+    event?.preventDefault?.()
+    event?.stopPropagation?.()
+    if (event?.button === RIGHT_MOUSE_BUTTON) return
+    void props.voice.toggleLive(props.sessionID)
+  }
+  label.add(live.text)
+  anchor.add(label)
+  wrapper.add(anchor)
+
+  // Line the toggle up with the mic button on the right edge of the box.
+  const sync = () => {
+    wrapper.position = "relative"
+    const right = micRightEdge()
+    const width = anchor.width
+    const base = wrapper.x
+    if (right === null || typeof width !== "number" || typeof base !== "number") return
+    const offset = Math.round(right - width - base)
+    if (anchor.left !== offset) anchor.left = offset
+  }
+  const timer = setInterval(sync, 400)
+  onCleanup(() => clearInterval(timer))
+
+  return <box flexShrink={0}>{wrapper}</box>
 }
 
 /**
