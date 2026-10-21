@@ -226,6 +226,62 @@ def _pipeline_checks() -> None:
 _pipeline_checks()
 
 
+# ---------------------------------------------------------- the chosen device
+
+def _device_checks() -> None:
+    """A chosen microphone is never replaced by some other one."""
+    tried: list[tuple[str, str]] = []
+
+    def fake_spawn(name, sr, device=None):
+        tried.append((name, device or ""))
+        raise jv_audio.AudioError(f"{name}: nope")
+
+    real_spawn = jv_audio.spawn_capture
+    jv_audio.spawn_capture = fake_spawn
+    try:
+        try:
+            jv_audio.open_capture(device="index:99")
+        except Exception:
+            pass
+        names = [n for n, _ in tried]
+        check("a chosen device never falls back to another backend",
+              names and all(n in ("sounddevice", "arecord", "ffmpeg") for n in names),
+              str(tried))
+        check("a chosen device never opens the pulse default by accident",
+              "pulse-sles" not in names and "pulse" not in names, str(tried))
+        check("sox never touches a chosen device",
+              "sox" not in names, str(tried))
+        check("a chosen device is handed to the backend",
+              jv_audio.backend_command("sounddevice", 16000, "index:99")[-1] == "99",
+              str(jv_audio.backend_command("sounddevice", 16000, "index:99")[-3:]))
+        sox_cmd = jv_audio.backend_command("sox", 16000, "alsa:hw:1,0")
+        check("sox gets a real input device, not the default one",
+              "alsa" in sox_cmd and "hw:1,0" in sox_cmd and "-d" not in sox_cmd, str(sox_cmd))
+        legacy_cmd = jv_audio.backend_command("sox", 16000, "hw:1,0")
+        check("a legacy ALSA id reaches sox as ALSA too",
+              "alsa" in legacy_cmd and "hw:1,0" in legacy_cmd, str(legacy_cmd))
+        check("sox is never offered a named/index device",
+              jv_audio._backend_uses_device("sox", "name:USB Audio") is False
+              and jv_audio._backend_uses_device("sox", "index:4") is False)
+
+        tried.clear()
+        try:
+            jv_audio.open_capture(device="pulse:jarvis_mic")
+        except Exception:
+            pass
+        names = [n for n, _ in tried]
+        check("a pulse source only tries the pulse backends",
+              names == ["pulse-sles", "pulse"], str(tried))
+        pcmd = jv_audio.backend_command("pulse", 16000, "pulse:jarvis_mic")
+        check("a pulse source reaches the player as its name",
+              any("jarvis_mic" in str(part) for part in pcmd), str(pcmd))
+    finally:
+        jv_audio.spawn_capture = real_spawn
+
+
+_device_checks()
+
+
 # --------------------------------------------------------------- live captions
 
 def _live_caption_checks() -> None:
@@ -374,11 +430,13 @@ def _queue_checks() -> None:
         # The queue is inclusive: `speaking()` stays true between the parts,
         # so the live loop does not open the microphone over its own voice.
         events.clear()
+        jv_tts.audio.play_wav = slow_play
         jv_tts.speak("one part", backend="fish", append=True, fish=fish)
         active = jv_tts.speaking()
-        time.sleep(0.4)
+        time.sleep(0.9)
         check("a queued utterance counts as speaking", active is True and jv_tts.speaking() is False,
               f"before={active} after={jv_tts.speaking()}")
+        jv_tts.audio.play_wav = fake_play
 
         # A new, explicit utterance takes the speaker: the waiting reply is
         # dropped instead of being read after the new one.

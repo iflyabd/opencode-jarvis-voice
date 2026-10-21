@@ -232,11 +232,17 @@ check("automatic means no device in the request", startBody?.mic?.device === "",
 //    it like a phone call: short hangover, a caption while listening, the
 //    microphone kept open, and the answer read while it streams.
 setStore("autoSend", true)
+setStore("micSource", "pulse:jarvis_mic")
 const sentBeforeLive = sent.length
 const liveRun = voice.toggleLive("ses_test")
 await new Promise((r) => setTimeout(r, 900))
 check("live mode is on", voice.live() === true)
 check("live mode sent the transcript", sent.length > sentBeforeLive, `${sentBeforeLive} -> ${sent.length}`)
+check(
+  "live mode uses the microphone chosen in the settings",
+  startBody?.mic?.device === "pulse:jarvis_mic",
+  JSON.stringify(startBody?.mic),
+)
 check(
   "a live turn ends on a short pause",
   startBody?.silence_ms === 450,

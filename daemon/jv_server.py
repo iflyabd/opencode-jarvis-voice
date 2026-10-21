@@ -212,6 +212,8 @@ def record_utterance(
         "open_ms": int((t0 - t_start) * 1000),
         "record_ms": int((time.time() - t0) * 1000),
         "speech_at_ms": int((speech_at - t0) * 1000) if speech_at else None,
+        "capture": str(getattr(cap, "name", "") or ""),
+        "device": str(device or ""),
         "audio_ms": int(len(pcm) / 2 / sr * 1000),
         "raw_ms": int(len(raw) / 2 / sr * 1000),
         "rms": round(audio.rms(pcm), 5),
@@ -394,6 +396,7 @@ class PttSession:
             "error": self.error,
             "level": self.level,
             "speaking": self.speaking,
+            "device": self.device,
         }
         if self.partial_enabled:
             payload["partial"] = self.partial
@@ -678,6 +681,7 @@ class Handler(BaseHTTPRequestHandler):
                     f"backend={result.get('backend')} model={result.get('model_name')} "
                     f"fallback={result.get('fallback')} rms={st.get('rms')} "
                     f"audio_ms={st.get('audio_ms')} reason={st.get('reason')} "
+                    f"mic={st.get('device') or 'auto'} via={st.get('capture') or '?'} "
                     f"stt_ms={result.get('ms')}",
                     flush=True,
                 )

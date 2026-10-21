@@ -1,6 +1,6 @@
 {
   "name": "opencode-jarvis-voice",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "private": true,
   "type": "module",
   "description": "Voice chat for OpenCode: mic -> local Whisper or optional Fish Audio ASR, local Piper voice or optional Fish Audio TTS.",

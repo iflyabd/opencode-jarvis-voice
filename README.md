@@ -383,11 +383,13 @@ lets you pick one:
 | PortAudio inputs | every input the sounddevice/PortAudio layer exposes |
 | ALSA capture devices | the hardware devices `arecord` can open |
 
-The choice is sent with every turn, so it applies to push-to-talk straight
-away. **Test this microphone** measures the input level for a second and
-tells you whether the chosen device hears anything. A microphone that is
-picked explicitly never falls back to another one: if it cannot be opened,
-the turn fails with the reason instead of quietly recording somewhere else.
+The choice is sent with every turn, so it applies to push-to-talk and to
+live mode straight away. **Test this microphone** measures the input level for
+a second and tells you whether the chosen device hears anything. A microphone
+that is picked explicitly never falls back to another one: if it cannot be
+opened, the turn fails with the reason instead of quietly recording somewhere
+else. The daemon log prints `mic=… via=…` for every PTT turn, so you can see
+which device and which backend actually opened.
 
 ### Reading a reply with Fish Audio
 

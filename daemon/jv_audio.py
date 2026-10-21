@@ -513,8 +513,31 @@ def device_for_backend(device: str, backend: str) -> str:
     if kind == "termux":
         return value if backend == "termux" else ""
     if kind in ("alsa", "index", "name"):
-        return value if backend in ("sounddevice", "arecord", "sox", "ffmpeg") else ""
+        # sox has no portable way to take an explicit input device: `-d` is
+        # the *default* device and a name after it is an output file. A chosen
+        # device must never end up on a different microphone, so sox stays out
+        # of this family.
+        return value if backend in ("sounddevice", "arecord", "ffmpeg") else ""
     return dev
+
+
+def _backend_uses_device(backend: str, device: str) -> bool:
+    """True when this backend can open the chosen device itself.
+
+    `device_for_backend` returns "" for a device the backend cannot use, which
+    would make that backend quietly open its own default microphone. An
+    explicit choice must never mean "some other microphone".
+    """
+    dev = (device or "").strip()
+    if not dev:
+        return True
+    if backend == "sox":
+        # sox can name an input driver only for ALSA/PulseAudio ids. Anything
+        # else (a PortAudio index or a device name) would fall back to its
+        # default source, so sox is not allowed near those choices.
+        kind = dev.partition(":")[0].lower()
+        return kind in ("alsa", "hw", "plughw", "default", "sysdefault", "pulse", "pulseaudio")
+    return bool(device_for_backend(dev, backend))
 
 
 def device_backend_order(device: str) -> list[str]:
@@ -530,7 +553,7 @@ def device_backend_order(device: str) -> list[str]:
     if kind == "pulse":
         return ["pulse-sles", "pulse"]
     if kind in ("alsa", "index", "name"):
-        return ["sounddevice", "arecord", "sox", "ffmpeg"]
+        return ["sounddevice", "arecord", "ffmpeg"]
     return capture_order()
 
 
@@ -565,14 +588,28 @@ def backend_command(name: str, sr: int, device: str | None = None) -> list[str]:
             cmd += ["-D", dev]
         return cmd + ["-"]
     if name == "sox":
-        rec = _which("rec")
-        if rec:
-            cmd = [rec, "-q", "-t", "raw", "-r", str(sr), "-c", "1", "-e", "signed", "-b", "16"]
-            if dev:
-                cmd += ["-d", dev]
-            return cmd + ["-"]
-        sox = _which("sox") or "sox"
-        return [sox, "-q", "-t", "raw", "-r", str(sr), "-c", "1", "-e", "signed", "-b", "16", dev or "-d", "-"]
+        # The explicit device (when there is one) keeps its prefix here, so the
+        # input audio driver can be named: `-t alsa hw:1,0` / `-t pulseaudio
+        # name`. A bare `-d name` would read the default device and write to a
+        # file called `name` - the wrong microphone and a stray file.
+        rec = _which("rec") or "rec"
+        raw = (device or "").strip() or _device_arg()
+        kind, _, rest = raw.partition(":")
+        rest = rest.strip()
+        if kind == "alsa":
+            value, fmt = rest, "alsa"
+        elif kind in ("hw", "plughw", "default", "sysdefault"):
+            # A bare ALSA id: the colon belongs to the id, not a namespace.
+            value, fmt = raw, "alsa"
+        elif kind in ("pulse", "pulseaudio"):
+            value, fmt = rest, "pulseaudio"
+        else:
+            value, fmt = "", ""
+        base = [rec, "-q"]
+        if value and fmt:
+            base += ["-t", fmt, value]
+        base += ["-t", "raw", "-r", str(sr), "-c", "1", "-e", "signed", "-b", "16"]
+        return base + ["-"]
     if name == "ffmpeg":
         ffmpeg = _which("ffmpeg") or "ffmpeg"
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
@@ -755,9 +792,10 @@ def open_capture(sr: int | None = None, prefer: str | None = None,
     """Open a capture stream, trying backends in order until one yields audio."""
     sr = sr or cfg.SAMPLE_RATE
     order = device_backend_order(device or "")
+    explicit = bool((device or "").strip())
     if prefer:
         order = [prefer] + [b for b in order if b != prefer]
-    else:
+    elif not explicit:
         cached = cached_probe()
         # Old cache files can point at a virtual source that only produced
         # silence. Do not trust those; re-probe on the next real recording.
@@ -765,6 +803,11 @@ def open_capture(sr: int | None = None, prefer: str | None = None,
                 and float(cached.get("rms") or 0.0) > 1e-6:
             best = cached["backend"]
             order = [best] + [b for b in order if b != best]
+    if explicit:
+        # A chosen device is a promise, not a hint. Never let a backend that
+        # cannot use it (and would fall back to its own default source) open
+        # the wrong microphone just because it was the fastest last time.
+        order = [name for name in order if _backend_uses_device(name, device)]
 
     errors: list[str] = []
     block = max(1, int(sr * cfg.BLOCK_MS / 1000)) * 2
