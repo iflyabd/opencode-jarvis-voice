@@ -73,6 +73,28 @@ export type SttOptions = {
   }
 }
 
+/** The microphone to record from. "" (or omitted) keeps the daemon's choice. */
+export type MicOptions = {
+  device?: string
+}
+
+/** One entry of the daemon's list of microphones. */
+export type MicChoice = {
+  id: string
+  label: string
+  kind: string
+  detail?: string
+  state?: string
+  available?: boolean
+}
+
+export type Devices = {
+  choices?: MicChoice[]
+  pulse?: { sources?: string[]; default?: string; server?: string }
+  sounddevice?: Array<{ index: number; name?: string; channels?: number; sr?: number }>
+  alsa?: string[]
+}
+
 export type SpeechStatus = {
   ok?: boolean
   /** True while a local player process is running. */
@@ -284,8 +306,8 @@ export async function request<T = unknown>(
 
 export const api = {
   health: (info: DaemonInfo, deep = false) => getJsonWithAuth<Health>(info, `/health${deep ? "?deep=1" : ""}`),
-  pttStart: (info: DaemonInfo, maxMs?: number, stt?: SttOptions) =>
-    request(info, "/ptt/start", { body: { max_ms: maxMs, ...(stt ? { stt } : {}) } }),
+  pttStart: (info: DaemonInfo, maxMs?: number, stt?: SttOptions, mic?: MicOptions) =>
+    request(info, "/ptt/start", { body: { max_ms: maxMs, ...(stt ? { stt } : {}), ...(mic ? { mic } : {}) } }),
   pttStop: (info: DaemonInfo, timeoutMs = 190000) => request<Transcript>(info, "/ptt/stop", { timeoutMs }),
   pttState: (info: DaemonInfo) => getJsonWithAuth<{ ptt: { id: string; state: string } | null }>(info, "/ptt/state"),
   pttCancel: (info: DaemonInfo) => request(info, "/ptt/cancel"),
@@ -303,8 +325,10 @@ export const api = {
   pause: (info: DaemonInfo) => request<{ ok?: boolean; paused?: boolean; speech?: SpeechStatus }>(info, "/pause", { timeoutMs: 8000 }),
   resume: (info: DaemonInfo) => request<{ ok?: boolean; resumed?: boolean; speech?: SpeechStatus }>(info, "/resume", { timeoutMs: 8000 }),
   interrupt: (info: DaemonInfo) => request(info, "/interrupt"),
-  probe: (info: DaemonInfo) => request(info, "/probe", { body: {}, timeoutMs: 120000 }),
-  devices: (info: DaemonInfo) => getJsonWithAuth<Record<string, unknown>>(info, "/devices"),
+  probe: (info: DaemonInfo, mic?: MicOptions) =>
+    request(info, "/probe", { body: mic ? { mic } : {}, timeoutMs: 120000 }),
+  devices: (info: DaemonInfo) =>
+    getJsonWithAuth<{ ok?: boolean; devices?: Devices }>(info, "/devices").then((r) => r?.devices ?? {}),
   voices: (info: DaemonInfo) => getJsonWithAuth<Record<string, unknown>>(info, "/voices"),
 }
 

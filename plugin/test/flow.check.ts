@@ -16,14 +16,18 @@ const cache = "/tmp/opencode/jarvis-voice-flow-cache"
 
 // A mock daemon that behaves like the real one.
 let polls = 0
+let startBody: any = null
 const server = Bun.serve({
   port: 0,
-  fetch(req) {
+  async fetch(req) {
     const url = new URL(req.url)
     const json = (body: unknown) =>
       new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } })
     if (url.pathname === "/ping") return json({ ok: true })
-    if (url.pathname === "/ptt/start") return json({ ok: true, ptt: { id: "ptt-1", state: "listening" } })
+    if (url.pathname === "/ptt/start") {
+      startBody = await req.json()
+      return json({ ok: true, ptt: { id: "ptt-1", state: "listening" } })
+    }
     if (url.pathname === "/ptt/state") {
       polls += 1
       return json({ ok: true, ptt: { id: "ptt-1", state: polls > 1 ? "done" : "listening" } })
@@ -81,6 +85,7 @@ const editor = {
 }
 
 const sent: string[] = []
+const sentRaw: any[] = []
 const context: any = {
   options: {},
   storage: { store: () => [store, setStore] },
@@ -98,9 +103,14 @@ const context: any = {
     },
   },
   client: {
+    server: { info: async () => ({ version: "2.1.1" }) },
     session: {
       prompt: async (input: any) => {
-        sent.push(input?.text ?? input?.body?.text ?? "")
+        sentRaw.push(input)
+        // OpenCode 2.1 puts the text in `text.text`; 2.0 used a plain string.
+        const text = typeof input?.text === "string" ? input.text : (input?.text?.text ?? input?.body?.text ?? "")
+        sent.push(text)
+        return { id: "msg_1", sessionID: "ses_test", type: "user", payload: { text } }
       },
     },
   },
@@ -125,6 +135,20 @@ setStore("autoSend", true)
 editor.plainText = ""
 await voice.toggleMic("ses_test")
 check("auto-send submits the transcript", sent.length === 1 && sent[0] === "hello from the microphone", sent.join("|"))
+check(
+  "auto-send uses the OpenCode 2.1 prompt shape",
+  sentRaw[0]?.text?.text === "hello from the microphone" && sentRaw[0]?.sessionID === "ses_test",
+  JSON.stringify(sentRaw[0]),
+)
+
+// 3. The picked microphone travels with the turn.
+setStore("micSource", "pulse:jarvis_mic")
+await voice.toggleMic("ses_test")
+check("the chosen microphone is sent with the turn", startBody?.mic?.device === "pulse:jarvis_mic", JSON.stringify(startBody?.mic))
+
+setStore("micSource", "")
+await voice.toggleMic("ses_test")
+check("automatic means no device in the request", startBody?.mic?.device === "", JSON.stringify(startBody?.mic))
 
 server.stop(true)
 if (failures > 0) {

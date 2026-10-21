@@ -19,6 +19,10 @@ idle CPU is zero and its memory goes back to the system.
 Works the same on **Parrot OS**, **Termux / Android**, and a **normal PC**
 (Linux, macOS, Windows).
 
+Built for **OpenCode 2.1.1** (the plugin SDK is pinned to
+`@opencode/plugin` 2.1.1 and OpenTUI 0.6.6). It also runs on 2.0.x: the
+plugin picks the prompt API shape that the running host expects.
+
 ---
 
 ## How it works
@@ -249,8 +253,9 @@ If you want the hands-free flow, turn **auto-send** on:
 * **Voice: settings → Auto-send transcripts** in the settings dialog.
 
 With auto-send on, the transcript is submitted to the agent as soon as it is
-transcribed, and the reply is spoken back (when auto-speak is on). With
-auto-send off, the reply is still spoken once you send the transcript.
+transcribed - the same thing pressing Enter in the prompt does - and the reply
+is spoken back (when auto-speak is on). With auto-send off, the reply is still
+spoken once you send the transcript.
 
 If the host TUI does not expose an editable prompt box, the transcript is
 shown in a toast so it can be copied by hand.
@@ -296,6 +301,26 @@ to the local Piper voice rather than silently failing.
 Advanced/CLI use can set `JARVIS_VOICE_FISH_KEY`, `JARVIS_VOICE_FISH_VOICE`,
 and `JARVIS_VOICE_FISH_MODEL`; the settings dialog is preferred because it
 stores the key without putting it in a shell history or committed config.
+
+### Choosing the microphone
+
+**Voice: settings → Microphone** lists every input the machine can offer and
+lets you pick one:
+
+| Entry | What it is |
+|---|---|
+| Automatic (recommended) | the daemon picks the first microphone that really delivers audio |
+| `jarvis_mic` | the Android phone microphone, captured directly through PulseAudio's SLES source |
+| `parrot_mic` | the Termux:API microphone piped in by the Termux audio bridge |
+| Termux:API microphone | `termux-microphone-record`, used directly (needs the Termux:API package) |
+| PortAudio inputs | every input the sounddevice/PortAudio layer exposes |
+| ALSA capture devices | the hardware devices `arecord` can open |
+
+The choice is sent with every turn, so it applies to push-to-talk straight
+away. **Test this microphone** measures the input level for a second and
+tells you whether the chosen device hears anything. A microphone that is
+picked explicitly never falls back to another one: if it cannot be opened,
+the turn fails with the reason instead of quietly recording somewhere else.
 
 ### Optional Fish Audio speech-to-text
 
@@ -532,6 +557,7 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
 | `autoSpeak` | `true` | speak replies automatically after push-to-talk starts the turn |
 | `autoSend` | `false` | send the transcript to the agent as soon as it is transcribed; off means it lands in the prompt box for review |
 | `fishAudio` | — | optional `{ provider, apiKey, voiceId, voiceName, model, sttProvider, sttModel, sttLanguage }`; the settings dialog is safer for keys |
+| `micSource` | — | the microphone to record from, e.g. `pulse:jarvis_mic`; the settings dialog is easier |
 | `stt` | — | optional `{ provider, model, language, localModel, localLanguage }` defaults for speech-to-text; normally set in the settings dialog |
 
 The **`Voice: settings`** dialog is the normal way to configure Fish Audio:
@@ -546,7 +572,7 @@ token from `~/.cache/jarvis-voice/daemon.json`:
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | capability report (`?deep=1` re-probes the mic) |
-| `POST /ptt/start` · `POST /ptt/stop` · `POST /ptt/cancel` · `GET /ptt/state` | push-to-talk session; `/ptt/start` accepts `{max_ms?, stt?}` |
+| `POST /ptt/start` · `POST /ptt/stop` · `POST /ptt/cancel` · `GET /ptt/state` | push-to-talk session; `/ptt/start` accepts `{max_ms?, stt?, mic?}` |
 | `POST /listen` | record one utterance, return the transcript; accepts `{max_ms?, silence_ms?, stt?}` |
 | `POST /transcribe` | raw PCM/WAV in, text out |
 | `POST /speak` | synthesize + play (`{text, async?, backend?, fish?}`) |
@@ -560,7 +586,8 @@ token from `~/.cache/jarvis-voice/daemon.json`:
 The optional `stt` object has the shape
 `{ "backend": "fish", "fish": { "apiKey": "…", "model": "transcribe-1-pro", "language": "en" } }`.
 `backend: "local"` forces on-device Whisper even if the daemon environment
-defaults to Fish.
+defaults to Fish. The optional `mic` object is
+`{ "device": "pulse:jarvis_mic" }` and picks the microphone for that turn.
 
 ### Speech-to-text speed & quality
 

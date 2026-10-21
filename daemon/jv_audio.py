@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -379,23 +380,64 @@ def _device_arg() -> str:
     return cfg.INPUT_DEVICE or ""
 
 
-def _sounddevice_cmd(sr: int) -> list[str]:
+def device_for_backend(device: str, backend: str) -> str:
+    """Hand a chosen device only to the backend family that understands it.
+
+    The TUI sends a prefixed id so one choice cannot be handed to a backend
+    that cannot use it: `pulse:jarvis_mic`, `alsa:hw:1,0`, `index:3`,
+    `name:USB Audio`, `termux:default`. An id without a prefix keeps the old
+    behaviour and is passed to every backend.
+    """
+    dev = (device or "").strip()
+    if not dev:
+        return ""
+    kind, sep, value = dev.partition(":")
+    if not sep:
+        return dev
+    value = value.strip()
+    if kind == "pulse":
+        return value if backend in ("pulse", "pulse-sles") else ""
+    if kind == "termux":
+        return value if backend == "termux" else ""
+    if kind in ("alsa", "index", "name"):
+        return value if backend in ("sounddevice", "arecord", "sox", "ffmpeg") else ""
+    return dev
+
+
+def device_backend_order(device: str) -> list[str]:
+    """The capture backends that can use a chosen device.
+
+    An explicit choice never falls back to a different microphone: either the
+    picked input opens, or the turn fails with a clear reason.
+    """
+    dev = (device or "").strip()
+    kind = dev.partition(":")[0] if ":" in dev else ""
+    if kind == "termux":
+        return ["termux"]
+    if kind == "pulse":
+        return ["pulse-sles", "pulse"]
+    if kind in ("alsa", "index", "name"):
+        return ["sounddevice", "arecord", "sox", "ffmpeg"]
+    return capture_order()
+
+
+def _sounddevice_cmd(sr: int, device: str = "") -> list[str]:
     return [sys.executable, str(SELF), "stream", "--backend", "sounddevice", "--sr", str(sr),
-            "--device", _device_arg()]
+            "--device", device or _device_arg()]
 
 
-def _termux_cmd(sr: int) -> list[str]:
+def _termux_cmd(sr: int, device: str = "") -> list[str]:
     return [sys.executable, str(SELF), "stream", "--backend", "termux", "--sr", str(sr),
-            "--device", _device_arg()]
+            "--device", device or _device_arg()]
 
 
-def backend_command(name: str, sr: int) -> list[str]:
+def backend_command(name: str, sr: int, device: str | None = None) -> list[str]:
     """The command whose stdout is raw S16LE mono at `sr`."""
-    dev = _device_arg()
+    dev = device_for_backend(device or "", name) or _device_arg()
     if name == "sounddevice":
-        return _sounddevice_cmd(sr)
+        return _sounddevice_cmd(sr, dev)
     if name == "termux":
-        return _termux_cmd(sr)
+        return _termux_cmd(sr, dev)
     if name == "pulse":
         cmd = [_which("parec") or "parec", "--format=s16le", f"--rate={sr}", "--channels=1", "--latency-msec=20"]
         if dev:
@@ -446,12 +488,12 @@ def capture_order() -> list[str]:
     return ["pulse"] + [b for b in all_backends if b != "pulse"]
 
 
-def spawn_capture(name: str, sr: int) -> Capture:
+def spawn_capture(name: str, sr: int, device: str | None = None) -> Capture:
     """Start one backend. Raises AudioError if it cannot even be launched."""
     ok, why = backend_available(name)
     if not ok:
         raise AudioError(f"{name} unavailable: {why}")
-    cmd = backend_command(name, sr)
+    cmd = backend_command(name, sr, device)
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 stdin=subprocess.DEVNULL, bufsize=0)
@@ -464,10 +506,14 @@ def spawn_capture(name: str, sr: int) -> Capture:
 # Probing (crash-isolated: one child process per backend)
 # ----------------------------------------------------------------------------
 
-def probe_backend_in_child(name: str, sr: int, timeout: float | None = None) -> dict:
+def probe_backend_in_child(name: str, sr: int, timeout: float | None = None,
+                           device: str | None = None) -> dict:
     """Probe a single backend inside its own process, so a native fault is contained."""
     timeout = timeout or cfg.PROBE_TIMEOUT
     cmd = [sys.executable, str(SELF), "probe-one", "--backend", name, "--sr", str(sr)]
+    dev = device_for_backend(device or "", name)
+    if dev:
+        cmd += ["--device", dev]
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=timeout + 2)
     except subprocess.TimeoutExpired:
@@ -491,13 +537,13 @@ def probe_backend_in_child(name: str, sr: int, timeout: float | None = None) -> 
             "reason": f"rc={p.returncode} {(detail[-1] if detail else 'no result')[:200]}"}
 
 
-def probe_one(name: str, sr: int) -> dict:
+def probe_one(name: str, sr: int, device: str | None = None) -> dict:
     """In-process probe for a single backend. Only safe inside the child process."""
     block_bytes = max(1, int(sr * cfg.BLOCK_MS / 1000)) * 2
     # A healthy microphone delivers its first block quickly. A dead virtual
     # pipe returns nothing; cap its wait so probing falls through to SLES.
     limit = 3.0 if name == "pulse" else cfg.PROBE_TIMEOUT
-    cap = spawn_capture(name, sr)
+    cap = spawn_capture(name, sr, device)
     try:
         buf = bytearray()
         deadline = time.time() + limit
@@ -505,22 +551,23 @@ def probe_one(name: str, sr: int) -> dict:
         while len(buf) < need and time.time() < deadline:
             buf.extend(cap.read(block_bytes, timeout=limit))
         level = rms(bytes(buf[:need]))
-        return {"backend": name, "ok": True, "rms": round(level, 5), "sr": sr, "device": cfg.INPUT_DEVICE}
+        return {"backend": name, "ok": True, "rms": round(level, 5), "sr": sr,
+                "device": device or cfg.INPUT_DEVICE}
     finally:
         cap.close()
 
 
-def probe_capture(sr: int | None = None, save: bool = True) -> dict:
+def probe_capture(sr: int | None = None, save: bool = True, device: str | None = None) -> dict:
     """Pick the first backend that really delivers samples. Safe to call from the daemon."""
     sr = sr or cfg.SAMPLE_RATE
     tried: list[dict] = []
     fallback: tuple[str, str, dict] | None = None
-    for name in capture_order():
+    for name in device_backend_order(device or ""):
         ok, why = backend_available(name)
         if not ok:
             tried.append({"backend": name, "ok": False, "reason": why})
             continue
-        res = probe_backend_in_child(name, sr)
+        res = probe_backend_in_child(name, sr, device=device)
         tried.append(res)
         if not res.get("ok"):
             continue
@@ -590,10 +637,11 @@ def _save_backend(result: dict) -> None:
         pass
 
 
-def open_capture(sr: int | None = None, prefer: str | None = None) -> Capture:
+def open_capture(sr: int | None = None, prefer: str | None = None,
+                 device: str | None = None) -> Capture:
     """Open a capture stream, trying backends in order until one yields audio."""
     sr = sr or cfg.SAMPLE_RATE
-    order = capture_order()
+    order = device_backend_order(device or "")
     if prefer:
         order = [prefer] + [b for b in order if b != prefer]
     else:
@@ -609,7 +657,7 @@ def open_capture(sr: int | None = None, prefer: str | None = None) -> Capture:
     block = max(1, int(sr * cfg.BLOCK_MS / 1000)) * 2
     for name in order:
         try:
-            cap = spawn_capture(name, sr)
+            cap = spawn_capture(name, sr, device)
         except AudioError as e:
             errors.append(str(e))
             continue
@@ -635,7 +683,10 @@ def open_capture(sr: int | None = None, prefer: str | None = None) -> Capture:
                 cap.close()
             except Exception:
                 pass
-    raise AudioError("no capture backend works. " + " | ".join(errors))
+    raise AudioError(
+        (f"microphone '{device}' could not be opened. " if device else "no capture backend works. ")
+        + " | ".join(errors)
+    )
 
 
 # A PTT turn opens the mic when the button is pressed, not when the recording
@@ -645,15 +696,17 @@ def open_capture(sr: int | None = None, prefer: str | None = None) -> Capture:
 _warm_lock = threading.Lock()
 _warm_cap: Capture | None = None
 _warm_at = 0.0
+_warm_device: str = ""
 
 
-def warm_capture(sr: int | None = None) -> Capture:
+def warm_capture(sr: int | None = None, device: str | None = None) -> Capture:
     """Open (or reuse) a capture stream and let it buffer until PTT consumes it."""
-    global _warm_cap, _warm_at
+    global _warm_cap, _warm_at, _warm_device
     sr = sr or cfg.SAMPLE_RATE
+    want = (device or "").strip()
     with _warm_lock:
         if (_warm_cap is not None and _warm_cap.proc.poll() is None
-                and time.time() - _warm_at < 30):
+                and time.time() - _warm_at < 30 and _warm_device == want):
             return _warm_cap
         if _warm_cap is not None:
             try:
@@ -661,26 +714,30 @@ def warm_capture(sr: int | None = None) -> Capture:
             except Exception:
                 pass
             _warm_cap = None
-        _warm_cap = open_capture(sr)
+        _warm_cap = open_capture(sr, device=want)
         _warm_at = time.time()
+        _warm_device = want
         return _warm_cap
 
 
-def take_capture(sr: int | None = None) -> Capture:
+def take_capture(sr: int | None = None, device: str | None = None) -> Capture:
     """Consume the warm PTT stream, or open a fresh one for non-PTT capture."""
-    global _warm_cap
+    global _warm_cap, _warm_device
     sr = sr or cfg.SAMPLE_RATE
+    want = (device or "").strip()
     with _warm_lock:
         cap = _warm_cap
         _warm_cap = None
-        if cap is not None and cap.proc.poll() is None:
+        if cap is not None and cap.proc.poll() is None and _warm_device == want:
+            _warm_device = ""
             return cap
         if cap is not None:
+            _warm_device = ""
             try:
                 cap.close()
             except Exception:
                 pass
-    return open_capture(sr)
+    return open_capture(sr, device=want)
 
 
 def drop_warm_capture() -> None:
@@ -1108,6 +1165,35 @@ def resample_to(pcm: bytes, sr_from: int, sr_to: int) -> bytes:
         return pcm
 
 
+def pulse_source_details() -> list[dict]:
+    """The PulseAudio input sources with a readable description."""
+    pactl = _which("pactl")
+    if not pactl:
+        return []
+    rc, out, _ = _run([pactl, "list", "short", "sources"], timeout=6)
+    if rc != 0:
+        return []
+    rows = []
+    for line in out.decode("utf-8", "replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2 or not parts[1]:
+            continue
+        name = parts[1]
+        driver = parts[2] if len(parts) > 2 else ""
+        low = driver.lower()
+        if "module-sles-source" in low:
+            kind, detail = "pulse", "Android phone microphone (SLES)"
+        elif "module-pipe-source" in low:
+            kind, detail = "pulse", "piped microphone (Termux:API bridge)"
+        elif "monitor" in name.lower() or "monitor" in low:
+            kind, detail = "pulse", "monitor (not a microphone)"
+        else:
+            kind, detail = "pulse", "PulseAudio source"
+        rows.append({"name": name, "driver": driver, "kind": kind, "detail": detail,
+                     "state": parts[4] if len(parts) > 4 else ""})
+    return rows
+
+
 def list_input_devices() -> dict:
     out: dict = {
         "capture": {
@@ -1120,6 +1206,37 @@ def list_input_devices() -> dict:
         "pulse": {"sources": pulse_sources(), "default": pulse_default_source(),
                   "server": cfg.PULSE_SERVER},
     }
+    # Load the phone mic module so it shows up in the list of choices.
+    try:
+        prepare_sles()
+    except Exception:
+        pass
+
+    choices: list[dict] = [{
+        "id": "",
+        "label": "Automatic (recommended)",
+        "kind": "auto",
+        "detail": "The daemon picks the best working microphone",
+    }]
+
+    for src in pulse_source_details():
+        choices.append({
+            "id": f"pulse:{src['name']}",
+            "label": src["name"],
+            "kind": "pulse",
+            "detail": src["detail"],
+            "state": src.get("state", ""),
+        })
+
+    termux_ok, termux_why = backend_available("termux")
+    choices.append({
+        "id": "termux:default",
+        "label": "Termux:API microphone",
+        "kind": "termux",
+        "detail": "termux-microphone-record" + ("" if termux_ok else f" (not installed: {termux_why})"),
+        "available": termux_ok,
+    })
+
     try:
         import sounddevice as sd
 
@@ -1129,11 +1246,32 @@ def list_input_devices() -> dict:
                 devs.append({"index": i, "name": d.get("name"), "channels": d["max_input_channels"],
                              "sr": d.get("default_samplerate")})
         out["sounddevice"] = devs
+        for d in devs:
+            choices.append({
+                "id": f"index:{d['index']}",
+                "label": d.get("name") or f"Input {d['index']}",
+                "kind": "index",
+                "detail": f"PortAudio input {d['index']} · {d['channels']} ch · {int(d.get('sr') or 0)} Hz",
+            })
     except Exception as e:
         out["sounddevice_error"] = str(e)
     if _which("arecord"):
         rc, so, _ = _run(["arecord", "-l"], timeout=6)
-        out["alsa"] = so.decode("utf-8", "replace").strip().splitlines() if rc == 0 else []
+        lines = so.decode("utf-8", "replace").strip().splitlines() if rc == 0 else []
+        out["alsa"] = lines
+        for line in lines:
+            # "card 1: USB [Device USB Audio], device 0: USB Audio [USB Audio]"
+            m = re.search(r"card (\d+):.*device (\d+):", line)
+            alsa_id = f"hw:{m.group(1)},{m.group(2)}" if m else ""
+            if not alsa_id:
+                continue
+            choices.append({
+                "id": f"alsa:{alsa_id}",
+                "label": line.strip(),
+                "kind": "alsa",
+                "detail": f"ALSA capture device {alsa_id}",
+            })
+    out["choices"] = choices
     return out
 
 
@@ -1152,8 +1290,9 @@ def _main(argv: list[str]) -> int:
     if cmd == "probe-one":
         name = opt("--backend")
         sr = int(opt("--sr", str(cfg.SAMPLE_RATE)))
+        device = opt("--device")
         try:
-            print(_json.dumps(probe_one(name, sr)))
+            print(_json.dumps(probe_one(name, sr, device)))
         except Exception as e:
             print(_json.dumps({"backend": name, "ok": False, "reason": f"{type(e).__name__}: {e}"}))
         return 0

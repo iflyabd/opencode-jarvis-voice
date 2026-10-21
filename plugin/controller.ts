@@ -26,6 +26,8 @@ import {
   type DaemonInfo,
   type FishOptions,
   type Health,
+  type MicChoice,
+  type MicOptions,
   type SttOptions,
 } from "./daemon-client"
 
@@ -50,6 +52,8 @@ type VoiceSettings = {
   localLanguage: string
   /** Send the transcript to the agent straight away instead of the prompt box. */
   autoSend: boolean
+  /** The microphone to record from; "" = let the daemon pick. */
+  micSource: string
 }
 
 type FishVoice = { id: string; title: string; description?: string }
@@ -61,7 +65,7 @@ const FISH_STT_MODEL = "transcribe-1-pro"
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.2.1"
+export const PLUGIN_VERSION = "1.3.0"
 
 /** Local Whisper models the settings can pick. "" means automatic. */
 const LOCAL_MODELS: Array<{ id: string; title: string; description: string }> = [
@@ -438,6 +442,7 @@ export function createVoiceController(context: any) {
     localModel: normalizeLocalModel(optionStt.localModel ?? context.options?.localModel ?? optionFish.localModel),
     localLanguage: normalizeSttLanguage(optionStt.localLanguage ?? context.options?.localLanguage ?? optionFish.localLanguage),
     autoSend: context.options?.autoSend === true,
+    micSource: String(context.options?.micSource ?? context.options?.mic ?? "").trim(),
   }
 
   // context.storage is durable and shared between TUI instances; keep a plain
@@ -465,7 +470,8 @@ export function createVoiceController(context: any) {
         typeof stored.fishSttLanguage !== "string" ||
         typeof stored.localModel !== "string" ||
         typeof stored.localLanguage !== "string" ||
-        typeof stored.autoSend !== "boolean"
+        typeof stored.autoSend !== "boolean" ||
+        typeof stored.micSource !== "string"
       if (needsMigration) {
         void setStored((draft) => {
           if (draft.sttProvider !== "local" && draft.sttProvider !== "fish") {
@@ -477,6 +483,7 @@ export function createVoiceController(context: any) {
           draft.localLanguage = normalizeSttLanguage(draft.localLanguage ?? seedSettings.localLanguage)
           // Review first: the transcript lands in the prompt box.
           if (typeof draft.autoSend !== "boolean") draft.autoSend = seedSettings.autoSend
+          if (typeof draft.micSource !== "string") draft.micSource = seedSettings.micSource
         }).catch(() => {
           /* defaults still apply in memory */
         })
@@ -536,6 +543,19 @@ export function createVoiceController(context: any) {
 
   function sttReady(): boolean {
     return settings.sttProvider !== "fish" || Boolean((settings.fishApiKey || "").trim())
+  }
+
+  /* --------------------------------------------------------- microphone */
+
+  /** The microphone the user picked; "" means "let the daemon choose". */
+  function micRequest(): MicOptions {
+    return { device: (settings.micSource || "").trim() }
+  }
+
+  function micLabel(): string {
+    const id = (settings.micSource || "").trim()
+    if (!id) return "Automatic (the daemon picks the best microphone)"
+    return id
   }
 
   function sttLabel(): string {
@@ -1031,9 +1051,11 @@ export function createVoiceController(context: any) {
       }
       if (kind === "mic") {
         const cap: any = h.audio?.capture
+        const chosen = (settings.micSource || "").trim()
         toast(
           cap?.backend
-            ? `Microphone: ${cap.backend}${cap.rms != null ? ` (level ${Number(cap.rms).toFixed(3)})` : ""}`
+            ? `Microphone: ${cap.backend}${cap.rms != null ? ` (level ${Number(cap.rms).toFixed(3)})` : ""}` +
+              `${chosen ? ` · ${chosen}` : " · automatic"}`
             : "No working microphone found",
           cap?.backend ? "info" : "error",
         )
@@ -1050,6 +1072,94 @@ export function createVoiceController(context: any) {
       )
     } catch (e) {
       toast(errorText(e), "error")
+    }
+  }
+
+  /**
+   * Pick the microphone. The list comes from the daemon, so it shows every
+   * input the system can offer: PulseAudio sources (the Android phone mic
+   * over SLES, the Termux:API bridge), the Termux:API recorder, PortAudio
+   * inputs and ALSA capture devices.
+   */
+  async function openMicSettings(): Promise<void> {
+    if (!context.ui?.dialog?.select) {
+      await showVoiceInfo("mic")
+      return
+    }
+    const info = await daemonOrToast()
+    if (!info) return
+    let choices: MicChoice[] = []
+    try {
+      const devices = await api.devices(info)
+      choices = devices?.choices ?? []
+    } catch (e) {
+      toast(`Could not list the microphones: ${errorText(e)}`, "error")
+      return
+    }
+    if (!choices.length) {
+      toast("The daemon did not report any microphones", "warning")
+      return
+    }
+
+    for (;;) {
+      const current = (settings.micSource || "").trim()
+      const options: Array<{ title: string; value: string; description?: string }> = choices.map((c) => {
+        const active = c.id === current
+        const missing = c.available === false
+        return {
+          title: `${active ? "● " : ""}${c.label}`,
+          value: c.id,
+          description: [c.detail, missing ? "not available here" : "", active ? "active" : ""]
+            .filter(Boolean)
+            .join(" · "),
+        }
+      })
+      options.push({ title: "Test this microphone", value: "__test__", description: "Measure the input level for a second" })
+      options.push({ title: "Show microphone status", value: "__status__" })
+      options.push({ title: "Done", value: "done" })
+
+      const choice: string | undefined = await context.ui.dialog.select({
+        title: "Microphone",
+        placeholder: "Choose the microphone to record from",
+        options,
+        current: current || "__auto__",
+      })
+      if (choice === undefined || choice === "done") return
+
+      if (choice === "__test__") {
+        await testMicrophone(info, current)
+        continue
+      }
+      if (choice === "__status__") {
+        await showVoiceInfo("mic")
+        continue
+      }
+      await persist((draft) => {
+        draft.micSource = choice
+      })
+      const picked = choices.find((c) => c.id === choice)
+      toast(`Microphone: ${picked?.label ?? choice}`, "success")
+    }
+  }
+
+  /** Measure the level of the chosen microphone without recording a turn. */
+  async function testMicrophone(info: DaemonInfo, device: string): Promise<void> {
+    toast("Measuring the microphone…", "info")
+    try {
+      const res = (await api.probe(info, { device })) as { capture?: { backend?: string; rms?: number; reason?: string } }
+      const cap = res?.capture ?? {}
+      if (!cap.backend) {
+        toast(`No working microphone: ${cap.reason ?? "unknown reason"}`, "error")
+        return
+      }
+      const level = typeof cap.rms === "number" ? cap.rms : 0
+      toast(
+        `Microphone ${cap.backend}: level ${level.toFixed(4)}` +
+          (level > 0.01 ? " — it is hearing you" : " — nothing yet, speak and test again"),
+        level > 0.01 ? "success" : "warning",
+      )
+    } catch (e) {
+      toast(`Could not test the microphone: ${errorText(e)}`, "error")
     }
   }
 
@@ -1087,7 +1197,7 @@ export function createVoiceController(context: any) {
           {
             title: "Microphone",
             value: "mic",
-            description: "Automatic: direct phone mic on Android, default mic elsewhere",
+            description: micLabel(),
           },
           { title: "Transcription", value: "stt", description: sttLabel() },
           {
@@ -1156,7 +1266,9 @@ export function createVoiceController(context: any) {
         await openSttSettings()
       } else if (choice === "autosend") {
         await toggleAutoSend()
-      } else if (choice === "mic" || choice === "status") {
+      } else if (choice === "mic") {
+        await openMicSettings()
+      } else if (choice === "status") {
         await showVoiceInfo(choice)
       }
     }
@@ -1379,25 +1491,67 @@ export function createVoiceController(context: any) {
 
   /* --------------------------------------------------------------- submit text */
 
+  let hostVersion: string | null = null
+
+  /** The host version, so the prompt API is called in the right shape. */
+  async function hostVersionString(): Promise<string> {
+    if (hostVersion !== null) return hostVersion
+    try {
+      const info: any = await (context.client as any)?.server?.info?.()
+      hostVersion = String(info?.version ?? "")
+    } catch {
+      hostVersion = ""
+    }
+    return hostVersion
+  }
+
+  function atLeast(version: string, major: number, minor: number): boolean {
+    const parts = version.split(".").map((p) => Number(p) || 0)
+    const vMajor = parts[0] ?? 0
+    const vMinor = parts[1] ?? 0
+    if (vMajor !== major) return vMajor > major
+    return vMinor >= minor
+  }
+
+  /**
+   * Send the transcript as the user's message - the same thing pressing
+   * Enter in the prompt does.
+   *
+   * OpenCode 2.1 moved the prompt text into `text.text`; 2.0 took a plain
+   * string. Sending the wrong shape posts an empty message, which is why
+   * auto-send used to end up as a toast with the words instead of a message.
+   */
   async function submit(sessionID: string | undefined, text: string): Promise<boolean> {
     const client: any = context.client
-    if (sessionID) {
-      // The generated client has been seen in both flat and nested shapes;
-      // try the natural one first, then the explicit path/body form.
+    if (!sessionID || typeof client?.session?.prompt !== "function") {
+      // Last resort: leave the text where the user can use it.
+      toast(`Transcript (copy it into the prompt): ${text}`, "warning")
+      return false
+    }
+    const version = await hostVersionString()
+    const modern = version ? atLeast(version, 2, 1) : true
+    const shapes: Array<Record<string, unknown>> = modern
+      ? [{ sessionID, text: { text } }, { sessionID, id: { text } }]
+      : [{ sessionID, text }, { path: { sessionID }, body: { text } }]
+    const errors: string[] = []
+    for (const shape of shapes) {
       try {
-        await client.session.prompt({ sessionID, text })
-        return true
-      } catch {
-        /* fall through */
-      }
-      try {
-        await client.session.prompt({ path: { sessionID }, body: { text } })
+        const res = await client.session.prompt(shape)
+        const sent = typeof res?.payload?.text === "string" ? res.payload.text : undefined
+        if (sent !== undefined && sent.trim() !== text.trim()) {
+          errors.push("the host posted a different message")
+          continue
+        }
+        if (res === undefined || res === null) {
+          errors.push("the host returned nothing")
+          continue
+        }
         return true
       } catch (e) {
-        toast(`Could not send the transcript: ${errorText(e)}`, "error")
+        errors.push(errorText(e))
       }
     }
-    // Last resort: leave the text where the user can use it.
+    toast(`Could not send the transcript: ${errors[0] ?? "unknown error"}`, "error")
     toast(`Transcript (copy it into the prompt): ${text}`, "warning")
     return false
   }
@@ -1501,7 +1655,7 @@ export function createVoiceController(context: any) {
     try {
       const info = await daemonOrToast()
       if (!info) return
-      await api.pttStart(info, 30000, sttRequest())
+      await api.pttStart(info, 30000, sttRequest(), micRequest())
       toast("🎙 Listening… speak now")
 
       // Wait for the capture turn to end on its own (silence detection).

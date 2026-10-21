@@ -78,6 +78,7 @@ def record_utterance(
     threshold: float | None = None,
     min_speech_ms: int | None = None,
     stop_event: threading.Event | None = None,
+    device: str | None = None,
 ) -> Utterance:
     """
     Record until the speaker stops, a hard limit is hit, or stop_event is set.
@@ -112,7 +113,7 @@ def record_utterance(
         # push-to-talk turns.
         if cfg.IS_ANDROID:
             audio.prepare_sles()
-        cap = audio.take_capture(sr)
+        cap = audio.take_capture(sr, device)
         t0 = time.time()
         try:
             # -- wait for speech to begin ------------------------------------
@@ -180,13 +181,27 @@ def record_utterance(
 # Push-to-talk session
 # ----------------------------------------------------------------------------
 
+def _mic_device(body: dict) -> str:
+    """The microphone the client asked for, if any.
+
+    `{"mic": {"device": "pulse:jarvis_mic"}}` picks that input; an empty
+    value keeps the daemon's automatic choice.
+    """
+    mic = body.get("mic")
+    if not isinstance(mic, dict):
+        return ""
+    return str(mic.get("device") or "").strip()
+
+
 class PttSession:
     """One push-to-talk recording, owned by a background thread."""
 
-    def __init__(self, max_ms: int | None = None, stt_options: dict | None = None):
+    def __init__(self, max_ms: int | None = None, stt_options: dict | None = None,
+                 device: str | None = None):
         self.id = f"ptt-{int(time.time() * 1000)}"
         self.started_at = time.time()
         self.stt_options = stt_options if isinstance(stt_options, dict) else None
+        self.device = (device or "").strip()
         self.stop_event = threading.Event()
         self.state = "listening"      # listening -> transcribing -> done | error | cancelled
         self.result: dict | None = None
@@ -198,7 +213,7 @@ class PttSession:
 
     def _run(self, max_ms: int | None) -> None:
         try:
-            utt = record_utterance(max_ms=max_ms, stop_event=self.stop_event)
+            utt = record_utterance(max_ms=max_ms, stop_event=self.stop_event, device=self.device)
             if self._cancelled or utt.stats.get("reason") == "cancelled":
                 self.state = "cancelled"
                 self._done.set()
@@ -211,13 +226,16 @@ class PttSession:
                 return
             self.state = "transcribing"
             res = stt.transcribe(utt.pcm, utt.sr, options=self.stt_options)
-            if self._cancelled:
-                self.state = "cancelled"
-                self.result = None
-                return
             res["stats"] = utt.stats
             res["empty"] = not res.get("text")
             self.result = res
+            if self._cancelled:
+                # The turn was cancelled while it was transcribing, but the
+                # words are already here. Keep them: the client that is
+                # waiting for this turn must not end up with nothing.
+                self.state = "done"
+                self._done.set()
+                return
             self.state = "done"
         except Exception as e:
             if self._cancelled:
@@ -468,9 +486,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/ptt/start":
                 body = self._json_body()
                 stt_options = body.get("stt") if isinstance(body.get("stt"), dict) else None
+                device = _mic_device(body)
                 # Refuse a misconfigured cloud provider before opening the mic.
                 stt.validate_options(stt_options)
-                if _state["ptt"] and _state["ptt"].state in ("listening", "transcribing"):
+                if _state["ptt"] and _state["ptt"].state == "listening":
+                    # Only a recording is dropped. A turn that is already
+                    # transcribing keeps its transcript: the client waiting
+                    # for it would otherwise get an empty answer.
                     _state["ptt"].cancel()
                 # Block until the phone mic is ready. The UI only flips to
                 # "Listening..." after this response, so the stream is already
@@ -481,10 +503,11 @@ class Handler(BaseHTTPRequestHandler):
                 audio.drop_warm_capture()
                 if cfg.IS_ANDROID:
                     audio.prepare_sles()
-                audio.warm_capture(cfg.SAMPLE_RATE)
+                audio.warm_capture(cfg.SAMPLE_RATE, device)
                 _state["ptt"] = PttSession(
                     max_ms=body.get("max_ms") or body.get("maxMs"),
                     stt_options=stt_options,
+                    device=device,
                 )
                 _maybe_warm_stt(stt_options)
                 return self._send(200, {"ok": True, "ptt": _state["ptt"].snapshot()})
@@ -534,6 +557,7 @@ class Handler(BaseHTTPRequestHandler):
                     start_timeout_ms=body.get("start_timeout_ms"),
                     threshold=body.get("threshold"),
                     min_speech_ms=body.get("min_speech_ms"),
+                    device=_mic_device(body),
                 )
                 if utt.stats["audio_ms"] < 120 or not utt.pcm:
                     return self._send(200, {"ok": True, "text": "", "empty": True, "stats": utt.stats})
@@ -602,7 +626,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True})
 
             if path == "/probe":
-                cap = audio.probe_capture()
+                body = self._json_body()
+                cap = audio.probe_capture(device=_mic_device(body))
                 return self._send(200, {"ok": True, "capture": cap})
 
             if path == "/shutdown":
