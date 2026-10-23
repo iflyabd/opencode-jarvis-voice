@@ -72,6 +72,8 @@ type FakeVoice = {
   setMic: (state: string) => void
   setSpeech: (state: string) => void
   setLive: (state: boolean) => void
+  setAutoSpeak: (state: boolean) => void
+  setAutoSend: (state: boolean) => void
 }
 
 function fakeVoice(mic = "idle", speech = "idle", live = false): FakeVoice {
@@ -83,6 +85,8 @@ function fakeVoice(mic = "idle", speech = "idle", live = false): FakeVoice {
   const [micState, setMicState] = createSignal(mic)
   const [speechState, setSpeechState] = createSignal(speech)
   const [liveState, setLiveState] = createSignal(live)
+  const [autoSpeakState, setAutoSpeakState] = createSignal(true)
+  const [autoSendState, setAutoSendState] = createSignal(false)
   const repaints = new Set<() => void>()
   const repaint = () => {
     for (const fn of repaints) fn()
@@ -98,7 +102,8 @@ function fakeVoice(mic = "idle", speech = "idle", live = false): FakeVoice {
     removeRepaint: (fn: () => void) => {
       repaints.delete(fn)
     },
-    autoSpeak: () => true,
+    autoSpeak: autoSpeakState,
+    autoSend: autoSendState,
     live: liveState,
     toggleLive: async (sid?: string) => {
       calls.push(`toggleLive:${sid ?? "-"}`)
@@ -113,7 +118,16 @@ function fakeVoice(mic = "idle", speech = "idle", live = false): FakeVoice {
     },
     cancel: async () => {},
     status: async () => {},
-    toggleAutoSpeak: () => {},
+    toggleAutoSpeak: () => {
+      calls.push("toggleAutoSpeak")
+      setAutoSpeakState((value) => !value)
+      repaint()
+    },
+    toggleAutoSend: async () => {
+      calls.push("toggleAutoSend")
+      setAutoSendState((value) => !value)
+      repaint()
+    },
     refreshSpeech: async () => {},
     dispose: () => {},
   }
@@ -130,6 +144,14 @@ function fakeVoice(mic = "idle", speech = "idle", live = false): FakeVoice {
     },
     setLive: (state: boolean) => {
       setLiveState(() => state)
+      repaint()
+    },
+    setAutoSpeak: (state: boolean) => {
+      setAutoSpeakState(() => state)
+      repaint()
+    },
+    setAutoSend: (state: boolean) => {
+      setAutoSendState(() => state)
       repaint()
     },
   }
@@ -191,7 +213,42 @@ async function mount(render: () => unknown, width = 40, height = 3) {
 {
   const f = fakeVoice()
   const s = await mount(() => ComposerLiveButton({ context: { theme }, voice: f.voice, sessionID: "ses_xyz" }), 40, 3)
-  check("live button renders the idle label", s.captureCharFrame().includes("live"), JSON.stringify(s.captureCharFrame()))
+  const firstFrame = s.captureCharFrame()
+  check("the composer toolbar renders read", firstFrame.includes("read"), JSON.stringify(firstFrame))
+  check("the composer toolbar renders send", firstFrame.includes("send"), JSON.stringify(firstFrame))
+  check("the composer toolbar renders the master play control", firstFrame.includes("▶ play"), JSON.stringify(firstFrame))
+  check("live button renders the idle label", firstFrame.includes("live"), JSON.stringify(firstFrame))
+
+  const line = firstFrame.split("\n")[0] ?? ""
+  const clickWord = async (word: string) => {
+    const at = line.indexOf(word)
+    check(`the ${word} control has a clickable position`, at >= 0, `line=${JSON.stringify(line)}`)
+    if (at < 0) return
+    await s.mockMouse.click(at, 0)
+    await s.renderOnce()
+  }
+
+  await clickWord("read")
+  check("read click toggles auto-read", f.calls.includes("toggleAutoSpeak"), f.calls.join(","))
+  check("auto-read turns off in place", s.captureCharFrame().includes("○ read"), JSON.stringify(s.captureCharFrame()))
+  f.setAutoSpeak(true)
+  await s.renderOnce()
+  check("auto-read turns back on in place", s.captureCharFrame().includes("◉ read"), JSON.stringify(s.captureCharFrame()))
+
+  await clickWord("send")
+  check("send click toggles auto-send", f.calls.includes("toggleAutoSend"), f.calls.join(","))
+  check("auto-send turns on in place", s.captureCharFrame().includes("◆ send"), JSON.stringify(s.captureCharFrame()))
+
+  await clickWord("▶")
+  check("master play calls pause/resume for the session", f.calls.includes("pauseResume:ses_xyz"), f.calls.join(","))
+  f.setSpeech("playing")
+  await s.renderOnce()
+  check("master control shows pause while the reader is speaking", s.captureCharFrame().includes("⏸ pause"), JSON.stringify(s.captureCharFrame()))
+  f.setSpeech("paused")
+  await s.renderOnce()
+  check("master control shows play while the reader is paused", s.captureCharFrame().includes("▶ play"), JSON.stringify(s.captureCharFrame()))
+  f.setSpeech("idle")
+
   await s.mockMouse.click(36, 0)
   await s.renderOnce()
   check("live click calls toggleLive with the slot's session", f.calls.includes("toggleLive:ses_xyz"), f.calls.join(","))
@@ -199,7 +256,7 @@ async function mount(render: () => unknown, width = 40, height = 3) {
   // The label follows the live state, live.
   f.setLive(true)
   await s.renderOnce()
-  check("live label updates when the conversation starts", s.captureCharFrame().includes("live"), JSON.stringify(s.captureCharFrame()))
+  check("live label updates when the conversation starts", s.captureCharFrame().includes("● live"), JSON.stringify(s.captureCharFrame()))
   s.renderer.destroy()
 }
 
@@ -258,6 +315,45 @@ async function mount(render: () => unknown, width = 40, height = 3) {
   check("long reply is read in full", long.length > 600 && long.endsWith("real words."), `len=${long.length}`)
   check("an explicit speech limit still clips", speakable(longText, 600).length <= 601)
   check("markdown fences are not read", !speakable("Hi ```code here``` bye").includes("code here"))
+
+  const { naturalTitle, titleAnnouncement } = await import("../controller.ts")
+  check(
+    "a plain title becomes a natural subject",
+    titleAnnouncement("Weather in Berlin") === "About weather in Berlin.",
+    JSON.stringify(titleAnnouncement("Weather in Berlin")),
+  )
+  check(
+    "a path title names the thing, not the path",
+    titleAnnouncement("/root/jarvis-voice/plugin/controller.ts") === "About the controller file.",
+    JSON.stringify(titleAnnouncement("/root/jarvis-voice/plugin/controller.ts")),
+  )
+  check(
+    "a path title with an instruction stays natural",
+    titleAnnouncement("Fix /root/jarvis-voice/plugin/controller.ts") === "About fixing the controller file.",
+    JSON.stringify(titleAnnouncement("Fix /root/jarvis-voice/plugin/controller.ts")),
+  )
+  check(
+    "a question title is introduced as a question",
+    titleAnnouncement("Why is the audio cutting out?") === "On the question: why is the audio cutting out.",
+    JSON.stringify(titleAnnouncement("Why is the audio cutting out?")),
+  )
+  check("a hash-only title is skipped", naturalTitle("3f2a9c1b") === "", JSON.stringify(naturalTitle("3f2a9c1b")))
+  check("a generic new-session title is skipped", naturalTitle("New session") === "", JSON.stringify(naturalTitle("New session")))
+  check(
+    "a long path is replaced by the file name",
+    speakable("Open /root/jarvis-voice/plugin/controller.ts.") === "Open the controller file.",
+    JSON.stringify(speakable("Open /root/jarvis-voice/plugin/controller.ts.")),
+  )
+  check(
+    "a link is not read as a URL",
+    speakable("See https://example.com/docs.") === "See the link.",
+    JSON.stringify(speakable("See https://example.com/docs.")),
+  )
+  check(
+    "a commit hash is not spelled out",
+    speakable("Commit a193906 fixed it.") === "Commit that fixed it.",
+    JSON.stringify(speakable("Commit a193906 fixed it.")),
+  )
 
   const { speechCut } = await import("../controller.ts")
   check(

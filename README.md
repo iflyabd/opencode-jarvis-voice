@@ -9,10 +9,11 @@ Press one key, talk, pause, and your words land in the prompt. The reply is
 spoken back in a JARVIS-style voice while it types.
 
 Mouse controls do the same: a **🎙 mic** at the bottom-right of the prompt box,
-and a **🔊 read / ⏸ pause / ▶ resume** control under every answer, plus a
-**◉ live** toggle above the text box for a hands-free voice conversation that
-behaves like a phone call - a 450 ms pause ends your turn, the words appear as
-you speak, and the answer starts playing while it is still being written.
+a **🔊 read / ⏸ pause / ▶ resume** control under every answer, and a compact
+toolbar above the text box with **read**, **send**, **play/pause**, and
+**◉ live** for a hands-free voice conversation that behaves like a phone call -
+a 450 ms pause ends your turn, the words appear as you speak, and the answer
+starts playing while it is still being written.
 
 It is built to keep a phone cold: the daemon starts **only when you use voice**,
 warms the model **while you speak** (never at boot), and **exits when idle**, so
@@ -193,8 +194,13 @@ the review step off with **Voice: toggle auto-send**.
 With **speaking replies** on (the default), every new answer of the session
 you are working in is read out loud:
 
-- the **session name comes first**, so you know which conversation the answer
-  belongs to: *"Weather in Berlin. It is sunny in Berlin today."*
+- the **session subject comes first**, so you know which conversation the
+  answer belongs to: *"About weather in Berlin. It is sunny in Berlin today."*
+  A question becomes *"On the question: why is the audio cutting out."*
+- titles that are really a path, a file name, a hash or a pile of symbols are
+  turned into something worth hearing: *"About the controller file."* instead
+  of reading `/root/jarvis-voice/plugin/controller.ts`. A hash-only or
+  generic *"New session"* title is skipped instead of read.
 - answers are read **one at a time**. A new answer waits for the one being
   read instead of cutting it off, so two voices never talk over each other and
   the order is kept.
@@ -223,13 +229,21 @@ Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 |---|---|---|
 | `🎙 mic` / `● listening` / `◌ transcribing` | bottom-right of the text box | start listening; click again to stop |
 | `🔊 read` / `⏸ pause` / `▶ resume` | directly under each assistant answer | read **that answer**; click again to pause it, again to resume |
-| `◉ live` / `● live` | top-right of the text box | switch the live voice conversation on or off |
+| `○ read` / `◉ read` | left side of the toolbar above the text box | turn auto-read on or off |
+| `◇ send` / `◆ send` | left side of the toolbar | turn auto-send on or off |
+| `▶ play` / `⏸ pause` | middle of the toolbar | master play/pause: read the newest answer when idle, pause or resume the actual reader when it is speaking |
+| `◉ live` / `● live` | right end of the toolbar | switch the live voice conversation on or off |
 
-The mic sits at the **bottom** of the text box and the live toggle **above**
-it, both on the **right edge of the same box** - the same arrangement in a
-session and on the home screen where a new chat starts. (The host's composer
-slot is narrower than the text box, so the plugin measures the box and the
-mic button and lines the toggle up with it.)
+The mic sits at the **bottom** of the text box and the toolbar **above** it,
+both on the **right edge of the same box** - the same arrangement in a session
+and on the home screen where a new chat starts. (The host's composer slot is
+narrower than the text box, so the plugin measures the box and the mic button
+and lines the toolbar up with it.)
+
+The read and send switches are green when on and muted when off. The master
+play/pause is not a separate player: it reads the daemon's speech state, so it
+shows `⏸ pause` while audio is really playing, `▶ play` while paused or idle,
+and its click goes through the same pause/resume path as `ctrl+alt+p`.
 
 All are theme-aware (colours come from the active theme's action and feedback
 tokens, with hover states) and drive the same state as the keybindings — a
@@ -255,8 +269,8 @@ stops the current one and moves the pause label with it.
 
 Reading rules:
 
-* a per-answer button reads only that answer; the composer button reads the
-  newest answer;
+* a per-answer button reads only that answer; the toolbar's `▶ play` reads the
+  newest answer when the reader is idle;
 * `reasoning` parts (the grayed-out thinking text) are never spoken;
 * when a turn has several text parts (narration between tool calls, then the
   answer), only the **last** one is read;
@@ -265,9 +279,10 @@ Reading rules:
 
 ### Live voice conversation
 
-The `◉ live` button at the top-right of the text box switches a hands-free
-conversation on. It sits in the same place in a session and on the home
-screen, where a new chat starts. It is meant to feel like a phone call, not
+The `◉ live` button at the right end of the toolbar above the text box
+switches a hands-free conversation on. It sits in the same place in a session
+and on the home screen, where a new chat starts. It is meant to feel like a
+phone call, not
 like a walkie-talkie:
 
 1. **The microphone keeps listening.** A pause of only **450 ms** ends your
@@ -341,7 +356,7 @@ shown in a toast so it can be copied by hand.
 | `Voice: cancel listening / stop speaking` | shut it up immediately |
 | `Voice: speak the last reply` | read the current answer out loud |
 | `Voice: live voice conversation (listen, send, read back)` | switch the live conversation on or off |
-| `Voice: toggle speaking replies` | read every new answer out loud, session name first (on/off, remembered) |
+| `Voice: toggle speaking replies` | read every new answer out loud, natural subject first (on/off, remembered) |
 | `Voice: toggle auto-send (transcript goes to the prompt box)` | hands-free mode on/off: send the transcript straight away, or drop it in the prompt box for review |
 
 ### Optional Fish Audio voices
@@ -402,17 +417,23 @@ start quickly:
 - **The request returns at once.** The rendering and the playback happen in
   the background, so the UI shows "playing" immediately instead of waiting
   for the whole clip.
-- **The reply is rendered in chunks** (sentences, about 220 characters each).
-  The first chunk starts playing as soon as it is ready, and the rest follow
-  in order, so the time to the first sound is a fraction of the time to
-  render the whole reply. Sentences always keep their order, including very
-  long ones that have to be split across chunks. The first chunk is asked for
-  with Fish's fastest latency mode.
+- **The reply is rendered in chunks** (sentences, about 220 characters each;
+  the first is about 120, so the voice starts sooner). The first chunk starts
+  playing as soon as it is ready, and the rest follow in order, so the time to
+  the first sound is a fraction of the time to render the whole reply.
+  Sentences always keep their order, including very long ones that have to be
+  split across chunks. The first chunk is asked for with Fish's fastest
+  latency mode.
+- **One player for the whole reply.** All rendered chunks are written into a
+  single continuous `ffplay` stream. The old reader opened a new player for
+  every chunk; the device-open gap between those players was audible as a
+  pause, a click, or a repeated syllable. One stream removes that handoff.
 - **The chunks run into each other.** Up to two chunks are rendered *while*
   the current one is playing, and the silence at the end of every clip is
   trimmed, so the reply does not pause between the paragraphs. The silence is
   trimmed once when the clip is rendered, never while a cached clip is
-  playing.
+  playing. A live answer that arrives sentence by sentence is batched for a
+  moment and then read as one stream, not one player per sentence.
 - **A failed chunk does not end the reply.** Fish requests are retried three
   times; if Fish stays unreachable, the rest of the answer continues with the
   local voice instead of stopping mid-sentence.
@@ -424,11 +445,18 @@ start quickly:
   audio hardware.
 - **Interrupting stops the whole read.** A new *read* request invalidates the
   reader, so the next paragraph cannot start over the newly requested voice.
+- **Closing OpenCode stops the voice.** Every speech request carries the TUI's
+  process id. If that process disappears (Ctrl+C, closing the window, a
+  crash), the daemon stops the current render and playback and releases the
+  microphone. Players also ask Linux to terminate them when the daemon dies,
+  so a daemon crash cannot leave an orphaned voice talking to an empty room.
 - **Every chunk is cached**, so reading the same reply again is instant.
 
 Set `JARVIS_VOICE_FISH_CHUNK_CHARS` to change the chunk size (a smaller chunk
-starts sooner), and `JARVIS_VOICE_FISH_LATENCY` to change the quality/latency
-balance of the rest (`low`, `balanced` or `normal`).
+starts sooner), `JARVIS_VOICE_FISH_FIRST_CHUNK_CHARS` for the first chunk, and
+`JARVIS_VOICE_FISH_LATENCY` to change the quality/latency balance of the rest
+(`low`, `balanced` or `normal`). Set `JARVIS_VOICE_QUEUE_COALESCE_S=0` to
+start live sentences immediately instead of batching them.
 
 **One voice at a time.** Pressing *read* on another answer while something is
 playing cuts the current voice first and starts the new one - two voices never
@@ -598,6 +626,9 @@ Everything is an environment variable, read at daemon start:
 | `JARVIS_VOICE_FISH_MODEL` | `s2.1-pro-free` | Fish TTS model header |
 | `JARVIS_VOICE_FISH_LATENCY` | `balanced` | `balanced`, `normal`, or `low` |
 | `JARVIS_VOICE_FISH_CHUNK_CHARS` | `220` | characters per rendered chunk; smaller starts the voice sooner |
+| `JARVIS_VOICE_FISH_FIRST_CHUNK_CHARS` | `120` | size of the first chunk; smaller starts the voice sooner |
+| `JARVIS_VOICE_QUEUE_COALESCE_S` | `0.35` | how long a live reply waits for the next sentence before it starts |
+| `JARVIS_VOICE_QUEUE_MAX_CHARS` | `4000` | largest live batch joined into one continuous stream |
 | `JARVIS_VOICE_FISH_ASR_MODEL` | `transcribe-1-pro` | Fish ASR model header (`transcribe-1-pro` or `transcribe-1`) |
 | `JARVIS_VOICE_FISH_ASR_URL` | `https://api.fish.audio/v1/asr` | override for testing a proxy or mock |
 | `JARVIS_VOICE_FISH_ASR_TIMEOUT` | `60` | seconds to wait for a Fish ASR response |
@@ -675,8 +706,8 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
 | Option | Default | Meaning |
 |---|---|---|
 | `mic` | `true` | show the 🎙 mic button in the prompt footer |
-| `speak` | `true` | show the ◉ live button above the text box |
-| `autoSpeak` | `true` | read every new answer out loud, starting with the session name |
+| `speak` | `true` | show the read/send/play/live toolbar above the text box |
+| `autoSpeak` | `true` | read every new answer out loud, starting with a natural session subject |
 | `autoSend` | `false` | send the transcript to the agent as soon as it is transcribed; off means it lands in the prompt box for review |
 | `fishAudio` | — | optional `{ provider, apiKey, voiceId, voiceName, model, sttProvider, sttModel, sttLanguage }`; the settings dialog is safer for keys |
 | `micSource` | — | the microphone to record from, e.g. `pulse:jarvis_mic`; the settings dialog is easier |

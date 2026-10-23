@@ -7,6 +7,7 @@ No audio and no network: the capture and the transcription are stubbed.
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -71,6 +72,39 @@ check("a turn cancelled while transcribing keeps its words",
 check("a cancelled turn is not left hanging", out.get("state") in ("done", "cancelled"), str(out.get("state")))
 
 
+# --------------------------------------------------------- client liveness
+
+check("a live process is alive", jv_server._pid_alive(os.getpid()))
+check("a missing process is gone", not jv_server._pid_alive(999999))
+check("the client pid is read", jv_server._client_pid({"client_pid": 424242}) == 424242)
+check("a camelCase client pid is read", jv_server._client_pid({"clientPid": 424242}) == 424242)
+check("a missing client pid is ignored", jv_server._client_pid({}) == 0)
+check("the daemon never watches itself", jv_server._client_pid({"client_pid": os.getpid()}) == 0)
+
+
+def _client_stop_check() -> None:
+    calls: list[str] = []
+    real_tts_stop = jv_server.tts.stop_speaking
+    real_audio_stop = jv_server.audio.stop_playback
+    jv_server.tts.stop_speaking = lambda: calls.append("tts")
+    jv_server.audio.stop_playback = lambda: calls.append("audio")
+    jv_server._state["speech"] = {"text": "hi", "backend": "fish",
+                                  "started_at": time.time(), "client_pid": os.getpid()}
+    try:
+        jv_server._stop_for_client(os.getpid())
+        check("a dead client stops the voice and the microphone",
+              calls == ["tts", "audio"] and not jv_server._state["speech"].get("client_pid"),
+              f"calls={calls} speech={jv_server._state['speech']}")
+    finally:
+        jv_server.tts.stop_speaking = real_tts_stop
+        jv_server.audio.stop_playback = real_audio_stop
+        jv_server._state["speech"] = {"text": "", "backend": None,
+                                      "started_at": 0.0, "client_pid": 0}
+
+
+_client_stop_check()
+
+
 # ------------------------------------------------------------------ devices
 
 check("a missing mic object means automatic", jv_server._mic_device({}) == "")
@@ -115,6 +149,17 @@ class _FakeAudio:
     def play_wav(self, path, timeout=120) -> dict:
         self.events.append(f"play:{Path(path).stem}")
         return {"backend": "fake", "ok": True}
+
+    # This fake has no continuous player: the reader must fall back to the
+    # per-clip path, which is what these checks observe.
+    def stream_backend(self):
+        return None
+
+    def open_pcm_stream(self, sample_rate=44100):
+        raise jv_audio.AudioError("fake audio has no stream")
+
+    def decode_pcm(self, path, sample_rate=44100):
+        raise jv_audio.AudioError("fake audio has no decoder")
 
 
 def _stub_synthesize(events: list[str], delay: float = 0.05):
@@ -205,8 +250,12 @@ def _pipeline_checks() -> None:
 
     real_synth = jv_tts.synthesize
     real_play = jv_tts.audio.play_wav
+    real_stream = jv_tts.audio.stream_backend
     jv_tts.synthesize = fake_synth
     jv_tts.audio.play_wav = fake_play
+    # These checks cover the per-clip fallback; the continuous path has its
+    # own check below.
+    jv_tts.audio.stream_backend = lambda: None
     try:
         text = ". ".join(f"Sentence number {i} is long enough to need its own chunk" for i in range(6)) + "."
         jv_tts.speak(text, backend="fish", wait=True, fish={"apiKey": "k", "voiceId": "v"})
@@ -222,9 +271,114 @@ def _pipeline_checks() -> None:
     finally:
         jv_tts.synthesize = real_synth
         jv_tts.audio.play_wav = real_play
+        jv_tts.audio.stream_backend = real_stream
 
 
 _pipeline_checks()
+
+
+# --------------------------------------------------------- continuous reader
+
+def _stream_checks() -> None:
+    """A whole reply must go through one player, not one player per chunk."""
+    class FakeStream:
+        sample_rate = jv_audio.STREAM_RATE
+
+        def __init__(self) -> None:
+            self.writes: list[bytes] = []
+            self.closed = 0
+            self.terminated = 0
+
+        def write(self, pcm: bytes) -> None:
+            self.writes.append(pcm)
+
+        def close(self, wait: bool = True) -> int:
+            self.closed += 1
+            return 0
+
+        def terminate(self) -> None:
+            self.terminated += 1
+
+    stream = FakeStream()
+    renders: list[str] = []
+    real = (jv_tts.audio.stream_backend, jv_tts.audio.open_pcm_stream,
+            jv_tts.audio.decode_pcm, jv_tts.audio.play_wav, jv_tts.synthesize)
+
+    def fake_synth(text: str, backend=None, use_cache=True, fish=None):
+        renders.append(text)
+        out = Path(f"/tmp/opencode/jv-stream-{len(renders)}.wav")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(b"RIFF")                 # decode is stubbed below
+        return {"path": str(out), "backend": backend or "fish", "cached": False, "ms": 1}
+
+    def fake_decode(path, sample_rate=44100):
+        return b"\x00\x00" * (sample_rate // 10)  # 0.1 s of silence
+
+    def no_per_clip(*_a, **_k):
+        raise AssertionError("the reader fell back to one player per chunk")
+
+    jv_tts.audio.stream_backend = lambda: "ffplay"
+    jv_tts.audio.open_pcm_stream = lambda sample_rate=44100: stream
+    jv_tts.audio.decode_pcm = fake_decode
+    jv_tts.audio.play_wav = no_per_clip
+    jv_tts.synthesize = fake_synth
+    try:
+        text = "First sentence. " + " ".join(
+            f"Sentence number {i} is here." for i in range(20))
+        expected = jv_tts._split_for_speech(text, first_chars=jv_tts.cfg.FISH_FIRST_CHUNK_CHARS)
+        jv_tts.speak(text, backend="fish", wait=True, fish={"apiKey": "k", "voiceId": "v"})
+        check("a whole reply opens one continuous player",
+              stream.closed == 1 and stream.terminated == 0,
+              f"closed={stream.closed} terminated={stream.terminated}")
+        check("every rendered chunk is written to that stream",
+              len(stream.writes) == len(renders) == len(expected) and len(renders) >= 3,
+              f"writes={len(stream.writes)} renders={len(renders)} chunks={len(expected)}")
+        check("the continuous stream keeps the reply in order",
+              renders == expected, str(renders)[:160])
+    finally:
+        (jv_tts.audio.stream_backend, jv_tts.audio.open_pcm_stream,
+         jv_tts.audio.decode_pcm, jv_tts.audio.play_wav, jv_tts.synthesize) = real
+
+
+_stream_checks()
+
+
+def _partial_write_checks() -> None:
+    """A pipe may accept fewer bytes than it was given; never drop the rest."""
+    class PartialPipe:
+        def __init__(self) -> None:
+            self.data = bytearray()
+            self.calls = 0
+
+        def write(self, data) -> int:
+            self.calls += 1
+            chunk = bytes(data)[:3]
+            self.data.extend(chunk)
+            return len(chunk)
+
+        def flush(self) -> None:
+            pass
+
+    class Proc:
+        def __init__(self) -> None:
+            self.stdin = PartialPipe()
+
+        def poll(self):
+            return None
+
+    stream = object.__new__(jv_audio.PcmStream)
+    stream._proc = Proc()
+    stream._closed = False
+    stream._bytes = 0
+    stream._err = []
+    stream.write(b"abcdefgh")
+    check("a partial pipe write is completed",
+          bytes(stream._proc.stdin.data) == b"abcdefgh" and stream._proc.stdin.calls == 3,
+          f"data={bytes(stream._proc.stdin.data)!r} calls={stream._proc.stdin.calls}")
+    check("a partial pipe write counts every byte", stream._bytes == 8, str(stream._bytes))
+
+
+_partial_write_checks()
 
 
 # ---------------------------------------------------------- the chosen device
@@ -499,10 +653,13 @@ def _queue_checks() -> None:
         events.clear()
         jv_tts.speak("alpha sentence", backend="fish", append=True, fish=fish)
         jv_tts.speak("beta sentence", backend="fish", append=True, fish=fish)
-        time.sleep(0.8)
+        time.sleep(0.9)
+        spoken = [text for kind, text in events if kind == "synth"]
         played = [e[1] for e in events if e[0] == "play"]
         check("a streamed answer is read in order",
-              played == ["jv-q-alpha_sentence", "jv-q-beta_sentence"], str(played))
+              len(spoken) == 1 and spoken[0].find("alpha") < spoken[0].find("beta"),
+              str(spoken))
+        check("sentences that arrive together share one player", len(played) == 1, str(played))
 
         # A queued sentence must not cut the voice that is already talking.
         def slow_play(path, timeout=120):
@@ -559,6 +716,12 @@ def _reader_checks() -> None:
     """The reader must cut a clip once, never restart it, and never go mute."""
     import struct
     import wave
+
+    # These checks are about the per-clip fallback; the continuous stream has
+    # its own check above. Keeping them on the fallback also keeps the tests
+    # from touching the sound card.
+    real_stream_backend = jv_tts.audio.stream_backend
+    jv_tts.audio.stream_backend = lambda: None
 
     clip = Path("/tmp/opencode/jv-reader-check.wav")
     clip.parent.mkdir(parents=True, exist_ok=True)
@@ -626,6 +789,16 @@ def _reader_checks() -> None:
             hint.unlink()
         except OSError:
             pass
+
+    # A reply that opens with one very long sentence must still get a short
+    # first chunk: the cap has to split that sentence, not accept a full-size
+    # unit just because it is the first one.
+    long_first = ("word " * 60).strip() + "."
+    parts = jv_tts._split_for_speech(long_first)
+    check("a long first sentence still gets a short first chunk",
+          len(parts[0]) <= jv_tts.cfg.FISH_FIRST_CHUNK_CHARS
+          and " ".join(parts) == long_first,
+          f"first={len(parts[0])} chunks={len(parts)}")
 
     # 4. A transient Fish failure is retried, and every chunk still plays.
     real_synth = jv_tts.synthesize
@@ -760,6 +933,7 @@ def _reader_checks() -> None:
     finally:
         jv_tts._SYNTH.pop("trimtest", None)
         jv_tts.synthesize = real_synth
+        jv_tts.audio.stream_backend = real_stream_backend
 
 
 _reader_checks()

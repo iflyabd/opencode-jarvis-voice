@@ -1,8 +1,9 @@
 /**
- * Jarvis Voice - the two on-screen buttons.
+ * Jarvis Voice - the on-screen controls.
  *
- *   MicButton    appended to `prompt.footer`         (bottom-right of the prompt box)
- *   SpeakButton  appended to `session.composer.top`  (top-right, above the text box)
+ *   MicButton     appended to `prompt.footer`         (bottom-right of the prompt box)
+ *   ComposerLive  appended to `session.composer.top`  (toolbar above the text box:
+ *                 read, send, master play/pause, and live)
  *
  * Plugin files are compiled outside the host's own JSX build, and the host
  * renderer only processes reactive text updates during its own repaint passes:
@@ -173,8 +174,112 @@ function liveLabel(props: ButtonProps) {
   }
 }
 
+type ToolbarButtonOptions = {
+  label: () => string
+  fg: (hovered: boolean) => string
+  click: () => void
+}
+
+/** One compact control in the row above the prompt box. */
+function toolbarButton(voice: VoiceController, options: ToolbarButtonOptions): any {
+  let hovered = false
+  const { node: text, paint } = liveText(voice, {
+    fg: () => options.fg(hovered),
+    label: options.label,
+  })
+
+  const box: any = createElement("box")
+  box.flexShrink = 0
+  box.paddingLeft = 1
+  box.onMouseOver = () => {
+    hovered = true
+    paint()
+  }
+  box.onMouseOut = () => {
+    hovered = false
+    paint()
+  }
+  box.onMouseUp = (event: any) => {
+    event?.preventDefault?.()
+    event?.stopPropagation?.()
+    if (event?.button === RIGHT_MOUSE_BUTTON) return
+    options.click()
+  }
+  box.add(text)
+  return box
+}
+
 /**
- * The mic button's box, so the live toggle can be lined up with it.
+ * The row above the prompt box:
+ *
+ *   read  send  play/pause  live
+ *
+ * Read and send are the two hands-free switches; the middle control is the
+ * master play/pause for whatever the reader is speaking right now (and reads
+ * the last answer when the speaker is idle). Live stays on the right edge, so
+ * the row lines up with the mic button below it.
+ */
+function createToolbar(props: ButtonProps): any {
+  const row: any = createElement("box")
+  row.flexShrink = 0
+  row.flexDirection = "row"
+  row.alignItems = "center"
+
+  const theme = () => props.context?.theme
+  const secondary = (hovered: boolean) => {
+    const token = theme()?.text?.action?.secondary ?? {}
+    return hovered ? (token.hovered ?? token.base) : token.base
+  }
+  const active = () => theme()?.text?.feedback?.success?.base ?? theme()?.text?.feedback?.info?.base ?? secondary(false)
+  const paused = () => theme()?.text?.feedback?.warning?.base ?? secondary(false)
+
+  row.add(
+    toolbarButton(props.voice, {
+      label: () => (props.voice.autoSpeak?.() ? "◉ read" : "○ read"),
+      fg: (hovered) => (props.voice.autoSpeak?.() ? active() : secondary(hovered)),
+      click: () => props.voice.toggleAutoSpeak(),
+    }),
+  )
+  row.add(
+    toolbarButton(props.voice, {
+      label: () => (props.voice.autoSend?.() ? "◆ send" : "◇ send"),
+      fg: (hovered) => (props.voice.autoSend?.() ? active() : secondary(hovered)),
+      click: () => void props.voice.toggleAutoSend(),
+    }),
+  )
+  row.add(
+    toolbarButton(props.voice, {
+      label: () => (props.voice.speech?.() === "playing" ? "⏸ pause" : "▶ play"),
+      fg: (hovered) => {
+        const state = props.voice.speech?.() ?? "idle"
+        return state === "playing" || state === "paused" ? paused() : secondary(hovered)
+      },
+      click: () => void props.voice.pauseResume(props.sessionID),
+    }),
+  )
+
+  // The live toggle is the rightmost control, so the whole toolbar keeps the
+  // same right edge as the mic button.
+  const live = liveLabel(props)
+  const liveBox: any = createElement("box")
+  liveBox.flexShrink = 0
+  liveBox.paddingLeft = 1
+  liveBox.onMouseOver = () => live.hover(true)
+  liveBox.onMouseOut = () => live.hover(false)
+  liveBox.onMouseUp = (event: any) => {
+    event?.preventDefault?.()
+    event?.stopPropagation?.()
+    if (event?.button === RIGHT_MOUSE_BUTTON) return
+    void props.voice.toggleLive(props.sessionID)
+  }
+  liveBox.add(live.text)
+  row.add(liveBox)
+
+  return row
+}
+
+/**
+ * The mic button's box, so the toolbar can be lined up with it.
  * The box is used rather than the text node, because a wide glyph (the
  * microphone emoji) is drawn two columns wide but measured as one.
  */
@@ -213,8 +318,6 @@ function promptBox(editor: any, mic: any): any {
  * the right edge.
  */
 export function PromptFooterLive(props: ButtonProps) {
-  const live = liveLabel(props)
-
   // OpenTUI only honours `position` when it is set after the element exists.
   const wrapper: any = createElement("box")
   wrapper.position = "relative"
@@ -229,21 +332,10 @@ export function PromptFooterLive(props: ButtonProps) {
   anchor.zIndex = 2000
   anchor.flexShrink = 0
 
-  const label: any = createElement("box")
-  label.flexShrink = 0
-  label.onMouseOver = () => live.hover(true)
-  label.onMouseOut = () => live.hover(false)
-  label.onMouseUp = (event: any) => {
-    event?.preventDefault?.()
-    event?.stopPropagation?.()
-    if (event?.button === RIGHT_MOUSE_BUTTON) return
-    void props.voice.toggleLive(props.sessionID)
-  }
-  label.add(live.text)
-  anchor.add(label)
+  anchor.add(createToolbar(props))
   wrapper.add(anchor)
 
-  // Keep the toggle on the row above the text box, on the mic's right edge.
+  // Keep the toolbar on the row above the text box, on the mic's right edge.
   const sync = () => {
     wrapper.position = "relative"
     const editor = props.voice.editor?.()
@@ -284,27 +376,14 @@ export function PromptFooterLive(props: ButtonProps) {
  * button can never be swallowed by a narrow slot.
  */
 export function ComposerLiveButton(props: ButtonProps) {
-  const live = liveLabel(props)
-
   const root: any = createElement("box")
   root.flexShrink = 0
   root.flexDirection = "row"
   root.justifyContent = "flex-end"
 
-  const label: any = createElement("box")
-  label.flexShrink = 0
-  label.onMouseOver = () => live.hover(true)
-  label.onMouseOut = () => live.hover(false)
-  label.onMouseUp = (event: any) => {
-    event?.preventDefault?.()
-    event?.stopPropagation?.()
-    if (event?.button === RIGHT_MOUSE_BUTTON) return
-    void props.voice.toggleLive(props.sessionID)
-  }
-  label.add(live.text)
-  root.add(label)
+  root.add(createToolbar(props))
 
-  // Reach the mic button's right edge, so both buttons line up.
+  // Reach the mic button's right edge, so the whole toolbar lines up.
   const sync = () => {
     const mic = micBox
     const right = mic ? mic.x + mic.width : null

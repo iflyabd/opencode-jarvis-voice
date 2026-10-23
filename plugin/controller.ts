@@ -67,7 +67,7 @@ const FISH_STT_MODEL = "transcribe-1-pro"
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.8.2"
+export const PLUGIN_VERSION = "1.9.0"
 
 /**
  * How long a pause ends a live turn.
@@ -316,10 +316,344 @@ export function insertIntoEditor(editor: any, text: string): boolean {
   }
 }
 
+const CODE_EXTENSIONS = new Set([
+  "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rb", "go", "rs", "java", "kt", "kts",
+  "c", "h", "cc", "cpp", "hpp", "cs", "php", "swift", "scala", "sh", "bash", "zsh",
+  "fish", "ps1", "lua", "pl", "r", "dart", "ex", "exs", "erl", "clj", "cljs", "elm",
+  "vue", "svelte", "astro", "sql", "wasm", "ipynb", "map",
+])
+const CONFIG_EXTENSIONS = new Set([
+  "toml", "ini", "conf", "config", "env", "properties", "plist", "lock", "yaml", "yml",
+])
+const DATA_EXTENSIONS = new Set([
+  "json", "jsonc", "xml", "csv", "tsv", "log", "db", "sqlite", "parquet",
+])
+const DOC_EXTENSIONS = new Set(["md", "mdx", "txt", "rst", "adoc", "org", "tex", "pdf", "doc", "docx", "rtf"])
+const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "tif", "tiff", "avif", "heic"])
+const AUDIO_EXTENSIONS = new Set(["mp3", "wav", "ogg", "flac", "m4a", "aac", "opus", "wma", "aiff"])
+const VIDEO_EXTENSIONS = new Set(["mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg"])
+const ARCHIVE_EXTENSIONS = new Set(["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "zst"])
+const KNOWN_EXTENSIONS = new Set([
+  ...CODE_EXTENSIONS, ...CONFIG_EXTENSIONS, ...DATA_EXTENSIONS, ...DOC_EXTENSIONS,
+  ...IMAGE_EXTENSIONS, ...AUDIO_EXTENSIONS, ...VIDEO_EXTENSIONS, ...ARCHIVE_EXTENSIONS,
+])
+
+/** Well-known files deserve a name people actually use, not "dot json". */
+const SPECIAL_FILE_NAMES: Record<string, string> = {
+  "package.json": "the package manifest",
+  "package-lock.json": "the package lock file",
+  "pnpm-lock.yaml": "the pnpm lock file",
+  "yarn.lock": "the yarn lock file",
+  "tsconfig.json": "the TypeScript config",
+  "jsconfig.json": "the JavaScript config",
+  "readme": "the readme",
+  "readme.md": "the readme",
+  "license": "the license",
+  "license.md": "the license",
+  "dockerfile": "the Dockerfile",
+  "makefile": "the makefile",
+  "requirements.txt": "the requirements file",
+  ".env": "the environment file",
+  ".gitignore": "the git ignore file",
+  ".gitattributes": "the git attributes file",
+  "opencode.json": "the OpenCode config",
+  "opencode.jsonc": "the OpenCode config",
+}
+
+/** Names with a dot that are products, not files. */
+const DOT_NAMES: Record<string, string> = {
+  "node.js": "Node JS",
+  "next.js": "Next JS",
+  "vue.js": "Vue JS",
+  "nuxt.js": "Nuxt JS",
+  "react.js": "React",
+  "angular.js": "Angular JS",
+  "express.js": "Express",
+  "three.js": "Three JS",
+  "d3.js": "D3",
+  "socket.io": "Socket IO",
+  "jquery.js": "jQuery",
+}
+
+const URL_PATTERN = /\b(?:https?|ftp|file):\/\/[^\s<>"'`]+/gi
+const URL_ONLY_PATTERN = /^(?:https?|ftp|file):\/\/\S+$/i
+const EMAIL_PATTERN = /\b[\w.!#$%&'*+/=?^`{|}~-]+@[\w.-]+\.[A-Za-z]{2,}\b/g
+const UUID_PATTERN = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi
+const HASH_PATTERN = /\b[a-f0-9]{7,64}\b/gi
+const DOMAIN_PATTERN = /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|org|net|io|dev|ai|co|edu|gov|app|xyz|me)\b/gi
+const WINDOWS_PATH_PATTERN = /[A-Za-z]:[\\/][^\s<>"'`]+/g
+const UNIX_PATH_PATTERN = /(?<![\w])(?:~[\\/]|\.{1,2}[\\/]|\/)[^\s<>"'`]+/g
+const RELATIVE_PATH_PATTERN = /(?<![\w/])(?:[\w.-]+[\\/])+[\w.-]+\.[A-Za-z][A-Za-z0-9]{0,7}(?=$|[\s),.;:!?])/g
+const RELATIVE_FOLDER_PATTERN = /(?<![\w/])(?:[\w.-]+[\\/]){2,}[\w.-]+/g
+const DOTFILE_PATTERN = /(?<![\w/])\.([A-Za-z][A-Za-z0-9_-]{0,30})\b/g
+const BARE_FILE_PATTERN = /(?<![\w/])([\w.-]+)\.([A-Za-z][A-Za-z0-9]{0,7})\b/g
+const VERSION_PATTERN = /\bv(\d+(?:\.\d+)+)\b/gi
+const DATE_PATTERN = /\b(?:\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b/g
+const EMOJI_PATTERN = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}\u{20E3}\u{1F1E6}-\u{1F1FF}]/gu
+const GENERIC_TITLES = new Set([
+  "new session", "new chat", "untitled", "untitled session", "untitled chat",
+  "session", "chat", "welcome", "home", "main", "opencode",
+])
+
+/** Split `jv_audio`, `autoSpeak`, `controller.ts` into natural words. */
+function humanizeIdentifier(value: string): string {
+  return String(value ?? "")
+    .replace(/[._-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => (/^[A-Z0-9]{2,}$/.test(word) ? word : word.toLowerCase()))
+    .join(" ")
+}
+
+/** What to call a path when it is not worth reading every segment. */
+function pathReference(token: string): string {
+  let raw = String(token ?? "").trim()
+  raw = raw.replace(/[.,;:!?…–—]+$/g, "")
+  raw = raw.replace(/[)\]}]+$/g, "")
+  raw = raw.replace(/(?::\d+(?::\d+)?|#L\d+)$/i, "")
+  if (!raw) return "the folder"
+  if (/^(?:https?|ftp|file):\/\//i.test(raw)) return "the link"
+  const windows = /^[A-Za-z]:[\\/]/.test(raw)
+  const parts = raw.split(windows ? /[\\/]+/ : /\/+/).filter(Boolean)
+  const last = parts[parts.length - 1] ?? ""
+  if (!last) return "the folder"
+  const lower = last.toLowerCase()
+  if (SPECIAL_FILE_NAMES[lower]) return SPECIAL_FILE_NAMES[lower]
+  const lastDot = last.lastIndexOf(".")
+  const dotfile = last.startsWith(".") && last.indexOf(".", 1) < 0
+  if (dotfile) {
+    const name = humanizeIdentifier(last.slice(1))
+    return name ? `the ${name} file` : "the file"
+  }
+  const hasExtension = lastDot > 0 && lastDot < last.length - 1
+  if (!hasExtension) {
+    const name = humanizeIdentifier(last)
+    return name ? `the ${name} folder` : "the folder"
+  }
+  const stem = last.slice(0, lastDot)
+  const ext = last.slice(lastDot + 1).toLowerCase()
+  // A dotted stem such as a settings file reads best by its last real name.
+  const stemParts = stem.split(".").filter((part) => part && !/^v?\d+$/i.test(part))
+  const name = humanizeIdentifier((stemParts[stemParts.length - 1] ?? stem).replace(/[._-]+/g, " "))
+  const shortName = name.split(/\s+/).slice(0, 4).join(" ") || "file"
+  if (IMAGE_EXTENSIONS.has(ext)) return "the image"
+  if (AUDIO_EXTENSIONS.has(ext)) return "the audio file"
+  if (VIDEO_EXTENSIONS.has(ext)) return "the video"
+  if (ARCHIVE_EXTENSIONS.has(ext)) return "the archive"
+  if (CONFIG_EXTENSIONS.has(ext)) return `the ${shortName} config`
+  if (DOC_EXTENSIONS.has(ext)) return `the ${shortName} document`
+  if (CODE_EXTENSIONS.has(ext)) return `the ${shortName} file`
+  if (DATA_EXTENSIONS.has(ext)) return `the ${shortName} file`
+  return `the ${shortName} file`
+}
+
+/** Keep the sentence's full stop when a path or link is replaced. */
+function replaceToken(match: string, replacement: string): string {
+  const trailing = match.match(/[.,;:!?…)\]}–—]+$/)?.[0] ?? ""
+  return `${replacement}${trailing}`
+}
+
+/** Replace paths, links, hashes and symbols with words a voice can say. */
+function naturalizeSpeech(input: string): string {
+  let out = String(input ?? "")
+
+  // Markdown that may still be in a title as well as an answer.
+  out = out
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/^\s*>\s?/gm, "")
+    .replace(/~~([^~]+)~~/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/_{2,}([^_]+)_{2,}/g, "$1")
+    .replace(/\|/g, " ")
+    .replace(/\[[ xX]\]\s*/g, "")
+
+  // Products whose dot is not a file extension.
+  out = out.replace(/\b(?:node|next|vue|nuxt|react|angular|express|three|d3|socket|jquery)\.(?:js|io)\b/gi, (match) => DOT_NAMES[match.toLowerCase()] ?? match)
+
+  // Dates are numbers, not folders: 10/23/2026 should never become a path.
+  out = out.replace(DATE_PATTERN, (match) => match.replace(/[/-]/g, " "))
+
+  // Links and addresses first, before their slashes look like a path.
+  out = out.replace(URL_PATTERN, (match) => replaceToken(match, "the link"))
+  out = out.replace(EMAIL_PATTERN, (match) => replaceToken(match, "the email address"))
+  out = out.replace(DOMAIN_PATTERN, (match) => replaceToken(match, "the website"))
+
+  // File paths. Absolute paths first, then relative ones, so a Windows drive
+  // letter is not mistaken for prose.
+  out = out.replace(WINDOWS_PATH_PATTERN, (match) => replaceToken(match, pathReference(match)))
+  out = out.replace(UNIX_PATH_PATTERN, (match) => replaceToken(match, pathReference(match)))
+  out = out.replace(RELATIVE_PATH_PATTERN, (match) => replaceToken(match, pathReference(match)))
+  out = out.replace(RELATIVE_FOLDER_PATTERN, (match) => replaceToken(match, pathReference(match)))
+  out = out.replace(DOTFILE_PATTERN, (match, name: string) => {
+    const special = SPECIAL_FILE_NAMES[`.${String(name).toLowerCase()}`]
+    return special ?? `the ${humanizeIdentifier(name) || "hidden"} file`
+  })
+  out = out.replace(BARE_FILE_PATTERN, (match, stem: string, ext: string) => {
+    const cleanStem = String(stem).replace(/[^A-Za-z0-9]/g, "")
+    if (cleanStem.length < 2 || !KNOWN_EXTENSIONS.has(String(ext).toLowerCase())) return match
+    return pathReference(match)
+  })
+
+  // Long identifiers are noise when spoken aloud; give the listener the role.
+  out = out.replace(UUID_PATTERN, "the identifier")
+  out = out.replace(HASH_PATTERN, (match, offset: number, whole: string) => {
+    if (!/[a-f]/i.test(match) || !/\d/.test(match)) return match
+    const before = String(whole).slice(Math.max(0, offset - 24), offset).toLowerCase()
+    if (/\bcommit\s+$/.test(before)) return "that"
+    return /\b(?:head|sha|hash|revision|commit)\b/.test(before) ? "the commit" : "the identifier"
+  })
+
+  // Arrows, maths and currency become words before the symbol sweep.
+  out = out
+    .replace(VERSION_PATTERN, (match, version: string, offset: number, whole: string) => {
+      const before = String(whole).slice(Math.max(0, offset - 10), offset).toLowerCase()
+      return /version\s+$/.test(before) ? version : `version ${version}`
+    })
+    .replace(/\b(\d+(?:\.\d+)?)\s*°C\b/gi, "$1 degrees Celsius")
+    .replace(/\b(\d+(?:\.\d+)?)\s*°F\b/gi, "$1 degrees Fahrenheit")
+    .replace(/\b(\d+)\s*%/g, "$1 percent")
+    .replace(/\$\s*(\d+(?:\.\d+)?)/g, "$1 dollars")
+    .replace(/€\s*(\d+(?:\.\d+)?)/g, "$1 euros")
+    .replace(/£\s*(\d+(?:\.\d+)?)/g, "$1 pounds")
+    .replace(/#\s*(\d+)/g, "number $1")
+    .replace(/<->|↔/g, " and ")
+    .replace(/->|→|⇒|=>/g, " to ")
+    .replace(/<-|←/g, " from ")
+    .replace(/(?:^|\s)-\s*(?=\d)/g, " minus ")
+    .replace(/(?<=\w)-(?=\w)/g, " ")
+    .replace(/≥/g, " at least ")
+    .replace(/≤/g, " at most ")
+    .replace(/≠/g, " not equal to ")
+    .replace(/±/g, " plus or minus ")
+    .replace(/≈/g, " about ")
+    .replace(/×/g, " by ")
+    .replace(/÷/g, " divided by ")
+    .replace(/&(?:amp|lt|gt|quot);/gi, (match) => ({
+      "&amp;": " and ", "&lt;": " less than ", "&gt;": " greater than ", "&quot;": "",
+    }[match.toLowerCase()] ?? " "))
+
+  // A final sweep for symbols that a synthesizer would otherwise spell out.
+  out = out
+    .replace(EMOJI_PATTERN, " ")
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F\u00AB\u00BB]/g, "")
+    .replace(/[–—―]/g, ", ")
+    .replace(/[•·▪▫◦✓✔★☆]/g, " ")
+    .replace(/[\[\]{}<>()]/g, " ")
+    .replace(/[*_~^`|\\]/g, " ")
+    .replace(/[@]/g, " at ")
+    .replace(/[&]/g, " and ")
+    .replace(/[+]/g, " plus ")
+    .replace(/[=]/g, " equals ")
+    .replace(/%/g, " percent")
+    .replace(/…/g, ".")
+    .replace(/(?<!\d):(?!\d)/g, ", ")
+    .replace(/;/g, ", ")
+    .replace(/\//g, " ")
+    .replace(/\u00A0/g, " ")
+    .replace(/[^\S\n]+/g, " ")
+    .replace(/\s+([,.;!?])/g, "$1")
+    .replace(/([,.;!?])(?:\s*[,.;!?])+/g, "$1")
+    .replace(/\n{2,}/g, ". ")
+    .replace(/\n/g, " ")
+    .replace(/^\s*[,.;:!?]+\s*/, "")
+    .trim()
+  return out
+}
+
+/** One natural phrase for a session title, without paths, hashes or symbols. */
+export function naturalTitle(title: string): string {
+  const original = String(title ?? "").trim()
+  if (!original) return ""
+  if (URL_ONLY_PATTERN.test(original)) return ""
+
+  const compact = original.replace(/[^A-Za-z0-9]/g, "")
+  if (compact.length >= 8 && /^[0-9a-f]+$/i.test(compact) && /[a-f]/i.test(compact) && /\d/.test(compact)) {
+    return ""
+  }
+  if (/^(?:ses|msg|ptt|conn|req|run|step)[_-][A-Za-z0-9_-]+$/i.test(original)) return ""
+
+  const originalKey = original.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+  if (GENERIC_TITLES.has(originalKey)) return ""
+  if (/^(?:new|untitled)\s+(?:session|chat)(?:\s+\d+)*$/.test(originalKey)) return ""
+
+  const cleaned = original
+    .replace(/^\s*(?:session|chat|conversation)\s*(?:title|name)?\s*[,:\-–—]\s*/i, "")
+    .replace(/^\s*(?:re|fwd)\s*:\s*/i, "")
+  let text = naturalizeSpeech(cleaned)
+    .replace(/^\s*[,.;:!?]+\s*/, "")
+    .trim()
+
+  // A title that is one code identifier reads better split into words.
+  if (/^[A-Za-z_$][\w$.-]*$/.test(text) && (/[a-z][A-Z]/.test(text) || text.includes("_"))) {
+    text = humanizeIdentifier(text)
+  }
+
+  const key = text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+  if (!key || GENERIC_TITLES.has(key)) return ""
+  if (/^(?:new|untitled)\s+(?:session|chat)(?:\s+\d+)*$/.test(key)) return ""
+  if (!/\p{L}{2,}/u.test(text)) return ""
+
+  // Keep the announcement short enough to feel like a subtitle, not a report.
+  const words = text.split(/\s+/).filter(Boolean)
+  if (words.length > 12) text = words.slice(0, 12).join(" ")
+  if (text.length > 72) {
+    const cut = text.slice(0, 72)
+    const at = cut.lastIndexOf(" ")
+    text = at > 36 ? cut.slice(0, at) : cut
+  }
+  return text.replace(/[\s.,;:!?…]+$/g, "").trim()
+}
+
+/**
+ * The spoken subject before an answer. It is deliberately a sentence of its
+ * own: "About the controller file." reads better than a raw path, and the
+ * answer that follows still sounds like a conversation.
+ */
+export function titleAnnouncement(title: string): string {
+  const subject = naturalTitle(title)
+  if (!subject) return ""
+  let phrase = subject
+  // "Fix the reader" -> "fixing the reader"; titles are often imperatives.
+  const gerunds: Record<string, string> = {
+    fix: "fixing", add: "adding", implement: "implementing", make: "making",
+    update: "updating", improve: "improving", remove: "removing", refactor: "refactoring",
+    continue: "continuing", help: "helping", debug: "debugging", investigate: "investigating",
+    check: "checking", review: "reviewing", write: "writing", create: "creating",
+    build: "building", run: "running", test: "testing", explain: "explaining",
+    tell: "telling", show: "showing", find: "finding", use: "using", install: "installing",
+    configure: "configuring", set: "setting", change: "changing", read: "reading",
+    speak: "speaking", start: "starting", stop: "stopping", enable: "enabling",
+    disable: "disabling", support: "supporting", return: "returning", keep: "keeping",
+  }
+  const asked =
+    /\?\s*$/.test(String(title ?? "").trim()) ||
+    /^(?:how|what|why|when|where|who|which|can|could|should|would|is|are|do|does|did)\b/i.test(subject)
+  const first = phrase.match(/^([A-Za-z]+)\b(.*)$/)
+  const gerund = first ? gerunds[first[1].toLowerCase()] : undefined
+  if (first && gerund) phrase = `${gerund}${first[2]}`
+  // "How do I fix this" -> "how to fix this".
+  phrase = phrase.replace(/^how\s+(?:do|can|could|should|would)\s+(?:i|we|you)\s+/i, "how to ")
+  const lower = /^[A-Z0-9]{2,}\b/.test(phrase) ? phrase : phrase.charAt(0).toLowerCase() + phrase.slice(1)
+  if (asked && !/^how to\b/i.test(lower)) {
+    return `On the question: ${lower.replace(/[?\s]+$/g, "")}.`
+  }
+  const lead = /^(?:about|regarding|on)\b/i.test(lower) ? "" : "About "
+  const sentence = lead ? `${lead}${lower}` : lower.charAt(0).toUpperCase() + lower.slice(1)
+  return `${sentence}.`
+}
+
 /** Turn a markdown answer into something worth listening to. */
 export function speakable(text: string, limit = 0): string {
-  let out = text
-    .replace(/```[\s\S]*?```/g, " (code) ")
+  let out = String(text ?? "")
+    .replace(/```[\s\S]*?```/g, " JVCODEFENCE ")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
@@ -330,6 +664,8 @@ export function speakable(text: string, limit = 0): string {
     .replace(/\*([^*]+)\*/g, "$1")
     .replace(/_{2,}([^_]+)_{2,}/g, "$1")
     .replace(/\|/g, " ")
+  out = naturalizeSpeech(out)
+    .replace(/JVCODEFENCE/gi, " a code block ")
     .replace(/[ \t]+/g, " ")
     .replace(/\n{2,}/g, ". ")
     .replace(/\n/g, " ")
@@ -342,7 +678,7 @@ export function speakable(text: string, limit = 0): string {
     out = stop > limit * 0.4 ? cut.slice(0, stop + 1) : `${cut}...`
   }
   // A reply that was only code or punctuation leaves nothing sayable.
-  if (out.replace(/\(code\)/g, " ").replace(/[\s.,:;!?()\-–—…"']/g, "").length < 2) return ""
+  if (out.replace(/a code block/gi, " ").replace(/[^\p{L}\p{N}]+/gu, "").length < 2) return ""
   return out
 }
 
@@ -467,6 +803,11 @@ export function createVoiceController(context: any) {
     repaint()
   }
 
+  function setLiveState(value: boolean): void {
+    setLive(value)
+    repaint()
+  }
+
   function setMicState(value: MicState): void {
     setMic(value)
     repaint()
@@ -570,6 +911,10 @@ export function createVoiceController(context: any) {
   } catch {
     /* storage unavailable: settings stay in memory for this TUI */
   }
+  // The toolbar and the settings dialog share this switch. A preference saved
+  // by an earlier TUI has to win over the default, or "reads replies" turns
+  // itself back on every time OpenCode starts.
+  autoSpeak = settings.autoSpeak !== false
 
   async function persist(mutation: (draft: VoiceSettings) => void): Promise<void> {
     try {
@@ -697,6 +1042,7 @@ export function createVoiceController(context: any) {
     await persist((draft) => {
       draft.autoSend = next
     })
+    repaint()
     toast(
       next
         ? "Transcripts are sent to the agent automatically"
@@ -1498,9 +1844,11 @@ export function createVoiceController(context: any) {
         toast("The last reply has nothing to read", "warning")
         return
       }
+      const title = sessionLabel(sid)
+      const toSay = title ? `${title} ${text}` : text
       const info = await daemonOrToast()
       if (!info) return
-      await api.speak(info, text, { async: true, ...ttsRequest() })
+      await api.speak(info, toSay, { async: true, ...ttsRequest() })
       setSpeakingMessage(answer.id ?? null)
       setSpeechState("playing")
       watchSpeech()
@@ -1529,6 +1877,8 @@ export function createVoiceController(context: any) {
         toast("This message has nothing to read", "warning")
         return
       }
+      const title = sessionLabel(sid)
+      const toSay = title ? `${title} ${text}` : text
       const info = await daemonOrToast()
       if (!info) return
       if (speech() !== "idle") {
@@ -1536,7 +1886,7 @@ export function createVoiceController(context: any) {
         // Stop it first so the new read starts at the beginning.
         await api.interrupt(info).catch(() => undefined)
       }
-      await api.speak(info, text, { async: true, ...ttsRequest() })
+      await api.speak(info, toSay, { async: true, ...ttsRequest() })
       setSpeakingMessage(messageID)
       setSpeechState("playing")
       watchSpeech()
@@ -1749,13 +2099,18 @@ export function createVoiceController(context: any) {
 
   /* ------------------------------------------------- reading the answers */
 
-  /** The name of the session, read out before its answer. */
+  /**
+   * The subject of the session, read out before its answer.
+   *
+   * Session titles are often the first thing the user typed: a path, a file
+   * name, a hash or a one-line instruction. `titleAnnouncement` turns that into
+   * a natural phrase ("About the controller file.") and skips titles that are
+   * only an identifier or a generic placeholder.
+   */
   function sessionLabel(sessionID: string): string {
     try {
       const info: any = context.data.session.get?.(sessionID)
-      const title = String(info?.title ?? "").trim()
-      if (!title) return ""
-      return title.length > 80 ? `${title.slice(0, 79)}…` : title
+      return titleAnnouncement(String(info?.title ?? ""))
     } catch {
       return ""
     }
@@ -1859,7 +2214,7 @@ export function createVoiceController(context: any) {
       next.labelDone = true
       seenAnswers.set(sessionID, id)
       if (writing) readProgress.set(id, next)
-      await speakChunk(sessionID, label ? `${label}. ${piece}` : piece, id)
+      await speakChunk(sessionID, label ? `${label} ${piece}` : piece, id)
     }
 
     if (writing) {
@@ -1983,7 +2338,7 @@ export function createVoiceController(context: any) {
   function stopLive(): void {
     liveStop = true
     setLiveCaption("")
-    setLive(false)
+    setLiveState(false)
     void (async () => {
       try {
         const info = await daemon(false)
@@ -2091,7 +2446,7 @@ export function createVoiceController(context: any) {
     if (!info) return
     liveBusy = true
     liveStop = false
-    setLive(true)
+    setLiveState(true)
     const mic = (settings.micSource || "").trim() || "automatic microphone"
     toast(
       `Live voice on (${mic}) — like a phone call: pause to send, the answer is spoken as it arrives. Click again to stop.`,
@@ -2102,7 +2457,7 @@ export function createVoiceController(context: any) {
     } catch (e) {
       toast(errorText(e), "error")
     } finally {
-      setLive(false)
+      setLiveState(false)
       liveBusy = false
     }
   }
@@ -2252,12 +2607,23 @@ export function createVoiceController(context: any) {
     void persist((draft) => {
       draft.autoSpeak = autoSpeak
     })
+    repaint()
     toast(autoSpeak ? "Replies will be spoken" : "Replies will stay silent", autoSpeak ? "success" : "info")
   }
 
   function dispose(): void {
     stopSpeechWatch()
     stopAnswers?.()
+    // Best effort on unload (Ctrl+C can kill the process before this
+    // completes); the daemon's client-pid watchdog is the reliable layer.
+    void (async () => {
+      try {
+        const info = await daemon(false)
+        if (info) await api.interrupt(info)
+      } catch {
+        /* the TUI is going away */
+      }
+    })()
   }
 
   // Read every new answer of the session that is on screen.

@@ -27,6 +27,7 @@ import queue
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -37,6 +38,15 @@ from pathlib import Path
 import jv_config as cfg
 
 SELF = Path(__file__).resolve()
+
+# Resolve libc in the parent, never inside a forked child: importing ctypes
+# from a preexec_fn can deadlock if another thread holds the import lock.
+try:
+    import ctypes as _ctypes
+
+    _LIBC = _ctypes.CDLL("libc.so.6", use_errno=True)
+except Exception:  # pragma: no cover - non-glibc platforms
+    _LIBC = None
 
 
 # ----------------------------------------------------------------------------
@@ -61,6 +71,22 @@ def _run(cmd: list[str], timeout: float = 8, input_bytes: bytes | None = None) -
         return 127, b"", f"not found: {cmd[0]}".encode()
     except Exception as e:  # pragma: no cover
         return 1, b"", str(e).encode()
+
+
+def _child_pdeathsig() -> None:
+    """Ask Linux to terminate a player when the daemon dies.
+
+    Without this, a daemon crash (or a SIGKILL from the OS) can leave ffplay
+    holding the speaker as an orphan - the "it keeps talking after I closed
+    OpenCode" symptom. It is a best-effort call: other platforms simply skip it.
+    """
+    if os.name != "posix" or _LIBC is None:
+        return
+    try:
+        # PR_SET_PDEATHSIG = 1. The signal is delivered when the parent dies.
+        _LIBC.prctl(1, signal.SIGTERM, 0, 0, 0)
+    except Exception:
+        pass
 
 
 class VoiceGate:
@@ -1234,6 +1260,265 @@ def play_wav(path: str | Path, timeout: float = 120) -> dict:
     raise AudioError("no playback backend worked. " + " | ".join(errors))
 
 
+# ----------------------------------------------------------------------------
+# Continuous playback: one player for a whole reply
+# ----------------------------------------------------------------------------
+
+# Every chunk of a reply is resampled to this rate before it is written to the
+# stream. Fish already returns 44.1 kHz; the local fallback may be 22.05 kHz.
+STREAM_RATE = 44100
+
+
+def stream_backend() -> str | None:
+    """The backend that can play a continuous PCM stream, if any.
+
+    ffplay is used on purpose: it is the player that survives the Android ALSA
+    device here, and it accepts a WAV stream on a pipe. A user-forced backend
+    is respected; forcing something else keeps the per-clip path.
+    """
+    if cfg.FORCE_PLAYBACK_BACKEND:
+        return "ffplay" if cfg.FORCE_PLAYBACK_BACKEND == "ffplay" else None
+    return "ffplay" if _which("ffplay") else None
+
+
+def _stream_wav_header(sample_rate: int, channels: int = 1, width: int = 2) -> bytes:
+    """A WAV header whose sizes say "until EOF"; ffplay streams it from a pipe."""
+    align = max(1, channels * width)
+    byte_rate = max(1, sample_rate * align)
+    return (
+        b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
+        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, sample_rate,
+                                byte_rate, align, width * 8)
+        + b"data" + struct.pack("<I", 0xFFFFFFFF)
+    )
+
+
+def decode_pcm(path: str | Path, sample_rate: int = STREAM_RATE) -> bytes:
+    """Decode an audio file to mono S16LE at `sample_rate`.
+
+    Fish normally returns WAV, which is decoded in-process. The MP3 fallback
+    (and a WAV with a strange header) is handed to ffmpeg. A short, clear error
+    lets the reader fall back to per-clip playback instead of going silent.
+    """
+    path = Path(path)
+    if path.suffix.lower() == ".wav":
+        try:
+            pcm, sr, _ = read_wav(path)
+            return resample_to(pcm, sr, sample_rate)
+        except Exception:
+            pass  # fall through to ffmpeg for a broken or unusual WAV
+    ffmpeg = _which("ffmpeg")
+    if not ffmpeg:
+        raise AudioError(f"cannot decode {path.suffix or 'audio'} without ffmpeg")
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(path),
+             "-f", "s16le", "-ac", "1", "-ar", str(sample_rate), "-"],
+            capture_output=True, timeout=60,
+        )
+    except Exception as e:
+        raise AudioError(f"cannot decode {path.name}: {e}") from e
+    if proc.returncode != 0 or not proc.stdout:
+        detail = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        raise AudioError(f"cannot decode {path.name}: "
+                         f"{(detail[-1] if detail else 'no PCM')[:200]}")
+    return proc.stdout
+
+
+class PcmStream:
+    """A single long-lived player fed PCM as the reply is rendered.
+
+    The old reader started a new `ffplay` for every chunk. Each start/stop left
+    a gap and, on the phone's audio HAL, sometimes a click or a stutter. One
+    process per reply makes the chunks join seamlessly; stopping the reply is
+    one terminate, and pausing is one SIGSTOP.
+    """
+
+    def __init__(self, sample_rate: int = STREAM_RATE, channels: int = 1, width: int = 2):
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        self.width = int(width)
+        self._proc: subprocess.Popen | None = None
+        self._closed = False
+        self._bytes = 0
+        self._err: list[str] = []
+        self._start()
+
+    def _start(self) -> None:
+        ffplay = _which("ffplay")
+        if not ffplay:
+            raise AudioError("continuous playback needs ffplay")
+        cmd = [ffplay, "-nodisp", "-autoexit", "-loglevel", "quiet",
+               "-f", "wav", "pipe:0"]
+        try:
+            p = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, bufsize=0,
+                preexec_fn=_child_pdeathsig if os.name == "posix" else None,
+            )
+        except Exception as e:
+            raise AudioError(f"ffplay stream: cannot start ({e})") from e
+        self._proc = p
+
+        def _read_err() -> None:
+            try:
+                if p.stderr is None:
+                    return
+                for line in p.stderr:
+                    text = line.decode("utf-8", "replace").strip()
+                    if text:
+                        self._err.append(text)
+                        del self._err[:-4]
+            except Exception:
+                pass
+
+        threading.Thread(target=_read_err, daemon=True, name="ffplay-err").start()
+        with _playback_state["lock"]:
+            _playback_state["proc"] = p
+            _playback_state["paused"] = False
+            _playback_state["started_at"] = time.time()
+            _playback_state["command"] = "ffplay-stream"
+        try:
+            assert p.stdin is not None
+            self._write_all(_stream_wav_header(self.sample_rate, self.channels, self.width))
+            p.stdin.flush()
+        except Exception as e:
+            self.terminate()
+            raise AudioError(f"ffplay stream: cannot start ({e})") from e
+
+    def _write_all(self, data: bytes) -> None:
+        """Write every byte to the player pipe.
+
+        A pipe is allowed to accept fewer bytes than it was given. Ignoring the
+        return value used to drop the rest of a PCM buffer once the player's
+        buffer was nearly full, which is heard as a clipped syllable or a small
+        gap in the middle of a reply. `memoryview` advances through the buffer
+        without copying it.
+        """
+        p = self._proc
+        if p is None or p.stdin is None:
+            raise AudioError("ffplay stream is not running")
+        view = memoryview(data)
+        while view:
+            written = p.stdin.write(view)
+            if written is None:
+                # A raw blocking pipe returns an int, but a wrapper may accept
+                # the full buffer and return None. Treat that as complete.
+                break
+            if written <= 0:
+                raise BrokenPipeError("ffplay stream accepted no data")
+            view = view[written:]
+
+    def _exit_error(self, cause: Exception | None = None) -> AudioError:
+        p = self._proc
+        bits = []
+        if p is not None and p.poll() is not None:
+            bits.append(f"rc={p.returncode}")
+        if self._err:
+            bits.append(self._err[-1][:160])
+        if cause is not None and not bits:
+            bits.append(str(cause)[:160])
+        return AudioError("ffplay stream stopped" + (f": {' | '.join(bits)}" if bits else ""))
+
+    def write(self, pcm: bytes) -> None:
+        """Write PCM to the player. Blocks when its buffer is full (backpressure)."""
+        if not pcm:
+            return
+        if self._closed:
+            raise AudioError("ffplay stream is closed")
+        p = self._proc
+        if p is None or p.stdin is None:
+            raise AudioError("ffplay stream is not running")
+        if p.poll() is not None:
+            raise self._exit_error()
+        try:
+            self._write_all(pcm)
+            p.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError) as e:
+            raise self._exit_error(e) from e
+        self._bytes += len(pcm)
+
+    def _clear_state(self, p: subprocess.Popen | None) -> None:
+        with _playback_state["lock"]:
+            if p is not None and _playback_state.get("proc") is p:
+                _playback_state["proc"] = None
+                _playback_state["paused"] = False
+
+    def close(self, wait: bool = True) -> int:
+        """Finish the stream. With `wait`, return after the audio has played."""
+        self._closed = True
+        p = self._proc
+        if p is None:
+            return 0
+        try:
+            if p.stdin is not None:
+                p.stdin.close()
+        except Exception:
+            pass
+        rc = p.poll()
+        if wait and _playback_state.get("paused") and p.poll() is None:
+            # The user paused near the end. Keep the player (and its buffered
+            # tail) alive so /resume can finish it; terminating here would cut
+            # the last sentence.
+            return 0
+        if wait:
+            # Allow the buffered audio to finish, with a generous ceiling: the
+            # point of this player is that the reply ends when the voice ends.
+            seconds = self._bytes / max(1, self.channels * self.width * self.sample_rate)
+            timeout = max(5.0, float(seconds) + 30.0)
+            try:
+                rc = p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self.terminate()
+                rc = p.poll()
+        self._clear_state(p)
+        self._proc = None
+        return int(rc or 0)
+
+    def terminate(self) -> None:
+        """Stop now: used by /interrupt and when a newer reply takes over."""
+        self._closed = True
+        p = self._proc
+        if p is not None:
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            try:
+                if p.stdin is not None:
+                    p.stdin.close()
+            except Exception:
+                pass
+            deadline = time.time() + 1.5
+            while time.time() < deadline and p.poll() is None:
+                time.sleep(0.02)
+            if p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                try:
+                    p.wait(timeout=0.5)
+                except Exception:
+                    pass
+            self._clear_state(p)
+            self._proc = None
+
+    def __enter__(self) -> "PcmStream":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.terminate()
+
+
+def open_pcm_stream(sample_rate: int = STREAM_RATE) -> PcmStream:
+    """Open a continuous player. Raises AudioError when streaming is unavailable."""
+    if stream_backend() != "ffplay":
+        raise AudioError("continuous playback is not available on this system")
+    return PcmStream(sample_rate)
+
+
 def _play_file_sounddevice(path: str) -> int:
     import numpy as np
     import sounddevice as sd
@@ -1252,7 +1537,9 @@ def _play_file_sounddevice(path: str) -> int:
 
 def _blocking_play(cmd: list[str], timeout: float) -> None:
     with _playback_state["lock"]:
-        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                             stdin=subprocess.DEVNULL,
+                             preexec_fn=_child_pdeathsig if os.name == "posix" else None)
         _playback_state["proc"] = p
         _playback_state["paused"] = False
         _playback_state["started_at"] = time.time()

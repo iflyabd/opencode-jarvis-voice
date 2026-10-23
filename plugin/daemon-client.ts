@@ -361,7 +361,16 @@ export const api = {
     /** Queue behind what is playing instead of taking the speaker. */
     append?: boolean
   } = {}) =>
-    request(info, "/speak", { body: { text, ...opts }, timeoutMs: opts.timeoutMs ?? 190000 }),
+    request(info, "/speak", {
+      // The daemon is detached, so Ctrl+C on the TUI does not kill it. It
+      // uses this pid to stop the voice the moment the TUI process is gone.
+      body: {
+        text,
+        ...opts,
+        ...(typeof process !== "undefined" && process.pid ? { client_pid: process.pid } : {}),
+      },
+      timeoutMs: opts.timeoutMs ?? 190000,
+    }),
   synth: (info: DaemonInfo, text: string, fish?: FishOptions) =>
     request<ArrayBuffer>(info, "/synth", { body: { text, fish }, raw: true }),
   warmup: (info: DaemonInfo, stt?: SttOptions) =>

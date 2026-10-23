@@ -469,8 +469,105 @@ _state = {
     "last_activity": time.time(),
     "warm": False,        # lazy STT warmup already kicked off (once per life)
     # What the speakers last said, so /speech can describe it while it plays.
-    "speech": {"text": "", "backend": None, "started_at": 0.0},
+    # client_pid is the TUI process that asked for this speech. The daemon is
+    # detached by design, so it cannot rely on a parent-death signal from the
+    # TUI: an explicit liveness check is what makes Ctrl+C stop the voice.
+    "speech": {"text": "", "backend": None, "started_at": 0.0, "client_pid": 0},
 }
+
+
+def _client_pid(body: dict) -> int:
+    """The TUI process id sent with /speak, or 0 for an old/CLI client."""
+    for key in ("client_pid", "clientPid"):
+        try:
+            pid = int(body.get(key) or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if pid > 1 and pid != os.getpid():
+            return pid
+    return 0
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is the client process still alive? A zombie counts as gone."""
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
+    # The TUI can become a zombie while its parent has not reaped it; it is
+    # gone for our purposes even though kill(pid, 0) still succeeds.
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        if len(stat.split()) > 2 and stat.split()[2] == "Z":
+            return False
+    except Exception:
+        pass
+    return True
+
+
+_client_watch_kick = threading.Event()
+
+
+def _stop_for_client(pid: int) -> None:
+    """The TUI disappeared: stop the voice and the microphone it owned."""
+    print(f"[jarvis-voice] client pid {pid} is gone - stopping speech", flush=True)
+    try:
+        tts.stop_speaking()
+    except Exception:
+        pass
+    try:
+        audio.stop_playback()
+    except Exception:
+        pass
+    try:
+        audio.drop_warm_capture()
+    except Exception:
+        pass
+    sess = _state.get("ptt")
+    if sess is not None:
+        # cancel() waits for the recording thread; do not hold the watchdog.
+        threading.Thread(target=sess.cancel, daemon=True, name="client-cancel-ptt").start()
+    _state["speech"] = {"text": "", "backend": None, "started_at": 0.0, "client_pid": 0}
+
+
+def _client_watch_loop() -> None:
+    """Watch the process that owns the current speech.
+
+    The daemon is intentionally detached from the TUI (so it can survive a
+    restart), which means Ctrl+C on OpenCode kills the client but not us. The
+    client sends its pid with every /speak; while audio or rendering is active,
+    a dead pid stops the speaker immediately instead of leaving an orphaned
+    voice talking to an empty room.
+    """
+    while True:
+        _client_watch_kick.wait(timeout=60.0)
+        _client_watch_kick.clear()
+        if not _state["speech"].get("client_pid"):
+            continue
+        # /speak sets the pid before the (possibly slow) first render starts.
+        start_deadline = time.time() + 15.0
+        while time.time() < start_deadline:
+            if tts.speaking() or audio.playback_status().get("playing"):
+                break
+            if not _state["speech"].get("client_pid"):
+                break
+            time.sleep(0.1)
+        while True:
+            pid = int(_state["speech"].get("client_pid") or 0)
+            if pid <= 1:
+                break
+            if not (tts.speaking() or audio.playback_status().get("playing")):
+                break
+            if not _pid_alive(pid):
+                _stop_for_client(pid)
+                break
+            time.sleep(0.5)
 
 # Read-only routes the UI polls (read/pause button heartbeat). They must never
 # keep an otherwise idle daemon alive.
@@ -522,6 +619,7 @@ def speech_status() -> dict:
         "text": last.get("text") or "",
         "backend": last.get("backend"),
         "started_at": last.get("started_at") or None,
+        "client_pid": last.get("client_pid") or None,
         "elapsed_ms": st["elapsed_ms"],
     }
 
@@ -798,13 +896,22 @@ class Handler(BaseHTTPRequestHandler):
                 if not text:
                     return self._send(400, {"error": "text required"})
                 fish = body.get("fish") if isinstance(body.get("fish"), dict) else None
+                pid = _client_pid(body)
+                # Record the owner (and wake the watchdog) *before* the first
+                # render: a cloud chunk can take seconds, and Ctrl+C during
+                # that wait must cancel the reply too.
+                _state["speech"] = {"text": text, "backend": body.get("backend"),
+                                    "started_at": time.time(), "client_pid": pid}
+                if pid:
+                    _client_watch_kick.set()
                 # `append` queues the sentence behind what is being read, so
                 # a reply that streams in is spoken in order instead of each
                 # sentence cutting off the one before it.
                 out = tts.speak(text, backend=body.get("backend"),
                                 wait=not bool(body.get("async")), fish=fish,
                                 append=bool(body.get("append")))
-                _state["speech"] = {"text": text, "backend": out.get("backend"), "started_at": time.time()}
+                _state["speech"].update({"backend": out.get("backend"),
+                                         "started_at": time.time()})
                 return self._send(200, {"ok": True, **out})
 
             if path == "/warmup":
@@ -841,7 +948,7 @@ class Handler(BaseHTTPRequestHandler):
                 tts.stop_speaking()
                 audio.stop_playback()
                 audio.drop_warm_capture()
-                _state["speech"] = {"text": "", "backend": None, "started_at": 0.0}
+                _state["speech"] = {"text": "", "backend": None, "started_at": 0.0, "client_pid": 0}
                 return self._send(200, {"ok": True})
 
             if path == "/probe":
@@ -929,6 +1036,10 @@ def serve(host: str, port: int, probe: bool = True) -> int:
     # daemon stops playback (if paused) and leaves. The plugin starts it again
     # on the next voice action, so idle CPU is exactly zero and the models'
     # RAM goes back to the system.
+    # A Ctrl+C on OpenCode kills the TUI, not this detached daemon. While a
+    # reply is being rendered or played, a dead client pid stops it at once.
+    threading.Thread(target=_client_watch_loop, daemon=True, name="client-watch").start()
+
     if cfg.IDLE_EXIT_S > 0:
         def _idle_watchdog():
             idle = cfg.IDLE_EXIT_S
@@ -961,6 +1072,8 @@ def serve(host: str, port: int, probe: bool = True) -> int:
 
     def _bye(*_a):
         try:
+            tts.stop_speaking()
+            audio.stop_playback()
             audio.drop_warm_capture()
             audio.release_sles()
         except Exception:
@@ -983,6 +1096,8 @@ def serve(host: str, port: int, probe: bool = True) -> int:
         httpd.serve_forever(poll_interval=2.0)
     finally:
         try:
+            tts.stop_speaking()
+            audio.stop_playback()
             audio.drop_warm_capture()
             audio.release_sles()
         except Exception:

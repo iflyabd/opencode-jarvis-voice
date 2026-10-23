@@ -13,12 +13,13 @@
  *
  * UI buttons (all follow the host theme, clickable with the mouse):
  *   `prompt.footer`         bottom-right of the prompt box: the mic / PTT button
- *   `session.composer.top`  top-right of the text box: the live voice toggle
+ *   `session.composer.top`  the toolbar above the text box: read, send,
+ *                           master play/pause, and the live voice toggle
  *   under each answer       a read / pause / resume button for that message
  *
  * The per-message rows are attached to the transcript renderables for assistant
  * messages and their text parts; see message-buttons.ts. Hosts that do not
- * expose those ids simply show the composer button only.
+ * expose those ids simply show the composer toolbar only.
  *
  * Commands:  voice.pushToTalk (ctrl+alt+v), voice.pauseResume (ctrl+alt+p),
  *            voice.status, voice.cancel, voice.speakLast, voice.toggleAutoSpeak,

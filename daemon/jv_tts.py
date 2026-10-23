@@ -521,28 +521,64 @@ def _wait_speaker_idle(timeout: float = 300.0) -> bool:
 
 
 def _queue_run() -> None:
-    """Play the queued utterances one after another, in order."""
+    """Play the queued utterances in order, batching a streaming reply.
+
+    A live answer arrives one sentence at a time. Playing each sentence with
+    its own player put a device-open gap between every sentence. This worker
+    waits a moment for the next sentences to land, then joins everything that
+    is already waiting into one utterance, so the reader opens one stream for
+    a whole stretch of the answer instead of one per sentence.
+    """
     global _queue_thread
     while True:
+        # A queued sentence follows what is playing, it never cuts it.
+        if not _wait_speaker_idle():
+            continue
         with _queue_lock:
             if not _queue:
                 _queue_thread = None
                 return
             token, text, backend, fish = _queue.popleft()
-        if token != _queue_gen:
-            continue
-        # A queued sentence follows what is playing, it never cuts it.
-        if not _wait_speaker_idle():
-            continue
-        with _queue_lock:
             if token != _queue_gen:
                 continue
-            # Claim the speaker while the queue lock is held: a normal
-            # utterance that arrives after this point takes the generation
-            # and drops this item instead of being cut by it.
+            # Claim the speaker before the coalesce wait. The TUI polls
+            # /speech every 600 ms; if the queue is momentarily empty during
+            # that wait, speaking() must still be true or the play button
+            # would flip to idle just before the voice starts.
             gen = _take_speak_generation()
+
+        # The answer is usually still streaming. A short grace period lets
+        # the next sentence (or two) join this batch; without it the very
+        # first sentence would start a player of its own.
+        if cfg.QUEUE_COALESCE_S > 0:
+            time.sleep(cfg.QUEUE_COALESCE_S)
+
+        with _queue_lock:
+            if token != _queue_gen or not _speak_current(gen):
+                # A newer utterance took the speaker and dropped this batch.
+                # If only the queue was cleared, release our claim as well.
+                _finish_speak(gen)
+                continue
+            parts = [text]
+            chars = len(text)
+            while _queue and chars < cfg.QUEUE_MAX_CHARS:
+                ntoken, more, nbackend, nfish = _queue[0]
+                if ntoken != _queue_gen:
+                    # Left over from a dropped generation: never speak it.
+                    _queue.popleft()
+                    continue
+                if nbackend != backend or nfish != fish:
+                    # Different voice settings: keep the next batch intact.
+                    break
+                _queue.popleft()
+                parts.append(more)
+                chars += 1 + len(more)
+            joined = " ".join(parts)
+            # The speaker is already claimed (above, while the queue lock was
+            # held). A normal utterance that arrives after this point takes
+            # the generation and drops this batch instead of being cut by it.
         try:
-            _speak_now(text, backend=backend, wait=True, fish=fish, gen=gen, stop=False)
+            _speak_now(joined, backend=backend, wait=True, fish=fish, gen=gen, stop=False)
         except Exception:
             # A failed utterance must not stop the ones behind it - and must
             # not leave the speaker marked as busy either.
@@ -632,48 +668,74 @@ def _speak_single(text: str, gen: int, wait: bool, backend: str | None,
 # Fish: render the reply in chunks so the first sound arrives early
 # ----------------------------------------------------------------------------
 
-def _split_for_speech(text: str, max_chars: int | None = None) -> list[str]:
+def _split_for_speech(text: str, max_chars: int | None = None,
+                      first_chars: int | None = None) -> list[str]:
     """Split a reply into chunks that can be rendered one at a time.
 
-    The split follows sentence boundaries: a cloud voice that renders a whole
-    reply in one request can take many seconds before the first sound, while
-    the first chunk is ready in a fraction of that time.
+    The first chunk is deliberately shorter than the rest: it is the only
+    render between the request and the first sound, so a small first chunk
+    makes the reader start quickly. The following chunks use the full size,
+    which gives the voice a natural rhythm.
+
+    The split always follows word order. A long sentence is broken at word
+    boundaries *after* the sentences already waiting, never before them: a
+    later sentence must not jump ahead of an earlier one.
     """
-    limit = max_chars or cfg.FISH_CHUNK_CHARS
+    limit = max(1, int(max_chars or cfg.FISH_CHUNK_CHARS))
+    if first_chars is None:
+        first_chars = cfg.FISH_FIRST_CHUNK_CHARS
+    # A first chunk is only ever shorter, never longer, than the configured
+    # chunk size (a user who lowers the chunk size must get smaller chunks).
+    first_limit = max(1, min(int(first_chars), limit))
     text = re.sub(r"\s+", " ", (text or "").strip())
     if not text:
         return []
-    chunks: list[str] = []
-    current = ""
+
+    # First turn the reply into ordered units no longer than a normal chunk.
+    # Sentences are natural units; a very long sentence becomes word pieces.
+    units: list[str] = []
     for sentence in re.split(r"(?<=[.!?])\s+", text):
         sentence = sentence.strip()
         if not sentence:
             continue
-        if len(sentence) > limit:
-            # Flush the sentences already waiting before adding pieces of this
-            # one. Appending them first put later words ahead of earlier ones,
-            # which the listener hears as cut/repeated speech.
-            if current:
-                chunks.append(current)
-                current = ""
-            # A very long sentence: break it on word boundaries.
-            piece = ""
-            for word in sentence.split(" "):
-                if piece and len(piece) + len(word) + 1 > limit:
-                    chunks.append(piece)
-                    piece = word
-                else:
-                    piece = f"{piece} {word}".strip()
-            if piece:
-                current = piece
+        if len(sentence) <= limit:
+            units.append(sentence)
             continue
-        if current and len(current) + len(sentence) + 1 > limit:
+        piece = ""
+        for word in sentence.split(" "):
+            if piece and len(piece) + len(word) + 1 > limit:
+                units.append(piece)
+                piece = word
+            else:
+                piece = f"{piece} {word}".strip()
+        if piece:
+            units.append(piece)
+
+    # Then pack the units greedily. The first chunk has a lower ceiling; after
+    # that the normal size applies. The voice hears one continuous stream, so a
+    # short first chunk does not add a pause between chunks.
+    chunks: list[str] = []
+    current = ""
+    current_limit = first_limit
+    for unit in units:
+        if current and len(current) + len(unit) + 1 > current_limit:
             chunks.append(current)
-            current = sentence
+            current = unit
+            current_limit = limit
         else:
-            current = f"{current} {sentence}".strip()
+            current = f"{current} {unit}".strip()
     if current:
         chunks.append(current)
+    # A reply that starts with a very long sentence can produce a full-size
+    # first unit. Keep the first chunk short too, cutting at a word boundary
+    # so the faster start never clips a word in half.
+    if chunks and len(chunks[0]) > first_limit:
+        first = chunks[0]
+        cut = first.rfind(" ", 0, first_limit + 1)
+        # No space means one unbroken word: keep it whole rather than clip it.
+        if cut > 0:
+            head, tail = first[:cut].strip(), first[cut:].strip()
+            chunks[0:1] = [c for c in (head, tail) if c]
     return [c for c in chunks if c]
 
 
@@ -726,7 +788,10 @@ def _speak_chunked(text: str, gen: int, wait: bool, backend: str, fish: dict | N
     failed chunk is retried; if Fish stays unreachable, the rest of the reply
     continues with the local voice instead of stopping mid-sentence.
     """
-    chunks = _split_for_speech(text)
+    # Fish is the slow renderer: a short first chunk is what makes the reader
+    # start quickly. A local voice is instant, so it keeps the normal size.
+    first_chars = cfg.FISH_FIRST_CHUNK_CHARS if backend == "fish" else cfg.FISH_CHUNK_CHARS
+    chunks = _split_for_speech(text, first_chars=first_chars)
     if len(chunks) <= 1:
         return _speak_single(text, gen, wait, backend, fish)
 
@@ -820,23 +885,145 @@ def _speak_chunked(text: str, gen: int, wait: bool, backend: str, fish: dict | N
             print(f"[jarvis-voice] tts: playback failed: {type(e).__name__}: {e}", flush=True)
 
     def _consume() -> None:
-        while True:
-            if stop.is_set() or not _speak_current(gen):
-                return
+        """Feed every rendered chunk into one continuous player.
+
+        The old consumer started a player per chunk. On this device the gap
+        between those players was audible (and the audio HAL sometimes clicked
+        at the handoff). One stream for the whole reply removes the handoff
+        entirely; if streaming is unavailable or a clip cannot be decoded, the
+        old per-clip path is used instead of going silent.
+        """
+        stream = None
+        stream_ok = bool(audio.stream_backend())
+        played_ms = 0.0
+
+        def _start_stream() -> bool:
+            nonlocal stream, stream_ok
             try:
-                item = ready.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if item is None:
-                return
-            index, info = item
-            if stop.is_set() or not _speak_current(gen):
-                return
-            if index == 0:
-                started.set()
-            _play(info["path"])
+                stream = audio.open_pcm_stream(audio.STREAM_RATE)
+                return True
+            except Exception as e:
+                stream = None
+                stream_ok = False
+                print(f"[jarvis-voice] tts: continuous player unavailable "
+                      f"({e}); playing clip by clip", flush=True)
+                return False
+
+        def _write_chunk(path: str, pcm: bytes | None = None) -> str:
+            """Write one clip to the stream: 'ok', 'fallback' or 'stop'."""
+            nonlocal stream, stream_ok, played_ms
+            if pcm is None:
+                try:
+                    pcm = audio.decode_pcm(path, stream.sample_rate)
+                except Exception as e:
+                    # The stream is already running. Let its buffered audio
+                    # finish, then keep the rest of the reply going clip by
+                    # clip instead of dropping the remaining sentences.
+                    print(f"[jarvis-voice] tts: cannot decode a chunk ({e}); "
+                          f"finishing it clip by clip", flush=True)
+                    try:
+                        stream.close(wait=True)
+                    except Exception:
+                        stream.terminate()
+                    stream = None
+                    stream_ok = False
+                    return "fallback"
+            try:
+                stream.write(pcm)
+                played_ms += len(pcm) / 2.0 / stream.sample_rate * 1000.0
+                return "ok"
+            except audio.AudioError as e:
+                print(f"[jarvis-voice] tts: playback stream failed: {e}", flush=True)
+                if played_ms >= audio._PLAYED_ANY_MS:
+                    # Part of the reply reached the speaker. Replaying on a
+                    # new player would repeat words; stop cleanly instead.
+                    try:
+                        stream.terminate()
+                    except Exception:
+                        pass
+                    stream = None
+                    return "stop"
+                try:
+                    stream.terminate()
+                except Exception:
+                    pass
+                stream = None
+                stream_ok = False
+                return "fallback"
+
+        def _still_ours() -> bool:
+            return not stop.is_set() and _speak_current(gen)
+
+        try:
+            while True:
+                if not _still_ours():
+                    return
+                try:
+                    item = ready.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    return
+                index, info = item
+                if not _still_ours():
+                    return
+                if index == 0:
+                    started.set()
+                path = info["path"]
+
+                if stream is not None:
+                    result = _write_chunk(path)
+                    if result == "stop":
+                        return
+                    if result == "fallback" and _still_ours():
+                        _play(path)
+                    continue
+
+                if stream_ok:
+                    # Decode before opening the player: a clip that cannot be
+                    # streamed (an old MP3 fallback, a corrupt cache file)
+                    # must not leave a silent player running.
+                    try:
+                        pcm = audio.decode_pcm(path, audio.STREAM_RATE)
+                    except Exception as e:
+                        print(f"[jarvis-voice] tts: cannot decode a chunk ({e}); "
+                              f"playing clip by clip", flush=True)
+                        stream_ok = False
+                        if _still_ours():
+                            _play(path)
+                        continue
+                    if not _start_stream():
+                        if _still_ours():
+                            _play(path)
+                        continue
+                    result = _write_chunk(path, pcm=pcm)
+                    if result == "stop":
+                        return
+                    if result == "fallback" and _still_ours():
+                        _play(path)
+                    continue
+
+                _play(path)
+        finally:
+            if stream is not None:
+                try:
+                    if _still_ours():
+                        # Normal end: wait for the last words to finish. A
+                        # stop or a newer reply must cut the stream at once.
+                        stream.close(wait=True)
+                    else:
+                        stream.terminate()
+                except Exception as e:
+                    print(f"[jarvis-voice] tts: stream close failed: {e}", flush=True)
+                    try:
+                        stream.terminate()
+                    except Exception:
+                        pass
 
     def _run() -> None:
+        player = audio.stream_backend() or "clip-by-clip"
+        print(f"[jarvis-voice] tts: {len(chunks)} chunks via {backend}, "
+              f"player={player}", flush=True)
         producer = threading.Thread(target=_produce, daemon=True, name="tts-produce")
         producer.start()
         try:

@@ -48,11 +48,15 @@ const voice: any = {
   },
 }
 
-// The microphone emoji is drawn two columns wide but measured as one, so the
-// comparison is done in columns and allows that one column of slack.
+// The microphone emoji is drawn two columns wide, while the toolbar's
+// geometric glyphs (○ ● ◉ ▶ ⏸) are one column. Count those widths instead of
+// treating every symbol as wide.
 const columns = (line: string) => {
   let n = 0
-  for (const ch of line.trimEnd()) n += ch.codePointAt(0)! > 0x2000 ? 2 : 1
+  for (const ch of line.trimEnd()) {
+    const cp = ch.codePointAt(0)!
+    n += cp >= 0x1f000 || (cp >= 0x2600 && cp <= 0x27bf) ? 2 : 1
+  }
   return n
 }
 

@@ -327,8 +327,8 @@ check(
   `spoken=${JSON.stringify(spokenByDaemon)}`,
 )
 check(
-  "the session name comes before the answer",
-  (spokenByDaemon[0] ?? "").startsWith("Weather in Berlin.") &&
+  "the session subject comes before the answer",
+  (spokenByDaemon[0] ?? "").startsWith("About weather in Berlin.") &&
     (spokenByDaemon[0] ?? "").includes("It is sunny in Berlin today"),
   JSON.stringify(spokenByDaemon[0]),
 )

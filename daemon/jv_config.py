@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-DAEMON_VERSION = "1.8.2"
+DAEMON_VERSION = "1.9.0"
 
 # ----------------------------------------------------------------------------
 # Paths
@@ -253,6 +253,10 @@ FISH_LATENCY = os.environ.get("JARVIS_VOICE_FISH_LATENCY", "balanced")
 # A cloud reply is rendered in chunks so the first sound arrives early. The
 # chunk size is in characters; a smaller chunk means a faster start.
 FISH_CHUNK_CHARS = int(os.environ.get("JARVIS_VOICE_FISH_CHUNK_CHARS", "220"))
+# The first chunk is deliberately short: it is the only render between the
+# request and the first sound. Once the reader is running, 220-char chunks
+# give the voice a natural rhythm without a long initial wait.
+FISH_FIRST_CHUNK_CHARS = int(os.environ.get("JARVIS_VOICE_FISH_FIRST_CHUNK_CHARS", "120"))
 FISH_TIMEOUT = float(os.environ.get("JARVIS_VOICE_FISH_TIMEOUT", "60"))
 FISH_API_URL = os.environ.get("JARVIS_VOICE_FISH_URL", "https://api.fish.audio/v1/tts")
 # Optional cloud ears. The TUI passes the key per request; the env vars are
@@ -260,6 +264,14 @@ FISH_API_URL = os.environ.get("JARVIS_VOICE_FISH_URL", "https://api.fish.audio/v
 FISH_ASR_URL = os.environ.get("JARVIS_VOICE_FISH_ASR_URL", "https://api.fish.audio/v1/asr")
 FISH_ASR_MODEL = os.environ.get("JARVIS_VOICE_FISH_ASR_MODEL", "transcribe-1-pro")
 FISH_ASR_TIMEOUT = float(os.environ.get("JARVIS_VOICE_FISH_ASR_TIMEOUT", "60"))
+
+# Live replies arrive one sentence at a time. Wait a moment for the next
+# sentences to land before starting, then join everything that is waiting into
+# one continuous utterance instead of opening a new player per sentence.
+QUEUE_COALESCE_S = float(os.environ.get("JARVIS_VOICE_QUEUE_COALESCE_S", "0.35"))
+# Cap one joined batch so an interrupt still takes effect in a few minutes,
+# not after the whole answer has already been queued.
+QUEUE_MAX_CHARS = int(os.environ.get("JARVIS_VOICE_QUEUE_MAX_CHARS", "4000"))
 
 # Where we look for Piper voices, in priority order.
 VOICE_SEARCH_DIRS = [
