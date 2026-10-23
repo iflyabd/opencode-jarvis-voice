@@ -347,9 +347,8 @@ check(
   `spoken=${JSON.stringify(spokenByDaemon)}`,
 )
 check(
-  "the session subject comes before the answer",
-  /^(?:About|On|Regarding) weather in Berlin\.|^Weather in Berlin\./.test(spokenByDaemon[0] ?? "") &&
-    (spokenByDaemon[0] ?? "").includes("It is sunny in Berlin today"),
+  "the same subject is not repeated before the next answer",
+  spokenByDaemon[0] === "It is sunny in Berlin today",
   JSON.stringify(spokenByDaemon[0]),
 )
 

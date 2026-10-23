@@ -504,6 +504,15 @@ function hashString(value: string): number {
   return hash >>> 0
 }
 
+/** Compare titles and subjects without case, punctuation or spacing noise. */
+function titleKey(value: string): string {
+  return String(value ?? "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+}
+
 /** Split `jv_audio`, `autoSpeak`, `controller.ts` into natural words. */
 function humanizeIdentifier(value: string): string {
   return String(value ?? "")
@@ -1361,6 +1370,9 @@ export function createVoiceController(context: any) {
   const leadSeenSessions = new Set<string>()
   /** Per-session variant cursor; it keeps later answers from repeating. */
   const leadState = new Map<string, { count: number; last: number }>()
+  /** The last title/subject that was read, so a continuing thread stays quiet. */
+  let lastReadTitleKey = ""
+  let lastReadSubjectKey = ""
 
   function pickLeadVariant(length: number, seed: string, last = -1): number {
     if (length <= 1) return 0
@@ -1377,31 +1389,52 @@ export function createVoiceController(context: any) {
    * first ("About ..., sir"), "On ..." and "Regarding ...". The subject is the
    * summarized title, never the raw title, and the first answer gets a wider
    * set of introductions so a long session does not sound like a loop.
+   *
+   * A subject is only announced when it changes. Consecutive reads of the same
+   * title or subject return no lead at all (except the one-time role greeting),
+   * and switching to another subject and back makes it announce again.
    */
   function readerLead(sessionID: string, title: string, seed = ""): string {
     const role = readerRole()
     const address = readerAddress()
     const subject = titleSubject(title)
     const kind = titleKind(title)
+    const currentTitleKey = titleKey(title)
+    const currentSubjectKey = titleKey(subject)
+    const sameAsLastRead =
+      Boolean(currentTitleKey && currentTitleKey === lastReadTitleKey) ||
+      Boolean(currentSubjectKey && currentSubjectKey === lastReadSubjectKey)
+    const mentionSubject = Boolean(subject) && !sameAsLastRead
+    const spokenSubject = mentionSubject ? subject : ""
     const firstAnswer = !leadSeenSessions.has(sessionID)
     const introduce = Boolean(role) && !introducedSessions.has(sessionID)
 
-    // A later answer with no subject has nothing useful to announce. The very
-    // first answer can still say hello even when the title is generic.
-    if (!subject && !(firstAnswer && introduce)) return ""
+    const rememberRead = () => {
+      if (currentTitleKey || currentSubjectKey) {
+        lastReadTitleKey = currentTitleKey
+        lastReadSubjectKey = currentSubjectKey
+      }
+    }
+
+    // A later answer on the same thread has nothing new to announce. The very
+    // first answer can still say hello, just without repeating the subject.
+    if (!mentionSubject && !(firstAnswer && introduce)) {
+      rememberRead()
+      return ""
+    }
 
     const state = leadState.get(sessionID) ?? { count: 0, last: -1 }
     const primaryLead: SubjectLead = kind === "question" ? "on" : "about"
-    const primary = subject ? subjectSentence(subject, primaryLead) : ""
-    const about = subject ? subjectSentence(subject, "about") : ""
-    const on = subject ? subjectSentence(subject, "on") : ""
-    const regarding = subject ? subjectSentence(subject, "regarding") : ""
-    const bare = subject ? subjectSentence(subject, "bare") : ""
-    const aboutClause = subject ? subjectClause(subject, "about") : ""
-    const onClause = subject ? subjectClause(subject, "on") : ""
-    const regardingClause = subject ? subjectClause(subject, "regarding") : ""
-    const bareClause = subject ? subjectClause(subject, "bare") : ""
-    const lower = subject ? lowerFirst(subject) : ""
+    const primary = spokenSubject ? subjectSentence(spokenSubject, primaryLead) : ""
+    const about = spokenSubject ? subjectSentence(spokenSubject, "about") : ""
+    const on = spokenSubject ? subjectSentence(spokenSubject, "on") : ""
+    const regarding = spokenSubject ? subjectSentence(spokenSubject, "regarding") : ""
+    const bare = spokenSubject ? subjectSentence(spokenSubject, "bare") : ""
+    const aboutClause = spokenSubject ? subjectClause(spokenSubject, "about") : ""
+    const onClause = spokenSubject ? subjectClause(spokenSubject, "on") : ""
+    const regardingClause = spokenSubject ? subjectClause(spokenSubject, "regarding") : ""
+    const bareClause = spokenSubject ? subjectClause(spokenSubject, "bare") : ""
+    const lower = spokenSubject ? lowerFirst(spokenSubject) : ""
     const addressCap = address ? upperFirst(address) : ""
 
     let variants: string[]
@@ -1422,17 +1455,17 @@ export function createVoiceController(context: any) {
             `${role} reporting. ${primary}`,
             `${role} ready. ${primary}`,
           ]
-      index = pickLeadVariant(variants.length, `${sessionID}|first|${role}|${address}|${subject}`)
+      index = pickLeadVariant(variants.length, `${sessionID}|first|${role}|${address}|${spokenSubject}`)
     } else if (firstAnswer && address) {
       variants = [
         `${addressCap}, ${lower}.`,
         `${aboutClause}, ${address}.`,
         `${addressCap}, here is ${lower}.`,
       ]
-      index = pickLeadVariant(variants.length, `${sessionID}|first-address|${address}|${subject}`)
+      index = pickLeadVariant(variants.length, `${sessionID}|first-address|${address}|${spokenSubject}`)
     } else if (firstAnswer) {
       variants = [about, on, regarding, bare]
-      index = pickLeadVariant(variants.length, `${sessionID}|first-subject|${subject}`)
+      index = pickLeadVariant(variants.length, `${sessionID}|first-subject|${spokenSubject}`)
     } else if (address) {
       variants = [
         `${addressCap}, ${lower}.`,
@@ -1441,16 +1474,17 @@ export function createVoiceController(context: any) {
         `${regardingClause}, ${address}.`,
         `${bareClause}, ${address}.`,
       ]
-      index = pickLeadVariant(variants.length, `${sessionID}|later|${seed}|${subject}|${state.count}`, state.last)
+      index = pickLeadVariant(variants.length, `${sessionID}|later|${seed}|${spokenSubject}|${state.count}`, state.last)
     } else {
       variants = [about, on, regarding, bare]
-      index = pickLeadVariant(variants.length, `${sessionID}|later-subject|${seed}|${subject}|${state.count}`, state.last)
+      index = pickLeadVariant(variants.length, `${sessionID}|later-subject|${seed}|${spokenSubject}|${state.count}`, state.last)
     }
 
     const text = (variants[index] ?? "")
       .replace(/\s+/g, " ")
       .replace(/\s+([.,!?])/g, "$1")
       .trim()
+    rememberRead()
     if (!text) return ""
     leadSeenSessions.add(sessionID)
     if (introduce) introducedSessions.add(sessionID)

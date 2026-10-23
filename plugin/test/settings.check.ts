@@ -6,7 +6,7 @@
  */
 
 import { createStore } from "solid-js/store"
-import { createVoiceController } from "../controller.ts"
+import { createVoiceController, titleSubject } from "../controller.ts"
 
 const cache = "/tmp/opencode/jarvis-voice-settings-cache"
 const spoken: string[] = []
@@ -128,37 +128,119 @@ check("the auto-send toggle writes it back", store.autoSend === false)
 // Explicit reads are independent of auto-read; turn the watcher off so it
 // cannot add its own answer to the spoken list while the persona is checked.
 setStore("autoSpeak", false)
-const firstLeadPattern =
-  /^(?:Alfred here, boss\.|Alfred at your service, boss\.|Boss, Alfred here\.|Alfred reporting, boss\.|Alfred ready, boss\.) About weather in Berlin\./
-
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
-function laterLeadPattern(address: string): RegExp {
-  const cap = address.charAt(0).toUpperCase() + address.slice(1)
+function upperFirst(value: string): string {
+  return value ? value.charAt(0).toUpperCase() + value.slice(1) : value
+}
+
+function firstLeadPattern(role: string, address: string, subject: string): RegExp {
+  const r = escapeRegExp(role)
   const a = escapeRegExp(address)
+  const c = escapeRegExp(upperFirst(address))
+  const s = escapeRegExp(subject)
   return new RegExp(
-    `^(?:${escapeRegExp(cap)}, about weather in Berlin\\.|About weather in Berlin, ${a}\\.|On weather in Berlin, ${a}\\.|Regarding weather in Berlin, ${a}\\.|Weather in Berlin, ${a}\\.)`,
+    `^(?:${r} here, ${a}\\.|${r} at your service, ${a}\\.|${c}, ${r} here\\.|${r} reporting, ${a}\\.|${r} ready, ${a}\\.) About ${s}\\.`,
   )
 }
 
+function laterLeadPattern(address: string, subject: string): RegExp {
+  const a = escapeRegExp(address)
+  const c = escapeRegExp(upperFirst(address))
+  const s = escapeRegExp(subject)
+  const bare = escapeRegExp(upperFirst(subject))
+  return new RegExp(
+    `^(?:${c}, ${s}\\.|About ${s}, ${a}\\.|On ${s}, ${a}\\.|Regarding ${s}, ${a}\\.|${bare}, ${a}\\.)`,
+  )
+}
+
+function plainLeadPattern(subject: string): RegExp {
+  const s = escapeRegExp(subject)
+  const bare = escapeRegExp(upperFirst(subject))
+  return new RegExp(`^(?:About ${s}\\.|On ${s}\\.|Regarding ${s}\\.|${bare}\\.)`)
+}
+
+const weatherTitle = "Weather in Berlin"
+const weatherSubject = titleSubject(weatherTitle)
+const firstIndex = spoken.length
 await voice.speakLast("ses_persona")
 check(
   "the reader introduces itself once and addresses the user",
-  firstLeadPattern.test(spoken[0] ?? ""),
-  JSON.stringify(spoken[0]),
+  firstLeadPattern("Alfred", "boss", weatherSubject).test(spoken[firstIndex] ?? ""),
+  JSON.stringify(spoken[firstIndex]),
 )
 
+const repeatIndex = spoken.length
 await voice.speakLast("ses_persona")
 check(
-  "the next answer uses the address without repeating the role",
-  laterLeadPattern("boss").test(spoken[1] ?? ""),
-  JSON.stringify(spoken[1]),
+  "the same subject is not announced again",
+  spoken[repeatIndex] === "It is sunny in Berlin today",
+  JSON.stringify(spoken[repeatIndex]),
 )
 
+title = "What's the weather in Berlin?"
+const sameSubjectIndex = spoken.length
+await voice.speakLast("ses_persona")
+check(
+  "the same subject is not announced under a different title",
+  spoken[sameSubjectIndex] === "It is sunny in Berlin today",
+  JSON.stringify(spoken[sameSubjectIndex]),
+)
+title = weatherTitle
+
+const otherSessionIndex = spoken.length
+await voice.speakLast("ses_other")
+check(
+  "a new session on the same subject greets without repeating it",
+  /^(?:Alfred here, boss\.|Alfred at your service, boss\.|Boss, Alfred here\.|Alfred reporting, boss\.|Alfred ready, boss\.)/.test(
+    spoken[otherSessionIndex] ?? "",
+  ) && !(spoken[otherSessionIndex] ?? "").includes("weather in Berlin"),
+  JSON.stringify(spoken[otherSessionIndex]),
+)
+
+title = "الطقس في برلين"
+await voice.speakLast("ses_persona")
+const nonLatinRepeatIndex = spoken.length
+await voice.speakLast("ses_persona")
+check(
+  "a non-Latin subject is not announced twice",
+  spoken[nonLatinRepeatIndex] === "It is sunny in Berlin today",
+  JSON.stringify(spoken[nonLatinRepeatIndex]),
+)
+
+title = "Fix the controller file"
+const controllerSubject = titleSubject(title)
+const changedIndex = spoken.length
+await voice.speakLast("ses_persona")
+check(
+  "a changed subject is announced",
+  laterLeadPattern("boss", controllerSubject).test(spoken[changedIndex] ?? ""),
+  JSON.stringify(spoken[changedIndex]),
+)
+
+title = weatherTitle
+const returnIndex = spoken.length
+await voice.speakLast("ses_persona")
+check(
+  "returning to a previous subject announces it again",
+  laterLeadPattern("boss", weatherSubject).test(spoken[returnIndex] ?? ""),
+  JSON.stringify(spoken[returnIndex]),
+)
+
+const rotationTitles = [
+  "Fix the controller file",
+  "Update the README",
+  "Why is the audio cutting out?",
+  "Add a dark mode",
+  "Improve the reader reasoning",
+]
 const beforeRotation = spoken.length
-for (let i = 0; i < 4; i++) await voice.speakLast("ses_persona")
+for (const nextTitle of rotationTitles) {
+  title = nextTitle
+  await voice.speakLast("ses_persona")
+}
 const shapes = new Set(
   spoken
     .slice(beforeRotation)
@@ -171,21 +253,25 @@ check(
 )
 
 setStore("readerAddress", "Captain")
+title = "Weather in Paris"
+const captainSubject = titleSubject(title)
 const captainIndex = spoken.length
 await voice.speakLast("ses_persona")
 check(
   "a changed address applies to the next answer",
-  laterLeadPattern("Captain").test(spoken[captainIndex] ?? ""),
+  laterLeadPattern("Captain", captainSubject).test(spoken[captainIndex] ?? ""),
   JSON.stringify(spoken[captainIndex]),
 )
 
 setStore("readerRole", "")
 setStore("readerAddress", "")
+title = "Fix the audio cutting out"
+const plainSubject = titleSubject(title)
 const plainIndex = spoken.length
 await voice.speakLast("ses_persona")
 check(
   "clearing the persona restores the plain subject",
-  /^(?:About|On|Regarding) weather in Berlin\.|^Weather in Berlin\./.test(spoken[plainIndex] ?? ""),
+  plainLeadPattern(plainSubject).test(spoken[plainIndex] ?? ""),
   JSON.stringify(spoken[plainIndex]),
 )
 
@@ -206,13 +292,12 @@ const freshContext = { ...context, storage: { store: () => [freshStore, setFresh
 const fresh = createVoiceController(freshContext)
 check("auto-send is off on a fresh install", fresh.autoSend() === false)
 check("auto-read is on on a fresh install", fresh.autoSpeak() === true)
+title = weatherTitle
 const defaultIndex = spoken.length
 await fresh.speakLast("ses_persona")
 check(
   "the default reader is Jarvis addressing sir",
-  /^(?:Jarvis here, sir\.|Jarvis at your service, sir\.|Sir, Jarvis here\.|Jarvis reporting, sir\.|Jarvis ready, sir\.) About weather in Berlin\./.test(
-    spoken[defaultIndex] ?? "",
-  ),
+  firstLeadPattern("Jarvis", "sir", weatherSubject).test(spoken[defaultIndex] ?? ""),
   JSON.stringify(spoken[defaultIndex]),
 )
 fresh.dispose()

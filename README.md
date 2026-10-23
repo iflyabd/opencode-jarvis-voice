@@ -210,6 +210,9 @@ you are working in is read out loud:
   Berlin."*, *"About weather in Berlin, sir."*, *"On weather in Berlin, sir."*,
   *"Regarding weather in Berlin, sir."* and *"Weather in Berlin, sir."* The
   reader avoids repeating the same shape twice in a row.
+- the subject is **announced only when it changes**. Consecutive reads of the
+  same title or subject start directly with the answer instead of repeating
+  the title; switching to another subject and coming back announces it again.
 - answers are read **one at a time**. A new answer waits for the one being
   read instead of cutting it off, so two voices never talk over each other and
   the order is kept.
@@ -307,6 +310,9 @@ persona. The defaults are role **Jarvis** and address **sir**:
   frames and long explanations are reduced to a short noun phrase, so a title
   like *"Why is the audio cutting out when I play a long reply?"* is announced
   as *"On the audio cutting out."*;
+* the subject is announced only when it changes. Consecutive reads of the same
+  title or subject skip it; switching to another subject and coming back
+  announces it again;
 * the address can be anything - `boss`, `Captain`, a name - and both fields
   are free text. Clearing a field removes that part; clearing both restores
   the plain *"About weather in Berlin."* subject.
