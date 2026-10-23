@@ -196,11 +196,20 @@ you are working in is read out loud:
 
 - the **session subject comes first**, so you know which conversation the
   answer belongs to: *"About weather in Berlin. It is sunny in Berlin today."*
-  A question becomes *"On the question: why is the audio cutting out."*
+  A long title or question is summarized to its subject instead of being read
+  word for word: *"Why is the audio cutting out?"* becomes *"On the audio
+  cutting out."*
 - titles that are really a path, a file name, a hash or a pile of symbols are
   turned into something worth hearing: *"About the controller file."* instead
   of reading `/root/jarvis-voice/plugin/controller.ts`. A hash-only or
   generic *"New session"* title is skipped instead of read.
+- the lead is **phrased dynamically**, not from one fixed template. The first
+  answer can say *"Jarvis here, sir. About weather in Berlin."*, *"Jarvis at
+  your service, sir. About weather in Berlin."* or *"Sir, Jarvis here. About
+  weather in Berlin."*; later answers rotate through *"Sir, about weather in
+  Berlin."*, *"About weather in Berlin, sir."*, *"On weather in Berlin, sir."*,
+  *"Regarding weather in Berlin, sir."* and *"Weather in Berlin, sir."* The
+  reader avoids repeating the same shape twice in a row.
 - answers are read **one at a time**. A new answer waits for the one being
   read instead of cutting it off, so two voices never talk over each other and
   the order is kept.
@@ -285,10 +294,19 @@ Reading rules:
 **Voice: settings → Voice reader role and address** controls the spoken
 persona. The defaults are role **Jarvis** and address **sir**:
 
-* the first answer of a session introduces the reader once:
-  *"Jarvis here, sir. About weather in Berlin. …"*;
-* later answers use the address without repeating the introduction:
-  *"Sir, about weather in Berlin. …"*;
+* the first answer of a session introduces the reader once, using one of
+  several natural greetings:
+  *"Jarvis here, sir. About weather in Berlin. …"*,
+  *"Jarvis at your service, sir. About weather in Berlin. …"*,
+  *"Sir, Jarvis here. About weather in Berlin. …"*;
+* later answers use the address without repeating the introduction, and
+  rotate through address-first, subject-first and *"On …"* / *"Regarding …"*
+  forms: *"Sir, about weather in Berlin. …"*, *"About weather in Berlin,
+  sir. …"*, *"On weather in Berlin, sir. …"*;
+* the subject is summarized from the session title. Instructions, question
+  frames and long explanations are reduced to a short noun phrase, so a title
+  like *"Why is the audio cutting out when I play a long reply?"* is announced
+  as *"On the audio cutting out."*;
 * the address can be anything - `boss`, `Captain`, a name - and both fields
   are free text. Clearing a field removes that part; clearing both restores
   the plain *"About weather in Berlin."* subject.

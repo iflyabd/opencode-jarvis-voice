@@ -88,7 +88,7 @@ function cleanPersona(value: unknown, max = 60): string {
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.10.0"
+export const PLUGIN_VERSION = "1.11.1"
 
 /**
  * How long a pause ends a live turn.
@@ -416,6 +416,94 @@ const GENERIC_TITLES = new Set([
   "session", "chat", "welcome", "home", "main", "opencode",
 ])
 
+/** A title that is only one of these has no useful subject to announce. */
+const GENERIC_SUBJECTS = new Set(["this", "that", "it", "thing", "stuff", "task", "work", "something"])
+
+/** Leading verbs that describe the action, not the subject of the session. */
+const TITLE_ACTION_VERBS = new Set([
+  "fix", "add", "implement", "make", "update", "improve", "remove", "refactor",
+  "continue", "help", "debug", "investigate", "check", "review", "write", "create",
+  "build", "run", "test", "explain", "tell", "show", "find", "use", "install",
+  "configure", "set", "change", "read", "speak", "start", "stop", "enable",
+  "disable", "support", "return", "keep", "ensure", "avoid", "prevent", "handle",
+  "allow", "simplify", "summarize", "summarise", "clean", "tune", "polish",
+  "redesign", "rewrite", "move", "rename", "delete", "drop", "restore", "save",
+  "load", "send", "fetch", "parse", "render", "cache", "stream", "switch",
+])
+
+const TITLE_STOPWORDS = new Set([
+  "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "am",
+  "do", "does", "did", "have", "has", "had", "will", "would", "can", "could",
+  "should", "shall", "may", "might", "must", "i", "me", "my", "we", "us", "our",
+  "you", "your", "he", "she", "it", "they", "them", "their", "this", "that",
+  "these", "those", "there", "here", "to", "of", "and", "or", "but", "if",
+  "then", "so", "because", "as", "while", "when", "where", "why", "how", "what",
+  "which", "who", "whom", "whose", "with", "without", "into", "over", "under",
+  "after", "before", "between", "through", "during", "about", "regarding", "on",
+  "in", "at", "for", "from", "by", "not", "no", "yes", "please", "just", "very",
+  "much", "more", "most", "really", "also", "too", "now", "again", "thanks",
+])
+
+/** Short connectors that belong inside a subject ("weather in Berlin"). */
+const TITLE_CONNECTORS = new Set(["in", "on", "at", "near", "for", "of", "from", "by", "about"])
+
+/** Particles that keep a phrasal verb together ("cutting out"). */
+const TITLE_PARTICLES = new Set(["out", "up", "down", "off"])
+
+const TITLE_COPULAS = new Set(["is", "are", "was", "were", "be", "been", "being", "am"])
+
+const TITLE_META_PREFIXES: RegExp[] = [
+  /^(?:please|kindly)\b[\s,;:-]*/i,
+  /^(?:can|could|would|will)\s+you\b[\s,;:-]*/i,
+  /^(?:i\s+(?:want|need|would\s+like)\s+to|i'd\s+like\s+to)\b[\s,;:-]*/i,
+  /^(?:help\s+me|let'?s|let\s+us)\b[\s,;:-]*/i,
+  /^(?:we\s+(?:need|should|must)\s+to|you\s+should)\b[\s,;:-]*/i,
+  /^(?:make\s+sure|ensure\s+that)\b[\s,;:-]*/i,
+  /^(?:it\s+would\s+be|this\s+should\s+be|the\s+goal\s+is\s+to)\b[\s,;:-]*/i,
+  /^(?:need|needs|have|has|want|wants)\s+to\b[\s,;:-]*/i,
+  /^(?:first|initial|later|subsequent|next|every|each)\s+(?:answer|response|reply|message)s?(?:\s+per\s+session)?\b[\s,;:-]*/i,
+  /^(?:requirements?|objectives?|goals?|context|background|details?)\b[\s,;:-]*/i,
+  /^(?:[A-Za-z][A-Za-z'’-]*(?:\s+[A-Za-z][A-Za-z'’-]*){0,2}\s+here)\b(?=[,.;:]|\s+(?:sir|madam|ma'am|boss|about|on|regarding)\b)[\s,.;:-]*/i,
+  /^(?:hi|hello|hey)\b[\s,.;:-]*/i,
+  /^(?:task|todo|goal)\b[\s,;:-]*/i,
+]
+
+/** Names that should keep their capitalization after "About". */
+const TITLE_PROPER_NOUNS = new Set([
+  "jarvis", "opencode", "github", "hostinger", "piper", "whisper", "parrot",
+  "termux", "telegram", "openai", "anthropic", "deepseek", "fish", "linux",
+  "berlin", "london", "paris", "tokyo", "new york",
+])
+
+const TITLE_QUESTION_FRAME =
+  /^(?:why|how|what|when|where|who|which)\s+(?:(?:is|are|was|were|do|does|did|can|could|should|would|will|has|have|had|to)\s+)?(?:(?:i|we|you|it|they|he|she)\s+)?/i
+
+const TITLE_YES_NO_FRAME =
+  /^(?:is|are|was|were|do|does|did|can|could|should|would|will|has|have|had)\s+(?:there|it|i|we|you|they|he|she)\b[\s,;:-]*/i
+
+function lowerFirst(value: string): string {
+  const text = String(value ?? "").trim()
+  if (!text) return ""
+  const firstWord = text.split(/\s+/)[0]?.toLowerCase() ?? ""
+  if (TITLE_PROPER_NOUNS.has(firstWord)) return text
+  return /^[A-Z0-9]{2,}\b/.test(text) ? text : text.charAt(0).toLowerCase() + text.slice(1)
+}
+
+function upperFirst(value: string): string {
+  const text = String(value ?? "").trim()
+  if (!text) return ""
+  return /^[A-Z0-9]{2,}\b/.test(text) ? text : text.charAt(0).toUpperCase() + text.slice(1)
+}
+
+function hashString(value: string): number {
+  let hash = 2166136261
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i)
+    hash = Math.imul(hash, 16777619)
+  }
+  return hash >>> 0
+}
+
 /** Split `jv_audio`, `autoSpeak`, `controller.ts` into natural words. */
 function humanizeIdentifier(value: string): string {
   return String(value ?? "")
@@ -589,8 +677,8 @@ function naturalizeSpeech(input: string): string {
   return out
 }
 
-/** One natural phrase for a session title, without paths, hashes or symbols. */
-export function naturalTitle(title: string): string {
+/** Clean a title without shortening it; the summarizer needs the whole thing. */
+function cleanTitleText(title: string): string {
   const original = String(title ?? "").trim()
   if (!original) return ""
   if (URL_ONLY_PATTERN.test(original)) return ""
@@ -621,6 +709,13 @@ export function naturalTitle(title: string): string {
   if (!key || GENERIC_TITLES.has(key)) return ""
   if (/^(?:new|untitled)\s+(?:session|chat)(?:\s+\d+)*$/.test(key)) return ""
   if (!/\p{L}{2,}/u.test(text)) return ""
+  return text.trim()
+}
+
+/** One natural phrase for a session title, without paths, hashes or symbols. */
+export function naturalTitle(title: string): string {
+  let text = cleanTitleText(title)
+  if (!text) return ""
 
   // Keep the announcement short enough to feel like a subtitle, not a report.
   const words = text.split(/\s+/).filter(Boolean)
@@ -633,42 +728,214 @@ export function naturalTitle(title: string): string {
   return text.replace(/[\s.,;:!?…]+$/g, "").trim()
 }
 
+/** Is the title a question, an instruction, or a plain topic? */
+export function titleKind(title: string): "question" | "action" | "topic" {
+  const original = String(title ?? "").trim()
+  if (!original) return "topic"
+  if (
+    /\?\s*$/.test(original) ||
+    /^(?:how|what|why|when|where|who|which|can|could|should|would|is|are|do|does|did)\b/i.test(original)
+  ) {
+    return "question"
+  }
+  const first = original.match(/^([A-Za-z][A-Za-z'’-]*)/)?.[1]?.toLowerCase() ?? ""
+  return TITLE_ACTION_VERBS.has(first) ? "action" : "topic"
+}
+
+function stripTitleMeta(value: string): string {
+  let text = value.trim()
+  for (let pass = 0; pass < 4; pass++) {
+    const before = text
+    for (const pattern of TITLE_META_PREFIXES) text = text.replace(pattern, "").trim()
+    if (text === before) break
+  }
+  return text
+}
+
+function stripTitleQuestion(value: string): string {
+  let text = value.trim()
+  // "Is there a way to ..." is all frame and no subject.
+  text = text.replace(
+    /^(?:is|are|was|were|do|does|did|can|could|should|would|will|has|have|had)\s+there\s+(?:a|any)\s+way\s+to\b[\s,;:-]*/i,
+    "",
+  )
+  text = text.replace(TITLE_YES_NO_FRAME, "")
+  text = text.replace(TITLE_QUESTION_FRAME, "")
+  text = text.replace(/^(?:a|any)\s+way\s+to\b[\s,;:-]*/i, "")
+  return text.trim()
+}
+
+/** Keep the first real clause; the rest is usually explanation, not subject. */
+function firstTitleClause(value: string): string {
+  let text = value.trim()
+  const patterns = [
+    /\s+(?:because|so\s+that|so|but|however|although|though|while|when|whenever|if|unless|which|that|who|where)\s+/i,
+    /\s+and\s+/i,
+    /\s*[,;]\s*/,
+    /\s+[–—-]\s+/,
+  ]
+  for (const pattern of patterns) {
+    const parts = text.split(pattern)
+    if (parts.length > 1 && parts[0].trim().split(/\s+/).filter(Boolean).length >= 2) {
+      text = parts[0].trim()
+    }
+  }
+  // "dynamic reader roles with multiple versions" -> "dynamic reader roles".
+  const withParts = text.split(/\s+with\s+/i)
+  if (withParts.length > 1 && withParts[0].trim().split(/\s+/).filter(Boolean).length >= 3) {
+    text = withParts[0].trim()
+  }
+  return text.trim()
+}
+
+/**
+ * Pull the noun phrase out of a title.
+ *
+ * The reader should say "About the audio cutting out", not read a whole
+ * instruction. This is deliberately local and deterministic: first remove
+ * frames ("why is", "please fix", "how do I"), then keep the first strong
+ * phrase, preserving short connectors such as "in Berlin".
+ */
+function focusTitleSubject(value: string): string {
+  const text = value.trim()
+  if (!text) return ""
+  const words = text.match(/[A-Za-z0-9][A-Za-z0-9'’+.-]*/g) ?? []
+  if (!words.length) return ""
+  const leadingThe = /^the\b/i.test(text)
+
+  const isContent = (word: string): boolean => {
+    const lower = word.toLowerCase()
+    return (!TITLE_STOPWORDS.has(lower) || TITLE_PARTICLES.has(lower)) && /[A-Za-z0-9]/.test(word)
+  }
+
+  const runs: Array<{ words: string[]; count: number }> = []
+  let current: string[] = []
+  let count = 0
+  const flush = () => {
+    if (current.length && count) runs.push({ words: current, count })
+    current = []
+    count = 0
+  }
+
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]
+    const lower = word.toLowerCase()
+    if (isContent(word)) {
+      current.push(word)
+      count += 1
+      continue
+    }
+    const next = words[i + 1]
+    if (
+      (TITLE_CONNECTORS.has(lower) || TITLE_COPULAS.has(lower)) &&
+      current.length &&
+      next &&
+      isContent(next)
+    ) {
+      current.push(word)
+      continue
+    }
+    flush()
+  }
+  flush()
+
+  // The first phrase with two content words is almost always the topic; a
+  // later longer run is usually the explanation that follows it.
+  const preferred = runs.find((run) => run.count >= 2) ?? runs.slice().sort((a, b) => b.count - a.count)[0]
+  let phrase = (preferred?.words ?? words.slice(0, 3)).filter(
+    (word) => !TITLE_COPULAS.has(word.toLowerCase()),
+  )
+  if (!phrase.length) return ""
+
+  // "a dark mode" -> "dark mode"; "the" is useful, "a" is not.
+  while (phrase.length && /^(?:a|an)$/i.test(phrase[0])) phrase.shift()
+  while (
+    phrase.length &&
+    (TITLE_STOPWORDS.has(phrase[0].toLowerCase()) || TITLE_CONNECTORS.has(phrase[0].toLowerCase()))
+  ) {
+    phrase.shift()
+  }
+  // Keep a leading "the" for a concrete subject ("the controller file").
+  if (leadingThe && !/^the$/i.test(phrase[0] ?? "")) phrase.unshift("the")
+  while (phrase.length) {
+    const last = phrase[phrase.length - 1].toLowerCase()
+    if (TITLE_PARTICLES.has(last) && phrase.length > 1) break
+    if (!TITLE_STOPWORDS.has(last) && !TITLE_CONNECTORS.has(last)) break
+    phrase.pop()
+  }
+  if (phrase.length > 7) phrase = phrase.slice(0, 7)
+  while (
+    phrase.length &&
+    (TITLE_STOPWORDS.has(phrase[phrase.length - 1].toLowerCase()) ||
+      TITLE_CONNECTORS.has(phrase[phrase.length - 1].toLowerCase()))
+  ) {
+    phrase.pop()
+  }
+
+  const subject = phrase
+    .join(" ")
+    .replace(/^[,.;:!?…\s]+|[,.;:!?…\s]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+  if (!subject) return ""
+  const key = subject.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+  if (!key || GENERIC_SUBJECTS.has(key) || key === "the") return ""
+  return lowerFirst(subject)
+}
+
+/** The summarized subject of a session title, ready to sit after "About". */
+export function titleSubject(title: string): string {
+  const text = cleanTitleText(title)
+  if (!text) return ""
+
+  let working = stripTitleMeta(text)
+  for (let pass = 0; pass < 4; pass++) {
+    const before = working
+    working = stripTitleQuestion(working)
+    const action = working.match(/^([A-Za-z][A-Za-z'’-]*)\b[\s,;:-]*(.*)$/)
+    if (action && TITLE_ACTION_VERBS.has(action[1].toLowerCase())) {
+      working = action[2].trim().replace(/^(?:me|us|it|this|that)\s+/i, "")
+    }
+    working = stripTitleMeta(working)
+    if (working === before) break
+  }
+  // "Sir, about ..." / "sir. About ..." is an address, not the subject.
+  working = working.replace(
+    /^(?:[A-Za-z][A-Za-z'’-]*)[.,;:]\s+(?=(?:about|on|regarding)\b)/i,
+    "",
+  )
+  working = working.replace(/^(?:about|regarding|on)\s+/i, "").trim()
+  working = working.replace(
+    /^((?:the\s+)?[A-Za-z0-9][\w' -]*)\s+(?:works?|fails?|breaks?|happens?|cuts?\s+out)[?.!]*$/i,
+    "$1",
+  )
+  working = firstTitleClause(working)
+  return focusTitleSubject(working)
+}
+
+type SubjectLead = "about" | "on" | "regarding" | "bare"
+
+function subjectSentence(subject: string, lead: SubjectLead): string {
+  const lower = lowerFirst(subject)
+  if (!lower) return ""
+  if (lead === "bare") return `${upperFirst(lower)}.`
+  const prefix = lead === "about" ? "About" : lead === "on" ? "On" : "Regarding"
+  return `${prefix} ${lower}.`
+}
+
+function subjectClause(subject: string, lead: SubjectLead): string {
+  return subjectSentence(subject, lead).replace(/\.$/, "")
+}
+
 /**
  * The spoken subject before an answer. It is deliberately a sentence of its
  * own: "About the controller file." reads better than a raw path, and the
  * answer that follows still sounds like a conversation.
  */
 export function titleAnnouncement(title: string): string {
-  const subject = naturalTitle(title)
+  const subject = titleSubject(title)
   if (!subject) return ""
-  let phrase = subject
-  // "Fix the reader" -> "fixing the reader"; titles are often imperatives.
-  const gerunds: Record<string, string> = {
-    fix: "fixing", add: "adding", implement: "implementing", make: "making",
-    update: "updating", improve: "improving", remove: "removing", refactor: "refactoring",
-    continue: "continuing", help: "helping", debug: "debugging", investigate: "investigating",
-    check: "checking", review: "reviewing", write: "writing", create: "creating",
-    build: "building", run: "running", test: "testing", explain: "explaining",
-    tell: "telling", show: "showing", find: "finding", use: "using", install: "installing",
-    configure: "configuring", set: "setting", change: "changing", read: "reading",
-    speak: "speaking", start: "starting", stop: "stopping", enable: "enabling",
-    disable: "disabling", support: "supporting", return: "returning", keep: "keeping",
-  }
-  const asked =
-    /\?\s*$/.test(String(title ?? "").trim()) ||
-    /^(?:how|what|why|when|where|who|which|can|could|should|would|is|are|do|does|did)\b/i.test(subject)
-  const first = phrase.match(/^([A-Za-z]+)\b(.*)$/)
-  const gerund = first ? gerunds[first[1].toLowerCase()] : undefined
-  if (first && gerund) phrase = `${gerund}${first[2]}`
-  // "How do I fix this" -> "how to fix this".
-  phrase = phrase.replace(/^how\s+(?:do|can|could|should|would)\s+(?:i|we|you)\s+/i, "how to ")
-  const lower = /^[A-Z0-9]{2,}\b/.test(phrase) ? phrase : phrase.charAt(0).toLowerCase() + phrase.slice(1)
-  if (asked && !/^how to\b/i.test(lower)) {
-    return `On the question: ${lower.replace(/[?\s]+$/g, "")}.`
-  }
-  const lead = /^(?:about|regarding|on)\b/i.test(lower) ? "" : "About "
-  const sentence = lead ? `${lead}${lower}` : lower.charAt(0).toUpperCase() + lower.slice(1)
-  return `${sentence}.`
+  return subjectSentence(subject, titleKind(title) === "question" ? "on" : "about")
 }
 
 /** Turn a markdown answer into something worth listening to. */
@@ -1090,36 +1357,105 @@ export function createVoiceController(context: any) {
 
   /** Sessions where the reader has already introduced itself. */
   const introducedSessions = new Set<string>()
+  /** Sessions where any lead has been spoken, so first/later shapes differ. */
+  const leadSeenSessions = new Set<string>()
+  /** Per-session variant cursor; it keeps later answers from repeating. */
+  const leadState = new Map<string, { count: number; last: number }>()
+
+  function pickLeadVariant(length: number, seed: string, last = -1): number {
+    if (length <= 1) return 0
+    let index = hashString(seed) % length
+    if (index === last) index = (index + 1) % length
+    return index
+  }
 
   /**
    * The spoken lead before an answer.
    *
-   * The role introduces itself once per session ("Jarvis here, sir."); the
-   * address then prefixes each session subject ("Sir, about weather in
-   * Berlin."). Both are optional, and clearing them restores the plain
-   * "About ..." announcement.
+   * The role introduces itself once per session, then later answers rotate
+   * through several natural shapes: address first ("Sir, about ..."), subject
+   * first ("About ..., sir"), "On ..." and "Regarding ...". The subject is the
+   * summarized title, never the raw title, and the first answer gets a wider
+   * set of introductions so a long session does not sound like a loop.
    */
-  function readerLead(sessionID: string, title: string): string {
+  function readerLead(sessionID: string, title: string, seed = ""): string {
     const role = readerRole()
     const address = readerAddress()
-    const subject = titleAnnouncement(title)
+    const subject = titleSubject(title)
+    const kind = titleKind(title)
+    const firstAnswer = !leadSeenSessions.has(sessionID)
     const introduce = Boolean(role) && !introducedSessions.has(sessionID)
-    if (introduce) introducedSessions.add(sessionID)
 
-    if (introduce) {
-      const greeting = address ? `${role} here, ${address}.` : `${role} here.`
-      if (!subject) return greeting
-      const sentence = subject.charAt(0).toUpperCase() + subject.slice(1)
-      return `${greeting} ${sentence}`
+    // A later answer with no subject has nothing useful to announce. The very
+    // first answer can still say hello even when the title is generic.
+    if (!subject && !(firstAnswer && introduce)) return ""
+
+    const state = leadState.get(sessionID) ?? { count: 0, last: -1 }
+    const primaryLead: SubjectLead = kind === "question" ? "on" : "about"
+    const primary = subject ? subjectSentence(subject, primaryLead) : ""
+    const about = subject ? subjectSentence(subject, "about") : ""
+    const on = subject ? subjectSentence(subject, "on") : ""
+    const regarding = subject ? subjectSentence(subject, "regarding") : ""
+    const bare = subject ? subjectSentence(subject, "bare") : ""
+    const aboutClause = subject ? subjectClause(subject, "about") : ""
+    const onClause = subject ? subjectClause(subject, "on") : ""
+    const regardingClause = subject ? subjectClause(subject, "regarding") : ""
+    const bareClause = subject ? subjectClause(subject, "bare") : ""
+    const lower = subject ? lowerFirst(subject) : ""
+    const addressCap = address ? upperFirst(address) : ""
+
+    let variants: string[]
+    let index: number
+
+    if (firstAnswer && introduce) {
+      variants = address
+        ? [
+            `${role} here, ${address}. ${primary}`,
+            `${role} at your service, ${address}. ${primary}`,
+            `${addressCap}, ${role} here. ${primary}`,
+            `${role} reporting, ${address}. ${primary}`,
+            `${role} ready, ${address}. ${primary}`,
+          ]
+        : [
+            `${role} here. ${primary}`,
+            `${role} at your service. ${primary}`,
+            `${role} reporting. ${primary}`,
+            `${role} ready. ${primary}`,
+          ]
+      index = pickLeadVariant(variants.length, `${sessionID}|first|${role}|${address}|${subject}`)
+    } else if (firstAnswer && address) {
+      variants = [
+        `${addressCap}, ${lower}.`,
+        `${aboutClause}, ${address}.`,
+        `${addressCap}, here is ${lower}.`,
+      ]
+      index = pickLeadVariant(variants.length, `${sessionID}|first-address|${address}|${subject}`)
+    } else if (firstAnswer) {
+      variants = [about, on, regarding, bare]
+      index = pickLeadVariant(variants.length, `${sessionID}|first-subject|${subject}`)
+    } else if (address) {
+      variants = [
+        `${addressCap}, ${lower}.`,
+        `${aboutClause}, ${address}.`,
+        `${onClause}, ${address}.`,
+        `${regardingClause}, ${address}.`,
+        `${bareClause}, ${address}.`,
+      ]
+      index = pickLeadVariant(variants.length, `${sessionID}|later|${seed}|${subject}|${state.count}`, state.last)
+    } else {
+      variants = [about, on, regarding, bare]
+      index = pickLeadVariant(variants.length, `${sessionID}|later-subject|${seed}|${subject}|${state.count}`, state.last)
     }
-    if (!subject) return ""
-    if (!address) return subject
-    const opener = address.charAt(0).toUpperCase() + address.slice(1)
-    // Keep an acronym intact ("NASA", not "nASA") after the address comma.
-    const lower = /^[A-Z0-9]{2,}\b/.test(subject)
-      ? subject
-      : subject.charAt(0).toLowerCase() + subject.slice(1)
-    return `${opener}, ${lower}`
+
+    const text = (variants[index] ?? "")
+      .replace(/\s+/g, " ")
+      .replace(/\s+([.,!?])/g, "$1")
+      .trim()
+    if (!text) return ""
+    leadSeenSessions.add(sessionID)
+    if (introduce) introducedSessions.add(sessionID)
+    leadState.set(sessionID, { count: state.count + 1, last: index })
+    return text
   }
 
   function readerSummary(): string {
@@ -2005,7 +2341,7 @@ export function createVoiceController(context: any) {
         toast("The last reply has nothing to read", "warning")
         return
       }
-      const lead = sessionLead(sid)
+      const lead = sessionLead(sid, answer.id ?? "last")
       const toSay = lead ? `${lead} ${text}` : text
       const info = await daemonOrToast()
       if (!info) return
@@ -2038,7 +2374,7 @@ export function createVoiceController(context: any) {
         toast("This message has nothing to read", "warning")
         return
       }
-      const lead = sessionLead(sid)
+      const lead = sessionLead(sid, messageID)
       const toSay = lead ? `${lead} ${text}` : text
       const info = await daemonOrToast()
       if (!info) return
@@ -2262,19 +2598,19 @@ export function createVoiceController(context: any) {
 
   /**
    * The spoken lead before an answer: the reader's optional introduction and
-   * address, then the natural session subject.
+   * address, then the summarized session subject.
    *
    * Session titles are often the first thing the user typed: a path, a file
-   * name, a hash or a one-line instruction. `titleAnnouncement` turns that into
-   * a natural phrase ("About the controller file.") and skips titles that are
-   * only an identifier or a generic placeholder.
+   * name, a hash or a long instruction. `titleSubject` reduces that to a short
+   * noun phrase ("the controller file") and `readerLead` rotates natural lead
+   * shapes around it. Identifiers and generic placeholders are skipped.
    */
-  function sessionLead(sessionID: string): string {
+  function sessionLead(sessionID: string, seed = ""): string {
     try {
       const info: any = context.data.session.get?.(sessionID)
-      return readerLead(sessionID, String(info?.title ?? ""))
+      return readerLead(sessionID, String(info?.title ?? ""), seed)
     } catch {
-      return readerLead(sessionID, "")
+      return readerLead(sessionID, "", seed)
     }
   }
 
@@ -2371,7 +2707,7 @@ export function createVoiceController(context: any) {
     const next = progress ?? { spoken: 0, labelDone: false }
     if (cut > next.spoken) {
       const piece = answer.text.slice(next.spoken, cut)
-      const label = next.labelDone ? "" : sessionLead(sessionID)
+      const label = next.labelDone ? "" : sessionLead(sessionID, id)
       next.spoken = cut
       next.labelDone = true
       seenAnswers.set(sessionID, id)
@@ -2471,7 +2807,7 @@ export function createVoiceController(context: any) {
     if (!answer.text) return
     const body = speakable(answer.text)
     if (!body) return
-    const lead = sessionLead(sessionID)
+    const lead = sessionLead(sessionID, answer.id ?? "reply")
     const toSay = lead ? `${lead} ${body}` : body
     // An explicit request: it takes the speaker from whatever was being read.
     const info = await daemon(false)

@@ -348,7 +348,7 @@ check(
 )
 check(
   "the session subject comes before the answer",
-  (spokenByDaemon[0] ?? "").startsWith("About weather in Berlin.") &&
+  /^(?:About|On|Regarding) weather in Berlin\.|^Weather in Berlin\./.test(spokenByDaemon[0] ?? "") &&
     (spokenByDaemon[0] ?? "").includes("It is sunny in Berlin today"),
   JSON.stringify(spokenByDaemon[0]),
 )

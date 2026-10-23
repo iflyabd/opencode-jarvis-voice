@@ -318,11 +318,16 @@ async function mount(render: () => unknown, width = 40, height = 3) {
   check("an explicit speech limit still clips", speakable(longText, 600).length <= 601)
   check("markdown fences are not read", !speakable("Hi ```code here``` bye").includes("code here"))
 
-  const { naturalTitle, titleAnnouncement } = await import("../controller.ts")
+  const { naturalTitle, titleAnnouncement, titleSubject } = await import("../controller.ts")
   check(
     "a plain title becomes a natural subject",
     titleAnnouncement("Weather in Berlin") === "About weather in Berlin.",
     JSON.stringify(titleAnnouncement("Weather in Berlin")),
+  )
+  check(
+    "the subject is the short noun phrase, not the whole title",
+    titleSubject("Weather in Berlin") === "weather in Berlin",
+    JSON.stringify(titleSubject("Weather in Berlin")),
   )
   check(
     "a path title names the thing, not the path",
@@ -330,14 +335,41 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     JSON.stringify(titleAnnouncement("/root/jarvis-voice/plugin/controller.ts")),
   )
   check(
-    "a path title with an instruction stays natural",
-    titleAnnouncement("Fix /root/jarvis-voice/plugin/controller.ts") === "About fixing the controller file.",
+    "a path title with an instruction drops the imperative",
+    titleAnnouncement("Fix /root/jarvis-voice/plugin/controller.ts") === "About the controller file.",
     JSON.stringify(titleAnnouncement("Fix /root/jarvis-voice/plugin/controller.ts")),
   )
   check(
-    "a question title is introduced as a question",
-    titleAnnouncement("Why is the audio cutting out?") === "On the question: why is the audio cutting out.",
+    "a question title is summarized to its subject",
+    titleAnnouncement("Why is the audio cutting out?") === "On the audio cutting out.",
     JSON.stringify(titleAnnouncement("Why is the audio cutting out?")),
+  )
+  check(
+    "a question frame is removed without losing the noun",
+    titleSubject("How does the reader work?") === "the reader",
+    JSON.stringify(titleSubject("How does the reader work?")),
+  )
+  check(
+    "a subject containing 'here' is not mistaken for a greeting",
+    titleSubject("The reader here is broken") === "the reader",
+    JSON.stringify(titleSubject("The reader here is broken")),
+  )
+  check(
+    "a long instruction keeps only its leading subject",
+    titleSubject("Implement dynamic reader roles with multiple versions and summarize titles") ===
+      "dynamic reader roles",
+    JSON.stringify(titleSubject("Implement dynamic reader roles with multiple versions and summarize titles")),
+  )
+  check(
+    "a question inside a long title is reduced to the subject",
+    titleSubject("First answer per session: Jarvis here, sir. About weather in Berlin.") ===
+      "weather in Berlin",
+    JSON.stringify(titleSubject("First answer per session: Jarvis here, sir. About weather in Berlin.")),
+  )
+  check(
+    "an instruction keeps its real object",
+    titleSubject("Update the README and bump all version files to 1.11.1") === "the README",
+    JSON.stringify(titleSubject("Update the README and bump all version files to 1.11.1")),
   )
   check("a hash-only title is skipped", naturalTitle("3f2a9c1b") === "", JSON.stringify(naturalTitle("3f2a9c1b")))
   check("a generic new-session title is skipped", naturalTitle("New session") === "", JSON.stringify(naturalTitle("New session")))

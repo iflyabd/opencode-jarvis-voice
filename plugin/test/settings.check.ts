@@ -128,35 +128,65 @@ check("the auto-send toggle writes it back", store.autoSend === false)
 // Explicit reads are independent of auto-read; turn the watcher off so it
 // cannot add its own answer to the spoken list while the persona is checked.
 setStore("autoSpeak", false)
+const firstLeadPattern =
+  /^(?:Alfred here, boss\.|Alfred at your service, boss\.|Boss, Alfred here\.|Alfred reporting, boss\.|Alfred ready, boss\.) About weather in Berlin\./
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function laterLeadPattern(address: string): RegExp {
+  const cap = address.charAt(0).toUpperCase() + address.slice(1)
+  const a = escapeRegExp(address)
+  return new RegExp(
+    `^(?:${escapeRegExp(cap)}, about weather in Berlin\\.|About weather in Berlin, ${a}\\.|On weather in Berlin, ${a}\\.|Regarding weather in Berlin, ${a}\\.|Weather in Berlin, ${a}\\.)`,
+  )
+}
+
 await voice.speakLast("ses_persona")
 check(
   "the reader introduces itself once and addresses the user",
-  spoken[0]?.startsWith("Alfred here, boss. About weather in Berlin."),
+  firstLeadPattern.test(spoken[0] ?? ""),
   JSON.stringify(spoken[0]),
 )
 
 await voice.speakLast("ses_persona")
 check(
   "the next answer uses the address without repeating the role",
-  spoken[1]?.startsWith("Boss, about weather in Berlin."),
+  laterLeadPattern("boss").test(spoken[1] ?? ""),
   JSON.stringify(spoken[1]),
 )
 
+const beforeRotation = spoken.length
+for (let i = 0; i < 4; i++) await voice.speakLast("ses_persona")
+const shapes = new Set(
+  spoken
+    .slice(beforeRotation)
+    .map((line) => line.replace(/ It is sunny in Berlin today$/, "")),
+)
+check(
+  "later answers rotate through multiple natural shapes",
+  shapes.size >= 2,
+  JSON.stringify([...shapes]),
+)
+
 setStore("readerAddress", "Captain")
+const captainIndex = spoken.length
 await voice.speakLast("ses_persona")
 check(
   "a changed address applies to the next answer",
-  spoken[2]?.startsWith("Captain, about weather in Berlin."),
-  JSON.stringify(spoken[2]),
+  laterLeadPattern("Captain").test(spoken[captainIndex] ?? ""),
+  JSON.stringify(spoken[captainIndex]),
 )
 
 setStore("readerRole", "")
 setStore("readerAddress", "")
+const plainIndex = spoken.length
 await voice.speakLast("ses_persona")
 check(
   "clearing the persona restores the plain subject",
-  spoken[3]?.startsWith("About weather in Berlin."),
-  JSON.stringify(spoken[3]),
+  /^(?:About|On|Regarding) weather in Berlin\.|^Weather in Berlin\./.test(spoken[plainIndex] ?? ""),
+  JSON.stringify(spoken[plainIndex]),
 )
 
 voice.dispose()
@@ -176,6 +206,15 @@ const freshContext = { ...context, storage: { store: () => [freshStore, setFresh
 const fresh = createVoiceController(freshContext)
 check("auto-send is off on a fresh install", fresh.autoSend() === false)
 check("auto-read is on on a fresh install", fresh.autoSpeak() === true)
+const defaultIndex = spoken.length
+await fresh.speakLast("ses_persona")
+check(
+  "the default reader is Jarvis addressing sir",
+  /^(?:Jarvis here, sir\.|Jarvis at your service, sir\.|Sir, Jarvis here\.|Jarvis reporting, sir\.|Jarvis ready, sir\.) About weather in Berlin\./.test(
+    spoken[defaultIndex] ?? "",
+  ),
+  JSON.stringify(spoken[defaultIndex]),
+)
 fresh.dispose()
 
 server.stop(true)
