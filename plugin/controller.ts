@@ -1345,6 +1345,17 @@ export function createVoiceController(context: any) {
     return typeof settings.autoSpeak === "boolean" ? settings.autoSpeak : seedSettings.autoSpeak
   }
 
+  /**
+   * True while the agent is working on a turn.
+   *
+   * OpenCode 2.1 reports `running`; older hosts reported `busy`. Accept both
+   * so an answer is never read half-written just because the status name
+   * changed under us.
+   */
+  function turnBusy(status: string | undefined): boolean {
+    return status === "busy" || status === "running"
+  }
+
   function autoSendEnabled(): boolean {
     return typeof settings.autoSend === "boolean" ? settings.autoSend : seedSettings.autoSend
   }
@@ -2611,14 +2622,14 @@ export function createVoiceController(context: any) {
       } catch {
         status = undefined
       }
-      if (status === "busy") started = true
+      if (turnBusy(status)) started = true
       // The agent never picked the message up: nothing will be read.
       if (!started && i > 40) return
       const info = await daemon(false)
       if (!info) return
       const state = await api.speech(info).catch(() => null)
       const speaking = state?.active === true
-      if (started && status !== "busy" && !speaking && !answerCheck && !answerAgain) {
+      if (started && !turnBusy(status) && !speaking && !answerCheck && !answerAgain) {
         quiet += 1
         if (quiet >= 2) return
       } else {
@@ -2658,7 +2669,10 @@ export function createVoiceController(context: any) {
   async function speakChunk(sessionID: string, text: string, messageID?: string): Promise<void> {
     const body = speakable(text)
     if (!body) return
-    const info = await daemon(false)
+    // Auto-read runs on a fresh boot too, when the on-demand daemon is not
+    // running yet. Starting it here is what makes a stored `autoSpeak: true`
+    // actually speak after a reboot.
+    const info = await daemonOrToast()
     if (!info) return
     try {
       await api.speak(info, body, { async: true, append: true, ...ttsRequest() })
@@ -2705,7 +2719,7 @@ export function createVoiceController(context: any) {
     } catch {
       status = undefined
     }
-    const writing = status === "busy"
+    const writing = turnBusy(status)
     // A live conversation reads the answer while it is written, the way a
     // phone call would: the first sentence starts long before the last one
     // exists. Everywhere else the whole answer is read once it is complete.

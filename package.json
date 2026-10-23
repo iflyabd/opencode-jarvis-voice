@@ -44,10 +44,11 @@
     "check": "cd plugin && npx tsc --noEmit",
     "test:ui": "cd plugin && bun test/ui.check.ts",
     "test:flow": "cd plugin && bun test/flow.check.ts",
+    "test:autoread": "cd plugin && bun test/autoread.check.ts",
     "test:settings": "cd plugin && bun test/settings.check.ts",
     "test:layout": "cd plugin && bun test/layout.check.tsx",
     "test:daemon": ".venv/bin/python daemon/test_turns.py",
-    "test": "npm run check && npm run test:ui && npm run test:flow && npm run test:settings && npm run test:layout && npm run test:daemon"
+    "test": "npm run check && npm run test:ui && npm run test:flow && npm run test:autoread && npm run test:settings && npm run test:layout && npm run test:daemon"
   },
   "dependencies": {
     "@opencode/plugin": "2.1.2"

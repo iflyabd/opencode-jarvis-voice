@@ -151,8 +151,9 @@ const context: any = {
   data: {
     session: {
       list: () => [{ id: "ses_test" }],
-      // The agent picks the message up right after it is sent.
-      status: () => (agentBusy ? "busy" : "idle"),
+      // OpenCode 2.1 reports `running` while the agent works; older hosts
+      // used `busy`. The watcher must understand both.
+      status: () => (agentBusy ? "running" : "idle"),
       get: (id: string) => ({ id, title: "Weather in Berlin" }),
       message: {
         list: () => (answerReady
@@ -336,7 +337,34 @@ answerReady = false
 answerID = "msg_answer"
 answerText = "It is sunny in Berlin today"
 
-// 7. Auto-speak: a new answer is read out loud, with the session name first.
+// 7. A turn that is still running is not read half-written. OpenCode 2.1
+//    reports `running`, so a watcher that only knows the old `busy` name
+//    would read the first fragment and never speak the rest.
+answerID = "msg_running"
+answerText = "The first half is ready."
+agentBusy = true
+answerReady = true
+spokenByDaemon.length = 0
+eventHandler?.({ details: { type: "message.updated" } })
+await new Promise((r) => setTimeout(r, 1200))
+check(
+  "a running answer is not read before it is complete",
+  spokenByDaemon.length === 0,
+  JSON.stringify(spokenByDaemon),
+)
+answerText = "The first half is ready. The second half is here."
+agentBusy = false
+eventHandler?.({ details: { type: "message.updated" } })
+await new Promise((r) => setTimeout(r, 1200))
+check(
+  "the completed answer is read in full",
+  spokenByDaemon.length === 1 && spokenByDaemon[0] === "The first half is ready. The second half is here.",
+  JSON.stringify(spokenByDaemon),
+)
+
+// 8. Auto-speak: a new answer is read out loud, with the session name first.
+answerID = "msg_answer"
+answerText = "It is sunny in Berlin today"
 answerReady = true
 spokenByDaemon.length = 0
 eventHandler?.({ details: { type: "message.updated" } })
@@ -352,12 +380,12 @@ check(
   JSON.stringify(spokenByDaemon[0]),
 )
 
-// 7. The same answer is never read twice.
+// 9. The same answer is never read twice.
 eventHandler?.({ details: { type: "message.updated" } })
 await new Promise((r) => setTimeout(r, 1200))
 check("an answer is not read twice", spokenByDaemon.length === 1, `spoken=${JSON.stringify(spokenByDaemon)}`)
 
-// 8. With auto-speak off, nothing is read.
+// 10. With auto-speak off, nothing is read.
 setStore("autoSpeak", false)
 answerReady = false
 spokenByDaemon.length = 0
@@ -366,7 +394,7 @@ eventHandler?.({ details: { type: "message.updated" } })
 await new Promise((r) => setTimeout(r, 1200))
 check("nothing is read with auto-speak off", spokenByDaemon.length === 0, `spoken=${JSON.stringify(spokenByDaemon)}`)
 
-// 9. A microphone that cannot open must not end the live conversation: the
+// 11. A microphone that cannot open must not end the live conversation: the
 //    reason is shown, and the next turn tries again.
 startFails = 2
 const sentBeforeRetry = sent.length
