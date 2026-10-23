@@ -22,14 +22,16 @@
  * expose those ids simply show the composer toolbar only.
  *
  * Commands:  voice.pushToTalk (ctrl+alt+v), voice.pauseResume (ctrl+alt+p),
- *            voice.status, voice.cancel, voice.speakLast, voice.toggleAutoSpeak,
- *            voice.toggleAutoSend, voice.toggleLive, /voice
+ *            voice.status, voice.cancel, voice.speakLast, voice.preload,
+ *            voice.togglePreload, voice.toggleAutoSpeak, voice.toggleAutoSend,
+ *            voice.toggleLive, /voice
  *
  * Options (plugin options in cli.json):
  *   { "mic": false }          hide the mic button
  *   { "speak": false }        hide the speaker button
  *   { "autoSpeak": false }    start with replies staying silent
  *   { "autoSend": true }      send the transcript straight away (hands-free)
+ *   { "preloadStt": false }   do not warm the transcript model at startup
  *   { "readerRole": "Jarvis" }  the name the voice reader introduces itself with
  *   { "readerAddress": "sir" }  what the voice reader calls the user
  */
@@ -44,6 +46,16 @@ export default Plugin.define({
   async setup(context) {
     const voice = createVoiceController(context)
     const messages = context.options?.speak === false ? null : createMessageButtons(context, voice)
+
+    // Warm the transcript model once the TUI has settled. The setting is on
+    // by default; the daemon answers /warmup with `skipped` when the model is
+    // already resident (for example after `opencode reload`). The delay keeps
+    // the first frame and the daemon start off the same CPU burst.
+    const preloadTimer = voice.preloadEnabled()
+      ? setTimeout(() => {
+          void voice.preloadOnLoad()
+        }, 1200)
+      : undefined
 
     if (context.options?.mic !== false) {
       // One claim for the prompt footer: the host only honours a single
@@ -152,8 +164,19 @@ export default Plugin.define({
           },
         },
         {
+          id: "voice.togglePreload",
+          title: voice.preloadEnabled()
+            ? "Voice: preload transcript model (on)"
+            : "Voice: preload transcript model (off)",
+          group: "Jarvis Voice",
+          palette: true,
+          run: async () => {
+            await voice.togglePreload()
+          },
+        },
+        {
           id: "voice.preload",
-          title: "Voice: preload the speech model",
+          title: "Voice: preload the speech model now",
           group: "Jarvis Voice",
           palette: true,
           run: async () => {
@@ -192,6 +215,7 @@ export default Plugin.define({
     }))
 
     return () => {
+      if (preloadTimer) clearTimeout(preloadTimer)
       messages?.dispose()
       voice.dispose()
     }

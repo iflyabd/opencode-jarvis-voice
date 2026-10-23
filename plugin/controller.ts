@@ -54,6 +54,8 @@ type VoiceSettings = {
   autoSend: boolean
   /** Read every new answer out loud. */
   autoSpeak: boolean
+  /** Warm the speech-to-text model when OpenCode starts. */
+  preloadStt: boolean
   /** The name the voice reader uses for itself, e.g. "Jarvis"; "" = no introduction. */
   readerRole: string
   /** What the voice reader calls the user, e.g. "sir"; "" = no address. */
@@ -1157,6 +1159,9 @@ export function createVoiceController(context: any) {
     // the user explicitly turns auto-send on.
     autoSend: context.options?.autoSend === true,
     autoSpeak: context.options?.autoSpeak !== false,
+    // Warm the transcript model when OpenCode starts; the daemon skips the
+    // load when the model is already resident.
+    preloadStt: context.options?.preloadStt !== false,
     readerRole: cleanPersona(
       context.options?.readerRole ?? context.options?.role ?? DEFAULT_READER_ROLE,
     ) || "",
@@ -1193,6 +1198,7 @@ export function createVoiceController(context: any) {
         typeof stored.localLanguage !== "string" ||
         typeof stored.autoSend !== "boolean" ||
         typeof stored.autoSpeak !== "boolean" ||
+        typeof stored.preloadStt !== "boolean" ||
         typeof stored.readerRole !== "string" ||
         typeof stored.readerAddress !== "string" ||
         typeof stored.micSource !== "string"
@@ -1208,6 +1214,7 @@ export function createVoiceController(context: any) {
           // Review first: the transcript lands in the prompt box.
           if (typeof draft.autoSend !== "boolean") draft.autoSend = seedSettings.autoSend
           if (typeof draft.autoSpeak !== "boolean") draft.autoSpeak = seedSettings.autoSpeak
+          if (typeof draft.preloadStt !== "boolean") draft.preloadStt = seedSettings.preloadStt
           if (typeof draft.readerRole !== "string") draft.readerRole = seedSettings.readerRole
           if (typeof draft.readerAddress !== "string") draft.readerAddress = seedSettings.readerAddress
           if (typeof draft.micSource !== "string") draft.micSource = seedSettings.micSource
@@ -1343,6 +1350,11 @@ export function createVoiceController(context: any) {
    */
   function autoSpeakEnabled(): boolean {
     return typeof settings.autoSpeak === "boolean" ? settings.autoSpeak : seedSettings.autoSpeak
+  }
+
+  /** Whether the transcript model is warmed when OpenCode starts. */
+  function preloadSttEnabled(): boolean {
+    return typeof settings.preloadStt === "boolean" ? settings.preloadStt : seedSettings.preloadStt
   }
 
   /**
@@ -2166,6 +2178,13 @@ export function createVoiceController(context: any) {
             description: micLabel(),
           },
           { title: "Transcription", value: "stt", description: sttLabel() },
+          {
+            title: preloadSttEnabled() ? "Preload transcript model (on)" : "Preload transcript model (off)",
+            value: "preload",
+            description: preloadSttEnabled()
+              ? "Warm the speech model when OpenCode starts so the first transcript is quick"
+              : "The speech model loads on the first transcript instead",
+          },
           { title: "Voice reader role and address", value: "reader", description: readerSummary() },
           {
             title: autoSendEnabled() ? "Auto-send transcripts (on)" : "Auto-send transcripts (off)",
@@ -2238,6 +2257,8 @@ export function createVoiceController(context: any) {
         }
       } else if (choice === "stt") {
         await openSttSettings()
+      } else if (choice === "preload") {
+        await togglePreload()
       } else if (choice === "reader") {
         await openReaderSettings()
       } else if (choice === "autosend") {
@@ -2252,24 +2273,63 @@ export function createVoiceController(context: any) {
     }
   }
 
-  async function preload(): Promise<void> {
-    const info = await daemonOrToast()
-    if (!info) return
-    if (!sttReady()) {
-      toast("Fish Audio STT needs an API key — open Voice: settings → Transcription", "warning")
+  /**
+   * Warm the local transcript model. `automatic` is the silent startup path:
+   * it respects the on/off setting and never shows a toast. The daemon answers
+   * `skipped` when the model is already resident, so an OpenCode reload or a
+   * second call does not load the weights again.
+   */
+  async function preload(options: { automatic?: boolean } = {}): Promise<void> {
+    const automatic = options.automatic === true
+    if (automatic && !preloadSttEnabled()) return
+
+    if (settings.sttProvider === "fish") {
+      if (!automatic) {
+        const ready = sttReady()
+        toast(
+          ready
+            ? "Fish Audio STT is cloud-hosted; no local model needs loading"
+            : "Fish Audio STT needs an API key — open Voice: settings → Transcription",
+          ready ? "info" : "warning",
+        )
+      }
       return
     }
-    try {
-      await api.warmup(info, sttRequest())
-      toast(
-        settings.sttProvider === "fish"
-          ? "Fish Audio STT is cloud-hosted; no local model needs loading"
-          : "Speech model ready — transcription will be quick",
-        "success",
-      )
-    } catch (e) {
-      toast(`Could not warm the speech model: ${errorText(e)}`, "error")
+    if (!sttReady()) {
+      if (!automatic) toast("Fish Audio STT needs an API key — open Voice: settings → Transcription", "warning")
+      return
     }
+
+    const info = automatic ? await daemon(true) : await daemonOrToast()
+    if (!info) return
+    try {
+      const result = (await api.warmup(info, sttRequest())) as {
+        skipped?: boolean
+        already_loaded?: boolean
+        reason?: string
+      }
+      if (!automatic) {
+        if (result?.skipped) {
+          toast(
+            result.reason ||
+              (result.already_loaded
+                ? "Speech model is already ready"
+                : "Nothing to preload for this speech provider"),
+            "info",
+          )
+        } else {
+          toast("Speech model ready — transcription will be quick", "success")
+        }
+      }
+    } catch (e) {
+      if (!automatic) toast(`Could not warm the speech model: ${errorText(e)}`, "error")
+    }
+  }
+
+  /** Called once by the TUI after it has settled; silent and non-blocking. */
+  async function preloadOnLoad(): Promise<void> {
+    if (!preloadSttEnabled()) return
+    await preload({ automatic: true })
   }
 
   /* ------------------------------------------------------------ speech state */
@@ -3159,6 +3219,21 @@ export function createVoiceController(context: any) {
     toast(next ? "Replies will be spoken" : "Replies will stay silent", next ? "success" : "info")
   }
 
+  async function togglePreload(): Promise<void> {
+    const next = !preloadSttEnabled()
+    await persist((draft) => {
+      draft.preloadStt = next
+    })
+    repaint()
+    if (!next) {
+      toast("Transcript preload off — the model will load on first use", "info")
+      return
+    }
+    toast("Transcript preload on — warming the speech model", "success")
+    // Turning it on should help now, not only at the next OpenCode start.
+    void preload({ automatic: true })
+  }
+
   function dispose(): void {
     stopSpeechWatch()
     stopAnswers?.()
@@ -3210,6 +3285,9 @@ export function createVoiceController(context: any) {
     status,
     openSettings,
     preload,
+    preloadOnLoad,
+    preloadEnabled: () => preloadSttEnabled(),
+    togglePreload,
     toggleAutoSpeak,
     toggleAutoSend,
     refreshSpeech,

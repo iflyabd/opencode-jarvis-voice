@@ -191,6 +191,22 @@ def _caption_model_name(main: str | None = None) -> str:
 _last_good_model: str | None = None
 
 
+def _faster_whisper_key(ref: str) -> tuple:
+    """The cache key for one resolved model on this device."""
+    return ("fw", ref, cfg.WHISPER_DEVICE, cfg.WHISPER_COMPUTE)
+
+
+def faster_whisper_loaded(model: str | None = None) -> bool:
+    """True when the resolved Whisper model is already resident.
+
+    `/warmup` uses this to answer "already loaded" without touching the
+    weights again. The daemon keeps up to three models resident, so an
+    OpenCode reload can preload again for free.
+    """
+    with _lock:
+        return _faster_whisper_key(_resolve_model_ref(model)) in _loaded
+
+
 def _get_faster_whisper_model(model: str | None = None):
     """Load (once) and return (model, resolved_ref, model_name)."""
     from faster_whisper import WhisperModel
@@ -201,7 +217,7 @@ def _get_faster_whisper_model(model: str | None = None):
         raise SttError(
             f"unknown Whisper model '{name}'. Use one of: {', '.join(_KNOWN_MODELS)}"
         )
-    key = ("fw", ref, cfg.WHISPER_DEVICE, cfg.WHISPER_COMPUTE)
+    key = _faster_whisper_key(ref)
     with _lock:
         model_obj = _loaded.get(key)
         if model_obj is not None:
@@ -781,7 +797,13 @@ def warmup(options: dict | None = None, backend: str | None = None) -> dict:
             # Load the weights only. A dummy transcription would spend another
             # second decoding silence (and often hallucinate "thank you").
             local = _local_opts(options)
-            _get_faster_whisper_model(str(local.get("model") or "").strip() or None)
+            # Match the model the next turn will use: an explicit setting
+            # first, then the multilingual model that last worked.
+            model = str(local.get("model") or "").strip() or _last_good_model or None
+            if faster_whisper_loaded(model):
+                return {"ok": True, "backend": b, "skipped": True,
+                        "already_loaded": True, "ms": 0}
+            _get_faster_whisper_model(model)
         else:
             # Other backends have no separate loader.
             transcribe(b"\x00\x00" * (cfg.SAMPLE_RATE // 4), cfg.SAMPLE_RATE, backend=b)

@@ -16,7 +16,7 @@ Endpoints (JSON unless noted):
   POST /transcribe        raw 16-bit mono PCM or WAV body   -> {text}
   POST /speak             synthesize + play locally         {text, async?, backend?, fish?, append?}
   POST /synth             synthesize only, returns audio/wav or audio/mpeg
-  POST /warmup            load the local STT model now      {stt?}
+  POST /warmup            load the local STT model now      {stt?}  -> {skipped?}
   GET  /speech            what the speakers are doing now (playing/paused)
   POST /pause             suspend the current playback (SIGSTOP)
   POST /resume            continue a paused playback (SIGCONT)
@@ -26,11 +26,13 @@ Endpoints (JSON unless noted):
 
 Auth: `Authorization: Bearer <token>` (token in ~/.cache/jarvis-voice/daemon.json).
 
-On-demand by design (battery): nothing heavy happens at startup. In the default
-`lazy` warmup mode the STT model loads in the background when push-to-talk
-starts (while the user is speaking anyway), and the daemon exits after
-JARVIS_VOICE_IDLE_EXIT_S seconds without real activity - status polls from the
-UI do not count, playing speech does. The plugin starts it again on demand.
+On-demand by design (battery): the daemon itself does nothing heavy at startup.
+The plugin may request `/warmup` after OpenCode starts (transcript preload, on
+by default); otherwise the default `lazy` warmup mode loads the STT model in
+the background when push-to-talk starts (while the user is speaking anyway).
+The daemon exits after JARVIS_VOICE_IDLE_EXIT_S seconds without real activity -
+status polls from the UI do not count, playing speech does. The plugin starts
+it again on demand.
 """
 
 from __future__ import annotations

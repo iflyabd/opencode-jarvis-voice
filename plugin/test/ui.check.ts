@@ -489,6 +489,17 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     ids.includes("voice.pauseResume") && (layer?.bindings ?? []).includes("voice.pauseResume"),
     ids.join(","),
   )
+  const preloadToggle = (layer?.commands ?? []).find((c: any) => c.id === "voice.togglePreload")
+  check(
+    "the transcript preload toggle is in the commands menu",
+    ids.includes("voice.togglePreload") && ids.includes("voice.preload"),
+    ids.join(","),
+  )
+  check(
+    "the preload toggle shows its current state",
+    /\(on\)$/.test(String(preloadToggle?.title ?? "")),
+    String(preloadToggle?.title),
+  )
   check("setup returns a cleanup function", typeof cleanup === "function", typeof cleanup)
   if (typeof cleanup === "function") cleanup()
 }

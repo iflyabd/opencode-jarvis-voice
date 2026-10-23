@@ -578,6 +578,33 @@ def _stt_speed_checks() -> None:
     check("both the caption and final models stay loaded",
           stt._LOADED_MAX >= 2, str(stt._LOADED_MAX))
 
+    # `/warmup` must not reload weights that are already resident: an OpenCode
+    # reload preloads again, and the daemon should answer "skipped".
+    saved_loaded = dict(stt._loaded)
+    real_get = stt._get_faster_whisper_model
+    loaded_calls: list[str | None] = []
+    try:
+        stt._loaded.clear()
+        stt._get_faster_whisper_model = (
+            lambda model=None: loaded_calls.append(model) or (object(), "/tmp/model", model or "tiny")
+        )
+        first = stt.warmup({"local": {"model": "small"}}, backend="faster-whisper")
+        check("preload loads the chosen model",
+              first.get("ok") is True and not first.get("skipped")
+              and loaded_calls == ["small"], str(first))
+
+        ref = stt._resolve_model_ref("small")
+        stt._loaded[stt._faster_whisper_key(ref)] = object()
+        loaded_calls.clear()
+        again = stt.warmup({"local": {"model": "small"}}, backend="faster-whisper")
+        check("preload skips a model that is already loaded",
+              again.get("skipped") is True and again.get("already_loaded") is True
+              and loaded_calls == [], str(again))
+    finally:
+        stt._get_faster_whisper_model = real_get
+        stt._loaded.clear()
+        stt._loaded.update(saved_loaded)
+
 
 _stt_speed_checks()
 

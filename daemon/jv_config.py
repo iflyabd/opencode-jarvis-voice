@@ -217,7 +217,8 @@ IDLE_EXIT_S = int(os.environ.get("JARVIS_VOICE_IDLE_EXIT_S", "300") or 0)
 #     user speaks and never while the daemon sits idle.
 #   boot: warm everything at daemon start (old behaviour, hot first answer,
 #     costs a few seconds of CPU whenever the daemon starts).
-#   off: never preload; the model loads on the first transcription.
+#   off: no automatic warmup; the model loads on the first transcription.
+#     An explicit POST /warmup (the plugin's startup preload) still loads it.
 WARMUP_MODE = (os.environ.get("JARVIS_VOICE_WARMUP", "lazy") or "off").strip().lower()
 
 

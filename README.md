@@ -15,9 +15,11 @@ toolbar above the text box with **auto-read**, **auto-send**, **play/pause**, an
 a 450 ms pause ends your turn, the words appear as you speak, and the answer
 starts playing while it is still being written.
 
-It is built to keep a phone cold: the daemon starts **only when you use voice**,
-warms the model **while you speak** (never at boot), and **exits when idle**, so
-idle CPU is zero and its memory goes back to the system.
+It is built to keep a phone cold: the daemon starts **on demand** (at OpenCode
+start for the transcript preload, or when you use voice), warms the model
+**while you speak**, and **exits when idle**, so idle CPU is zero and its memory
+goes back to the system. The transcript preload is on by default; turn it off
+with **Voice: preload transcript model** in the commands menu.
 
 Works the same on **Parrot OS**, **Termux / Android**, and a **normal PC**
 (Linux, macOS, Windows).
@@ -396,7 +398,8 @@ shown in a toast so it can be copied by hand.
 | `Voice: push to talk` | record a turn (`ctrl+alt+v`) |
 | `Voice: read / pause / resume the reply` | one button for read, pause, resume (`ctrl+alt+p`) |
 | `Voice: settings (Fish Audio / reader / transcription / microphone)` | choose the voice and speech-to-text providers, API key, voice, language, reader role and address; inspect mic/STT |
-| `Voice: preload the speech model` | load Whisper now so the next transcript is fast |
+| `Voice: preload transcript model (on/off)` | warm the speech-to-text model when OpenCode starts (on by default; turning it on preloads now) |
+| `Voice: preload the speech model now` | load Whisper immediately so the next transcript is fast |
 | `Voice: status` | what mic, STT model, TTS voice are in use, plus the plugin and daemon versions |
 | `Voice: cancel listening / stop speaking` | shut it up immediately |
 | `Voice: speak the last reply` | read the current answer out loud |
@@ -698,13 +701,16 @@ drive your microphone.
 
 ### Battery & resources
 
-Nothing runs unless you use it:
+Nothing runs while idle:
 
-* **Starts on demand** — when you press push-to-talk, click a button, or the
-  agent calls a voice tool. Opening OpenCode does not start it.
-* **Cheap boot** — under a second, no model loading. The STT model is warmed
-  in the background when push-to-talk starts (a transcription is coming
-  anyway), so CPU work happens while you speak, never while it sits idle.
+* **Starts on demand** — when you press push-to-talk, click a button, the agent
+  calls a voice tool, or the transcript preload runs after OpenCode starts.
+  Turn the preload off with **Voice: preload transcript model** if you prefer
+  the daemon to start only on the first voice action.
+* **Cheap boot** — under a second, no model loading. With preload on (the
+  default) the STT model is warmed in the background shortly after OpenCode
+  starts; with it off, the model is warmed when push-to-talk starts (a
+  transcription is coming anyway), so CPU work happens while you speak.
 * **Mic only while needed** — the direct phone-mic source is loaded when the
   first push-to-talk starts, sits idle between turns, and is unloaded when the
   daemon exits. The first press pays a short (~1 s) module-load cost; later
@@ -747,6 +753,7 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
         "speak": true,
         "autoSpeak": true,
         "autoSend": false,
+        "preloadStt": true,
         "readerRole": "Jarvis",
         "readerAddress": "sir"
       }
@@ -761,6 +768,7 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
 | `speak` | `true` | show the auto-read/auto-send/play/live toolbar above the text box |
 | `autoSpeak` | `true` | read every new answer out loud, starting with a natural session subject |
 | `autoSend` | `false` | send push-to-talk transcripts to the agent as soon as they are transcribed; off means they land in the prompt box for review |
+| `preloadStt` | `true` | warm the speech-to-text model when OpenCode starts; the daemon skips the load when the model is already resident |
 | `readerRole` | `"Jarvis"` | the name the voice reader introduces itself with once per session; `""` disables the introduction |
 | `readerAddress` | `"sir"` | what the voice reader calls you; `""` disables the address |
 | `fishAudio` | — | optional `{ provider, apiKey, voiceId, voiceName, model, sttProvider, sttModel, sttLanguage }`; the settings dialog is safer for keys |
@@ -785,7 +793,7 @@ token from `~/.cache/jarvis-voice/daemon.json`:
 | `POST /speak` | synthesize + play (`{text, async?, backend?, fish?, append?}`; `append` queues behind the voice instead of cutting it off) |
 | `POST /ptt/start` | `{max_ms?, silence_ms?, start_timeout_ms?, partial?, keep_warm?, stt?, mic?}`; `partial` captions while recording, `keep_warm` keeps the device open |
 | `POST /synth` | synthesize only, returns `audio/wav` or `audio/mpeg` |
-| `POST /warmup` | load the local STT model now (no audio); accepts `{stt?}` and is a no-op for Fish |
+| `POST /warmup` | load the local STT model now (no audio); accepts `{stt?}`, returns `skipped: true` when the model is already resident, and is a no-op for Fish |
 | `GET /speech` | what the speakers are doing now (`active`, `paused`, `elapsed_ms`) |
 | `POST /pause` · `POST /resume` | suspend / continue the current playback (`SIGSTOP` / `SIGCONT`) |
 | `POST /interrupt` | stop capture and playback |
@@ -800,9 +808,11 @@ defaults to Fish. The optional `mic` object is
 ### Speech-to-text speed & quality
 
 The default is `tiny.en` (English): it is roughly twice as fast as multilingual
-`tiny` and more accurate for English. The model is warmed when push-to-talk
-starts, while you are speaking, so the first real decode is not paying the full
-load cost. On the reference arm64 phone a 1.5 s clip transcribes in about
+`tiny` and more accurate for English. The model is preloaded when OpenCode
+starts (on by default; turn it off with **Voice: preload transcript model** in
+the commands menu), and push-to-talk also warms it while you are speaking, so
+the first real decode is not paying the full load cost. On the reference arm64
+phone a 1.5 s clip transcribes in about
 0.6–0.7 s once the model is loaded; a cold model load is about 0.5 s from the
 page cache (a few seconds on a completely cold start).
 
