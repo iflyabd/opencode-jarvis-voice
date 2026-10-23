@@ -216,6 +216,8 @@ async function mount(render: () => unknown, width = 40, height = 3) {
   const firstFrame = s.captureCharFrame()
   check("the composer toolbar renders read", firstFrame.includes("read"), JSON.stringify(firstFrame))
   check("the composer toolbar renders send", firstFrame.includes("send"), JSON.stringify(firstFrame))
+  check("the auto-read toggle has an auto- label", firstFrame.includes("◉ auto-read"), JSON.stringify(firstFrame))
+  check("the auto-send toggle has an auto- label", firstFrame.includes("◇ auto-send"), JSON.stringify(firstFrame))
   check("the composer toolbar renders the master play control", firstFrame.includes("▶ play"), JSON.stringify(firstFrame))
   check("live button renders the idle label", firstFrame.includes("live"), JSON.stringify(firstFrame))
 
@@ -230,14 +232,14 @@ async function mount(render: () => unknown, width = 40, height = 3) {
 
   await clickWord("read")
   check("read click toggles auto-read", f.calls.includes("toggleAutoSpeak"), f.calls.join(","))
-  check("auto-read turns off in place", s.captureCharFrame().includes("○ read"), JSON.stringify(s.captureCharFrame()))
+  check("auto-read turns off in place", s.captureCharFrame().includes("○ auto-read"), JSON.stringify(s.captureCharFrame()))
   f.setAutoSpeak(true)
   await s.renderOnce()
-  check("auto-read turns back on in place", s.captureCharFrame().includes("◉ read"), JSON.stringify(s.captureCharFrame()))
+  check("auto-read turns back on in place", s.captureCharFrame().includes("◉ auto-read"), JSON.stringify(s.captureCharFrame()))
 
   await clickWord("send")
   check("send click toggles auto-send", f.calls.includes("toggleAutoSend"), f.calls.join(","))
-  check("auto-send turns on in place", s.captureCharFrame().includes("◆ send"), JSON.stringify(s.captureCharFrame()))
+  check("auto-send turns on in place", s.captureCharFrame().includes("◆ auto-send"), JSON.stringify(s.captureCharFrame()))
 
   await clickWord("▶")
   check("master play calls pause/resume for the session", f.calls.includes("pauseResume:ses_xyz"), f.calls.join(","))

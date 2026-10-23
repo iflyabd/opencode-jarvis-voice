@@ -13,8 +13,8 @@
  *
  * UI buttons (all follow the host theme, clickable with the mouse):
  *   `prompt.footer`         bottom-right of the prompt box: the mic / PTT button
- *   `session.composer.top`  the toolbar above the text box: read, send,
- *                           master play/pause, and the live voice toggle
+ *   `session.composer.top`  the toolbar above the text box: auto-read,
+ *                           auto-send, master play/pause, and live
  *   under each answer       a read / pause / resume button for that message
  *
  * The per-message rows are attached to the transcript renderables for assistant
@@ -30,6 +30,8 @@
  *   { "speak": false }        hide the speaker button
  *   { "autoSpeak": false }    start with replies staying silent
  *   { "autoSend": true }      send the transcript straight away (hands-free)
+ *   { "readerRole": "Jarvis" }  the name the voice reader introduces itself with
+ *   { "readerAddress": "sir" }  what the voice reader calls the user
  */
 
 import { Plugin } from "@opencode/plugin/tui"
@@ -141,7 +143,7 @@ export default Plugin.define({
         },
         {
           id: "voice.settings",
-          title: "Voice: settings (Fish Audio / transcription / microphone)",
+          title: "Voice: settings (Fish Audio / reader / transcription / microphone)",
           group: "Jarvis Voice",
           palette: true,
           slash: { name: "voice-settings" },
@@ -160,11 +162,11 @@ export default Plugin.define({
         },
         {
           id: "voice.toggleAutoSpeak",
-          title: "Voice: toggle speaking replies",
+          title: "Voice: toggle auto-read",
           group: "Jarvis Voice",
           palette: true,
-          run: () => {
-            voice.toggleAutoSpeak()
+          run: async () => {
+            await voice.toggleAutoSpeak()
           },
         },
         {

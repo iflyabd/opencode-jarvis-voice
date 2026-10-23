@@ -3,7 +3,7 @@
  *
  *   MicButton     appended to `prompt.footer`         (bottom-right of the prompt box)
  *   ComposerLive  appended to `session.composer.top`  (toolbar above the text box:
- *                 read, send, master play/pause, and live)
+ *                 auto-read, auto-send, master play/pause, and live)
  *
  * Plugin files are compiled outside the host's own JSX build, and the host
  * renderer only processes reactive text updates during its own repaint passes:
@@ -212,9 +212,9 @@ function toolbarButton(voice: VoiceController, options: ToolbarButtonOptions): a
 /**
  * The row above the prompt box:
  *
- *   read  send  play/pause  live
+ *   auto-read  auto-send  play/pause  live
  *
- * Read and send are the two hands-free switches; the middle control is the
+ * Auto-read and auto-send are the two hands-free switches; the middle control is the
  * master play/pause for whatever the reader is speaking right now (and reads
  * the last answer when the speaker is idle). Live stays on the right edge, so
  * the row lines up with the mic button below it.
@@ -235,14 +235,14 @@ function createToolbar(props: ButtonProps): any {
 
   row.add(
     toolbarButton(props.voice, {
-      label: () => (props.voice.autoSpeak?.() ? "◉ read" : "○ read"),
+      label: () => (props.voice.autoSpeak?.() ? "◉ auto-read" : "○ auto-read"),
       fg: (hovered) => (props.voice.autoSpeak?.() ? active() : secondary(hovered)),
       click: () => props.voice.toggleAutoSpeak(),
     }),
   )
   row.add(
     toolbarButton(props.voice, {
-      label: () => (props.voice.autoSend?.() ? "◆ send" : "◇ send"),
+      label: () => (props.voice.autoSend?.() ? "◆ auto-send" : "◇ auto-send"),
       fg: (hovered) => (props.voice.autoSend?.() ? active() : secondary(hovered)),
       click: () => void props.voice.toggleAutoSend(),
     }),

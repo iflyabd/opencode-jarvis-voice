@@ -54,6 +54,10 @@ type VoiceSettings = {
   autoSend: boolean
   /** Read every new answer out loud. */
   autoSpeak: boolean
+  /** The name the voice reader uses for itself, e.g. "Jarvis"; "" = no introduction. */
+  readerRole: string
+  /** What the voice reader calls the user, e.g. "sir"; "" = no address. */
+  readerAddress: string
   /** The microphone to record from; "" = let the daemon pick. */
   micSource: string
 }
@@ -63,11 +67,28 @@ type FishVoice = { id: string; title: string; description?: string }
 const FISH_MODEL = "s2.1-pro-free"
 const FISH_STT_MODEL = "transcribe-1-pro"
 
+/** The spoken persona defaults; both can be changed or cleared in settings. */
+const DEFAULT_READER_ROLE = "Jarvis"
+const DEFAULT_READER_ADDRESS = "sir"
+
+/**
+ * Keep a custom role or address to one short spoken phrase. Punctuation at the
+ * end is dropped because the announcement adds its own comma or full stop.
+ */
+function cleanPersona(value: unknown, max = 60): string {
+  return String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[,.;:!?…]+$/g, "")
+    .slice(0, max)
+    .trim()
+}
+
 /**
  * The plugin build that is running in this TUI. It is shown in the status
  * line so a stale TUI (started before an update) is obvious at a glance.
  */
-export const PLUGIN_VERSION = "1.9.0"
+export const PLUGIN_VERSION = "1.10.0"
 
 /**
  * How long a pause ends a live turn.
@@ -821,7 +842,6 @@ export function createVoiceController(context: any) {
     repaint()
   }
 
-  let autoSpeak = context.options?.autoSpeak !== false
   // The moment the plugin started: answers from before that were already
   // seen (or already read) and must not be spoken again.
   const startedAt = Date.now()
@@ -857,8 +877,16 @@ export function createVoiceController(context: any) {
     fishSttLanguage: normalizeSttLanguage(optionStt.language ?? context.options?.fishSttLanguage ?? optionFish.sttLanguage),
     localModel: normalizeLocalModel(optionStt.localModel ?? context.options?.localModel ?? optionFish.localModel),
     localLanguage: normalizeSttLanguage(optionStt.localLanguage ?? context.options?.localLanguage ?? optionFish.localLanguage),
+    // Review-first is the default: a transcript lands in the prompt box until
+    // the user explicitly turns auto-send on.
     autoSend: context.options?.autoSend === true,
     autoSpeak: context.options?.autoSpeak !== false,
+    readerRole: cleanPersona(
+      context.options?.readerRole ?? context.options?.role ?? DEFAULT_READER_ROLE,
+    ) || "",
+    readerAddress: cleanPersona(
+      context.options?.readerAddress ?? context.options?.address ?? context.options?.userTitle ?? DEFAULT_READER_ADDRESS,
+    ) || "",
     micSource: String(context.options?.micSource ?? context.options?.mic ?? "").trim(),
   }
 
@@ -889,6 +917,8 @@ export function createVoiceController(context: any) {
         typeof stored.localLanguage !== "string" ||
         typeof stored.autoSend !== "boolean" ||
         typeof stored.autoSpeak !== "boolean" ||
+        typeof stored.readerRole !== "string" ||
+        typeof stored.readerAddress !== "string" ||
         typeof stored.micSource !== "string"
       if (needsMigration) {
         void setStored((draft) => {
@@ -902,6 +932,8 @@ export function createVoiceController(context: any) {
           // Review first: the transcript lands in the prompt box.
           if (typeof draft.autoSend !== "boolean") draft.autoSend = seedSettings.autoSend
           if (typeof draft.autoSpeak !== "boolean") draft.autoSpeak = seedSettings.autoSpeak
+          if (typeof draft.readerRole !== "string") draft.readerRole = seedSettings.readerRole
+          if (typeof draft.readerAddress !== "string") draft.readerAddress = seedSettings.readerAddress
           if (typeof draft.micSource !== "string") draft.micSource = seedSettings.micSource
         }).catch(() => {
           /* defaults still apply in memory */
@@ -911,11 +943,6 @@ export function createVoiceController(context: any) {
   } catch {
     /* storage unavailable: settings stay in memory for this TUI */
   }
-  // The toolbar and the settings dialog share this switch. A preference saved
-  // by an earlier TUI has to win over the default, or "reads replies" turns
-  // itself back on every time OpenCode starts.
-  autoSpeak = settings.autoSpeak !== false
-
   async function persist(mutation: (draft: VoiceSettings) => void): Promise<void> {
     try {
       await saveSettings(mutation)
@@ -1031,10 +1058,78 @@ export function createVoiceController(context: any) {
     return true
   }
 
-  /* --------------------------------------------------------- auto send */
+  /* --------------------------------------------------------- auto toggles */
+
+  /**
+   * The toolbar, the watcher and the settings dialog all read the same stored
+   * value. A preference saved by an earlier TUI therefore wins over the
+   * default, and a click cannot leave the label out of step with the setting.
+   */
+  function autoSpeakEnabled(): boolean {
+    return typeof settings.autoSpeak === "boolean" ? settings.autoSpeak : seedSettings.autoSpeak
+  }
 
   function autoSendEnabled(): boolean {
-    return settings.autoSend === true
+    return typeof settings.autoSend === "boolean" ? settings.autoSend : seedSettings.autoSend
+  }
+
+  /* ------------------------------------------------------- reader persona */
+
+  function readerRole(): string {
+    // A store created before this setting existed has no string yet; use the
+    // default until the migration writes it, but let an explicitly cleared
+    // value ("") stay cleared.
+    return cleanPersona(typeof settings.readerRole === "string" ? settings.readerRole : seedSettings.readerRole)
+  }
+
+  function readerAddress(): string {
+    return cleanPersona(
+      typeof settings.readerAddress === "string" ? settings.readerAddress : seedSettings.readerAddress,
+    )
+  }
+
+  /** Sessions where the reader has already introduced itself. */
+  const introducedSessions = new Set<string>()
+
+  /**
+   * The spoken lead before an answer.
+   *
+   * The role introduces itself once per session ("Jarvis here, sir."); the
+   * address then prefixes each session subject ("Sir, about weather in
+   * Berlin."). Both are optional, and clearing them restores the plain
+   * "About ..." announcement.
+   */
+  function readerLead(sessionID: string, title: string): string {
+    const role = readerRole()
+    const address = readerAddress()
+    const subject = titleAnnouncement(title)
+    const introduce = Boolean(role) && !introducedSessions.has(sessionID)
+    if (introduce) introducedSessions.add(sessionID)
+
+    if (introduce) {
+      const greeting = address ? `${role} here, ${address}.` : `${role} here.`
+      if (!subject) return greeting
+      const sentence = subject.charAt(0).toUpperCase() + subject.slice(1)
+      return `${greeting} ${sentence}`
+    }
+    if (!subject) return ""
+    if (!address) return subject
+    const opener = address.charAt(0).toUpperCase() + address.slice(1)
+    // Keep an acronym intact ("NASA", not "nASA") after the address comma.
+    const lower = /^[A-Z0-9]{2,}\b/.test(subject)
+      ? subject
+      : subject.charAt(0).toLowerCase() + subject.slice(1)
+    return `${opener}, ${lower}`
+  }
+
+  function readerSummary(): string {
+    const role = readerRole()
+    const address = readerAddress()
+    if (!role && !address) return "No introduction and no address"
+    const parts: string[] = []
+    parts.push(role ? `role ${role}` : "no role introduction")
+    parts.push(address ? `calls you ${address}` : "no address")
+    return parts.join(" · ")
   }
 
   async function toggleAutoSend(): Promise<void> {
@@ -1045,8 +1140,8 @@ export function createVoiceController(context: any) {
     repaint()
     toast(
       next
-        ? "Transcripts are sent to the agent automatically"
-        : "Transcripts land in the prompt box — review and send them yourself",
+        ? "Push-to-talk transcripts are sent to the agent automatically"
+        : "Push-to-talk transcripts land in the prompt box — review and send them yourself",
       next ? "success" : "info",
     )
   }
@@ -1590,6 +1685,69 @@ export function createVoiceController(context: any) {
     }
   }
 
+  /**
+   * The reader's persona: the name it introduces itself with and the words it
+   * uses for the user. Both are free text so a user can be "sir", "boss",
+   * "Captain" or anything else, and both can be cleared.
+   */
+  async function openReaderSettings(): Promise<void> {
+    if (!context.ui?.dialog?.select || !context.ui?.dialog?.prompt) {
+      toast("Voice reader settings need the interactive TUI", "warning")
+      return
+    }
+    for (;;) {
+      const choice: string | undefined = await context.ui.dialog.select({
+        title: "Voice reader",
+        placeholder: "Choose a setting",
+        options: [
+          {
+            title: "Reader role",
+            value: "role",
+            description: readerRole() ? `Introduces itself as ${readerRole()}` : "No introduction",
+          },
+          {
+            title: "What the reader calls you",
+            value: "address",
+            description: readerAddress() ? `Calls you ${readerAddress()}` : "No address",
+          },
+          { title: "Done", value: "done" },
+        ],
+      })
+      if (choice === undefined || choice === "done") return
+
+      if (choice === "role") {
+        const raw = await context.ui.dialog.prompt({
+          title: "Voice reader role",
+          description:
+            "The name the reader uses for itself, e.g. Jarvis. Leave blank to remove the introduction.",
+          placeholder: "Jarvis",
+          value: readerRole(),
+        })
+        if (raw === undefined) continue
+        const value = cleanPersona(raw)
+        await persist((draft) => {
+          draft.readerRole = value
+        })
+        repaint()
+        toast(value ? `Voice reader role: ${value}` : "Voice reader introduction cleared", "success")
+      } else if (choice === "address") {
+        const raw = await context.ui.dialog.prompt({
+          title: "What should the reader call you?",
+          description: "For example sir, boss, Captain or your name. Leave blank to stop using an address.",
+          placeholder: "sir",
+          value: readerAddress(),
+        })
+        if (raw === undefined) continue
+        const value = cleanPersona(raw)
+        await persist((draft) => {
+          draft.readerAddress = value
+        })
+        repaint()
+        toast(value ? `The reader will call you ${value}` : "Reader address cleared", "success")
+      }
+    }
+  }
+
   async function openSettings(): Promise<void> {
     if (!context.ui?.dialog?.select) {
       toast("Settings need the interactive TUI", "warning")
@@ -1627,17 +1785,18 @@ export function createVoiceController(context: any) {
             description: micLabel(),
           },
           { title: "Transcription", value: "stt", description: sttLabel() },
+          { title: "Voice reader role and address", value: "reader", description: readerSummary() },
           {
             title: autoSendEnabled() ? "Auto-send transcripts (on)" : "Auto-send transcripts (off)",
             value: "autosend",
             description: autoSendEnabled()
-              ? "Transcripts are sent to the agent as soon as they are transcribed"
-              : "Transcripts land in the prompt box so you can correct them before sending",
+              ? "Push-to-talk transcripts are sent to the agent as soon as they are transcribed"
+              : "Push-to-talk transcripts land in the prompt box so you can correct them before sending",
           },
           {
-            title: autoSpeak ? "Speaking replies (on)" : "Speaking replies (off)",
+            title: autoSpeakEnabled() ? "Auto-read replies (on)" : "Auto-read replies (off)",
             value: "autospeak",
-            description: autoSpeak
+            description: autoSpeakEnabled()
               ? "Every new answer is read out loud, starting with the session name"
               : "Answers stay silent",
           },
@@ -1698,10 +1857,12 @@ export function createVoiceController(context: any) {
         }
       } else if (choice === "stt") {
         await openSttSettings()
+      } else if (choice === "reader") {
+        await openReaderSettings()
       } else if (choice === "autosend") {
         await toggleAutoSend()
       } else if (choice === "autospeak") {
-        toggleAutoSpeak()
+        await toggleAutoSpeak()
       } else if (choice === "mic") {
         await openMicSettings()
       } else if (choice === "status") {
@@ -1844,8 +2005,8 @@ export function createVoiceController(context: any) {
         toast("The last reply has nothing to read", "warning")
         return
       }
-      const title = sessionLabel(sid)
-      const toSay = title ? `${title} ${text}` : text
+      const lead = sessionLead(sid)
+      const toSay = lead ? `${lead} ${text}` : text
       const info = await daemonOrToast()
       if (!info) return
       await api.speak(info, toSay, { async: true, ...ttsRequest() })
@@ -1877,8 +2038,8 @@ export function createVoiceController(context: any) {
         toast("This message has nothing to read", "warning")
         return
       }
-      const title = sessionLabel(sid)
-      const toSay = title ? `${title} ${text}` : text
+      const lead = sessionLead(sid)
+      const toSay = lead ? `${lead} ${text}` : text
       const info = await daemonOrToast()
       if (!info) return
       if (speech() !== "idle") {
@@ -2100,19 +2261,20 @@ export function createVoiceController(context: any) {
   /* ------------------------------------------------- reading the answers */
 
   /**
-   * The subject of the session, read out before its answer.
+   * The spoken lead before an answer: the reader's optional introduction and
+   * address, then the natural session subject.
    *
    * Session titles are often the first thing the user typed: a path, a file
    * name, a hash or a one-line instruction. `titleAnnouncement` turns that into
    * a natural phrase ("About the controller file.") and skips titles that are
    * only an identifier or a generic placeholder.
    */
-  function sessionLabel(sessionID: string): string {
+  function sessionLead(sessionID: string): string {
     try {
       const info: any = context.data.session.get?.(sessionID)
-      return titleAnnouncement(String(info?.title ?? ""))
+      return readerLead(sessionID, String(info?.title ?? ""))
     } catch {
-      return ""
+      return readerLead(sessionID, "")
     }
   }
 
@@ -2177,7 +2339,7 @@ export function createVoiceController(context: any) {
     // A live conversation reads the answer while it is written, the way a
     // phone call would: the first sentence starts long before the last one
     // exists. Everywhere else the whole answer is read once it is complete.
-    const streaming = live() && autoSpeak
+    const streaming = live() && autoSpeakEnabled()
     const progress = readProgress.get(id)
 
     if (!progress) {
@@ -2195,7 +2357,7 @@ export function createVoiceController(context: any) {
       if (writing && !streaming) return // the answer is still being written
     }
 
-    if (!autoSpeak) {
+    if (!autoSpeakEnabled()) {
       if (!writing) {
         seenAnswers.set(sessionID, id)
         spokenAnswers.add(id)
@@ -2209,7 +2371,7 @@ export function createVoiceController(context: any) {
     const next = progress ?? { spoken: 0, labelDone: false }
     if (cut > next.spoken) {
       const piece = answer.text.slice(next.spoken, cut)
-      const label = next.labelDone ? "" : sessionLabel(sessionID)
+      const label = next.labelDone ? "" : sessionLead(sessionID)
       next.spoken = cut
       next.labelDone = true
       seenAnswers.set(sessionID, id)
@@ -2307,8 +2469,10 @@ export function createVoiceController(context: any) {
       /* fall through with whatever we have */
     }
     if (!answer.text) return
-    const toSay = speakable(answer.text)
-    if (!toSay) return
+    const body = speakable(answer.text)
+    if (!body) return
+    const lead = sessionLead(sessionID)
+    const toSay = lead ? `${lead} ${body}` : body
     // An explicit request: it takes the speaker from whatever was being read.
     const info = await daemon(false)
     if (!info) return
@@ -2602,13 +2766,13 @@ export function createVoiceController(context: any) {
     }
   }
 
-  function toggleAutoSpeak(): void {
-    autoSpeak = !autoSpeak
-    void persist((draft) => {
-      draft.autoSpeak = autoSpeak
+  async function toggleAutoSpeak(): Promise<void> {
+    const next = !autoSpeakEnabled()
+    await persist((draft) => {
+      draft.autoSpeak = next
     })
     repaint()
-    toast(autoSpeak ? "Replies will be spoken" : "Replies will stay silent", autoSpeak ? "success" : "info")
+    toast(next ? "Replies will be spoken" : "Replies will stay silent", next ? "success" : "info")
   }
 
   function dispose(): void {
@@ -2642,7 +2806,7 @@ export function createVoiceController(context: any) {
     /** Buttons register their text nodes here; every state change repaints. */
     addRepaint,
     removeRepaint,
-    autoSpeak: () => autoSpeak,
+    autoSpeak: () => autoSpeakEnabled(),
     /** True while the live conversation is running. */
     live: () => live(),
     /** What the microphone is hearing right now (live mode), else "". */

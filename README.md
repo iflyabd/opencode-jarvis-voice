@@ -10,7 +10,7 @@ spoken back in a JARVIS-style voice while it types.
 
 Mouse controls do the same: a **🎙 mic** at the bottom-right of the prompt box,
 a **🔊 read / ⏸ pause / ▶ resume** control under every answer, and a compact
-toolbar above the text box with **read**, **send**, **play/pause**, and
+toolbar above the text box with **auto-read**, **auto-send**, **play/pause**, and
 **◉ live** for a hands-free voice conversation that behaves like a phone call -
 a 450 ms pause ends your turn, the words appear as you speak, and the answer
 starts playing while it is still being written.
@@ -185,8 +185,8 @@ needed. Watch for:
 ```
 
 The transcript lands in the prompt box so you can correct it before it is
-sent. Turn the spoken reply off with **Voice: toggle speaking replies** in the
-command palette (`ctrl+p`) or in **Voice: settings → Speaking replies**, and
+sent. Turn the spoken reply off with **Voice: toggle auto-read** in the
+command palette (`ctrl+p`) or in **Voice: settings → Auto-read replies**, and
 the review step off with **Voice: toggle auto-send**.
 
 ### Reading the answers
@@ -229,10 +229,13 @@ Suggested chase-cam bindings in `~/.config/opencode/cli.json`:
 |---|---|---|
 | `🎙 mic` / `● listening` / `◌ transcribing` | bottom-right of the text box | start listening; click again to stop |
 | `🔊 read` / `⏸ pause` / `▶ resume` | directly under each assistant answer | read **that answer**; click again to pause it, again to resume |
-| `○ read` / `◉ read` | left side of the toolbar above the text box | turn auto-read on or off |
-| `◇ send` / `◆ send` | left side of the toolbar | turn auto-send on or off |
+| `○ auto-read` / `◉ auto-read` | left side of the toolbar above the text box | turn auto-read on or off |
+| `◇ auto-send` / `◆ auto-send` | left side of the toolbar | turn auto-send on or off |
 | `▶ play` / `⏸ pause` | middle of the toolbar | master play/pause: read the newest answer when idle, pause or resume the actual reader when it is speaking |
 | `◉ live` / `● live` | right end of the toolbar | switch the live voice conversation on or off |
+
+Both auto switches are saved in OpenCode's local plugin storage and read back
+on the next boot, so the labels and the behaviour cannot drift apart.
 
 The mic sits at the **bottom** of the text box and the toolbar **above** it,
 both on the **right edge of the same box** - the same arrangement in a session
@@ -240,7 +243,7 @@ and on the home screen where a new chat starts. (The host's composer slot is
 narrower than the text box, so the plugin measures the box and the mic button
 and lines the toolbar up with it.)
 
-The read and send switches are green when on and muted when off. The master
+The auto-read and auto-send switches are green when on and muted when off. The master
 play/pause is not a separate player: it reads the daemon's speech state, so it
 shows `⏸ pause` while audio is really playing, `▶ play` while paused or idle,
 and its click goes through the same pause/resume path as `ctrl+alt+p`.
@@ -276,6 +279,22 @@ Reading rules:
   answer), only the **last** one is read;
 * long answers are read in full, with code blocks, tables and markdown
   symbols stripped first.
+
+### Voice reader role and address
+
+**Voice: settings → Voice reader role and address** controls the spoken
+persona. The defaults are role **Jarvis** and address **sir**:
+
+* the first answer of a session introduces the reader once:
+  *"Jarvis here, sir. About weather in Berlin. …"*;
+* later answers use the address without repeating the introduction:
+  *"Sir, about weather in Berlin. …"*;
+* the address can be anything - `boss`, `Captain`, a name - and both fields
+  are free text. Clearing a field removes that part; clearing both restores
+  the plain *"About weather in Berlin."* subject.
+
+The role and address are stored with the other voice settings and survive a
+restart.
 
 ### Live voice conversation
 
@@ -313,8 +332,10 @@ records one turn at a time again, and the transcript lands in the prompt box
 for review.
 
 Live mode uses the same microphone and speech-to-text settings as everything
-else, and it honours the auto-send and auto-speak switches. The new voice
-gate (adaptive noise floor, pre-roll, short hangover) is also used by
+else. It always sends each turn so the conversation stays hands-free; the
+auto-send switch controls push-to-talk, where review-first is the default.
+Auto-read controls whether the answers are spoken. The new voice gate
+(adaptive noise floor, pre-roll, short hangover) is also used by
 push-to-talk, which keeps its comfortable 900 ms pause; the numbers are
 adjustable with `JARVIS_VOICE_VAD_*` and `JARVIS_VOICE_LIVE_*`.
 
@@ -350,13 +371,13 @@ shown in a toast so it can be copied by hand.
 |---|---|
 | `Voice: push to talk` | record a turn (`ctrl+alt+v`) |
 | `Voice: read / pause / resume the reply` | one button for read, pause, resume (`ctrl+alt+p`) |
-| `Voice: settings (Fish Audio / transcription / microphone)` | choose the voice and speech-to-text providers, API key, voice, language; inspect mic/STT |
+| `Voice: settings (Fish Audio / reader / transcription / microphone)` | choose the voice and speech-to-text providers, API key, voice, language, reader role and address; inspect mic/STT |
 | `Voice: preload the speech model` | load Whisper now so the next transcript is fast |
 | `Voice: status` | what mic, STT model, TTS voice are in use, plus the plugin and daemon versions |
 | `Voice: cancel listening / stop speaking` | shut it up immediately |
 | `Voice: speak the last reply` | read the current answer out loud |
 | `Voice: live voice conversation (listen, send, read back)` | switch the live conversation on or off |
-| `Voice: toggle speaking replies` | read every new answer out loud, natural subject first (on/off, remembered) |
+| `Voice: toggle auto-read` | read every new answer out loud, natural subject first (on/off, remembered) |
 | `Voice: toggle auto-send (transcript goes to the prompt box)` | hands-free mode on/off: send the transcript straight away, or drop it in the prompt box for review |
 
 ### Optional Fish Audio voices
@@ -365,7 +386,7 @@ Piper stays the default and works offline. If you want a cloned or library
 voice, Fish Audio can be selected on demand:
 
 1. Open the command palette (`ctrl+p`) and run
-   **`Voice: settings (Fish Audio / transcription / microphone)`**, or type
+   **`Voice: settings (Fish Audio / reader / transcription / microphone)`**, or type
    `/voice-settings`.
 2. Choose **Fish Audio API key** and paste a key from
    [fish.audio](https://fish.audio) → API keys.
@@ -697,7 +718,14 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
   "plugins": [
     {
       "package": "/absolute/path/to/opencode-jarvis-voice",
-      "options": { "mic": true, "speak": true, "autoSpeak": true, "autoSend": false }
+      "options": {
+        "mic": true,
+        "speak": true,
+        "autoSpeak": true,
+        "autoSend": false,
+        "readerRole": "Jarvis",
+        "readerAddress": "sir"
+      }
     }
   ]
 }
@@ -706,9 +734,11 @@ The plugin entry in `~/.config/opencode/cli.json` can be an object:
 | Option | Default | Meaning |
 |---|---|---|
 | `mic` | `true` | show the 🎙 mic button in the prompt footer |
-| `speak` | `true` | show the read/send/play/live toolbar above the text box |
+| `speak` | `true` | show the auto-read/auto-send/play/live toolbar above the text box |
 | `autoSpeak` | `true` | read every new answer out loud, starting with a natural session subject |
-| `autoSend` | `false` | send the transcript to the agent as soon as it is transcribed; off means it lands in the prompt box for review |
+| `autoSend` | `false` | send push-to-talk transcripts to the agent as soon as they are transcribed; off means they land in the prompt box for review |
+| `readerRole` | `"Jarvis"` | the name the voice reader introduces itself with once per session; `""` disables the introduction |
+| `readerAddress` | `"sir"` | what the voice reader calls you; `""` disables the address |
 | `fishAudio` | — | optional `{ provider, apiKey, voiceId, voiceName, model, sttProvider, sttModel, sttLanguage }`; the settings dialog is safer for keys |
 | `micSource` | — | the microphone to record from, e.g. `pulse:jarvis_mic`; the settings dialog is easier |
 | `stt` | — | optional `{ provider, model, language, localModel, localLanguage }` defaults for speech-to-text; normally set in the settings dialog |

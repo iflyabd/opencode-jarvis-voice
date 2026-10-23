@@ -102,6 +102,11 @@ const [store, setStore] = createStore<any>({
   fishVoiceId: "",
   fishVoiceName: "",
   fishModel: "s2.1-pro-free",
+  autoSpeak: true,
+  autoSend: false,
+  readerRole: "",
+  readerAddress: "",
+  micSource: "",
 })
 
 const editor = {
@@ -195,6 +200,21 @@ function check(name: string, ok: boolean, detail = "") {
 }
 
 const voice = createVoiceController(context)
+
+check("auto-read starts from the stored setting", voice.autoSpeak() === true)
+check("auto-send starts from the stored setting", voice.autoSend() === false)
+setStore("autoSpeak", false)
+check("auto-read follows a changed setting", voice.autoSpeak() === false)
+setStore("autoSpeak", true)
+check("auto-read follows the setting back on", voice.autoSpeak() === true)
+await voice.toggleAutoSpeak()
+check("the auto-read toggle writes the setting", store.autoSpeak === false)
+await voice.toggleAutoSpeak()
+check("the auto-read toggle writes it back", store.autoSpeak === true)
+await voice.toggleAutoSend()
+check("the auto-send toggle writes the setting", store.autoSend === true)
+await voice.toggleAutoSend()
+check("the auto-send toggle writes it back", store.autoSend === false)
 
 // 1. Default: the transcript lands in the prompt box and is NOT sent.
 await voice.toggleMic("ses_test")
