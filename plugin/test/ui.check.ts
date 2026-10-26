@@ -29,7 +29,7 @@ ensureRuntimePluginSupport({
 })
 
 const { testRender } = await import("@opentui/solid")
-const { ComposerLiveButton, MicButton } = await import("../ui.tsx")
+const { ComposerLiveButton, FormMic, MicButton } = await import("../ui.tsx")
 const plugin = await import("../tui.tsx")
 // The same Solid runtime the components use; the live-update checks below
 // exercise the real signal path instead of re-mounting with a fixed state.
@@ -47,6 +47,9 @@ function check(name: string, condition: boolean, detail?: string) {
 
 // Every token the buttons may read; shapes mirror ResolvedTheme.
 const theme = {
+  background: {
+    raised: { base: "#000000" },
+  },
   text: {
     base: "#d0d0d0",
     muted: "#808080",
@@ -206,6 +209,64 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     JSON.stringify(s.captureCharFrame()),
   )
   s.renderer.destroy()
+}
+
+/* --------------------------------------------------------------- form mic */
+
+{
+  const f = fakeVoice()
+  const form = { id: "form_1", sessionID: "ses_form", title: "Test question", fields: [] }
+  const makeContext = (forms: (id: string) => any[], route: any) => ({
+    theme,
+    location: { directory: "/tmp" },
+    ui: { router: { current: () => route } },
+    data: {
+      location: { default: () => ({ directory: "/tmp" }) },
+      session: { form: { list: (id: string) => forms(id) } },
+    },
+  })
+
+  const session = makeContext((id) => (id === "ses_form" ? [form] : []), {
+    type: "session",
+    sessionID: "ses_form",
+  })
+  const s = await mount(() => FormMic({ context: session, voice: f.voice }), 40, 10)
+  const frame = s.captureCharFrame()
+  const lines = frame.replace(/\n$/, "").split("\n")
+  const micLine = lines.findIndex((line) => line.includes("mic"))
+  check("the form mic is visible on a session question", micLine >= 0, JSON.stringify(frame))
+  check(
+    "the form mic is anchored to the bottom row",
+    micLine >= lines.length - 2,
+    `line ${micLine} of ${lines.length}`,
+  )
+  const micX = lines[micLine].indexOf("mic")
+  await s.mockMouse.click(micX, micLine)
+  await s.renderOnce()
+  check(
+    "the form mic uses the form's session",
+    f.calls.includes("toggleMic:ses_form"),
+    f.calls.join(","),
+  )
+  s.renderer.destroy()
+
+  const home = makeContext((id) => (id === "global" ? [form] : []), { type: "home" })
+  const h = await mount(() => FormMic({ context: home, voice: f.voice }), 40, 10)
+  check(
+    "the form mic is visible on a home or wizard form",
+    h.captureCharFrame().includes("mic"),
+    JSON.stringify(h.captureCharFrame()),
+  )
+  h.renderer.destroy()
+
+  const none = makeContext(() => [], { type: "session", sessionID: "ses_form" })
+  const n = await mount(() => FormMic({ context: none, voice: f.voice }), 40, 10)
+  check(
+    "the form mic is hidden when no form is active",
+    !n.captureCharFrame().includes("mic"),
+    JSON.stringify(n.captureCharFrame()),
+  )
+  n.renderer.destroy()
 }
 
 /* ------------------------------------------------------------- live button */
@@ -466,10 +527,15 @@ async function mount(render: () => unknown, width = 40, height = 3) {
     client: {},
   }
   const cleanup = await plugin.default.setup(context)
-  check("plugin registers two slots", slots.length === 2, `got ${slots.length}`)
+  check("plugin registers three slots", slots.length === 3, `got ${slots.length}`)
   check(
     "mic button appends to prompt.footer",
     slots.some((s) => s.append === "prompt.footer" && typeof s.render === "function"),
+    slots.map((s) => s.append).join(","),
+  )
+  check(
+    "a form mic appends to app so it survives the question form",
+    slots.some((s) => s.append === "app" && typeof s.render === "function"),
     slots.map((s) => s.append).join(","),
   )
   check(

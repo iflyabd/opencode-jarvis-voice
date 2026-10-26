@@ -2,6 +2,8 @@
  * Jarvis Voice - the on-screen controls.
  *
  *   MicButton     appended to `prompt.footer`         (bottom-right of the prompt box)
+ *   FormMic       appended to `app`                   (the same mic at the bottom-right
+ *                 of a question or wizard form, which replaces the prompt box)
  *   ComposerLive  appended to `session.composer.top`  (toolbar above the text box:
  *                 auto-read, auto-send, master play/pause, and live)
  *
@@ -17,8 +19,8 @@
  * consistent, and a left-click `onMouseUp` mirrors the host's tab buttons.
  */
 
-import { createSignal, onCleanup } from "solid-js"
-import { createElement } from "@opentui/solid"
+import { createMemo, createSignal, onCleanup, Show } from "solid-js"
+import { createElement, useTerminalDimensions } from "@opentui/solid"
 import type { VoiceController } from "./controller"
 
 const RIGHT_MOUSE_BUTTON = 2
@@ -118,6 +120,14 @@ export function MicButton(props: ButtonProps) {
   // context is only guaranteed while the host is mounting this component.
   const { node: text, paint } = liveText(props.voice, { fg, label })
 
+  // The toolbar uses this box to line up with the mic. A floating form mic is
+  // mounted after the prompt footer mic, so clear the reference when it goes
+  // away instead of leaving the toolbar aligned to a removed node.
+  let ownBox: any = null
+  onCleanup(() => {
+    if (micBox === ownBox) micBox = null
+  })
+
   const hover = (value: boolean) => {
     setHovered(value)
     paint()
@@ -129,6 +139,7 @@ export function MicButton(props: ButtonProps) {
       paddingLeft={1}
       ref={(el: any) => {
         micBox = el
+        ownBox = el
       }}
       onMouseOver={() => hover(true)}
       onMouseOut={() => hover(false)}
@@ -146,6 +157,55 @@ export function MicButton(props: ButtonProps) {
     >
       {text}
     </box>
+  )
+}
+
+/**
+ * The mic button while a host question or wizard form is open.
+ *
+ * OpenCode swaps the prompt box for the form, so `prompt.footer` (and the
+ * normal mic button) is not rendered. This copy is anchored to the
+ * bottom-right of the form, the same corner the prompt footer uses, and is
+ * mounted only while a form is active. It is claimed from the `app` slot so
+ * it sits above the form overlay instead of behind it.
+ */
+export function FormMic(props: ButtonProps) {
+  const dimensions = useTerminalDimensions()
+  // Match the session layout: it narrows its side padding on tiny terminals.
+  const inset = () => (dimensions().width < 44 ? 1 : 2)
+  const form = createMemo(() => {
+    const data = props.context.data
+    const route = props.context.ui?.router?.current?.()
+    const location = props.context.location ?? data?.location?.default?.()
+    // A wizard or a global MCP elicitation has no session route; its form is
+    // listed under "global" and is shown over the home screen.
+    const global = data?.session?.form?.list?.("global", location) ?? []
+    if (global.length > 0) return global[0]
+    if (route?.type !== "session" || !route.sessionID) return undefined
+    const forms = data?.session?.form?.list?.(route.sessionID) ?? []
+    return forms[0]
+  })
+
+  return (
+    <Show when={form()}>
+      {(active: () => any) => (
+        <box
+          position="absolute"
+          right={inset()}
+          bottom={1}
+          zIndex={3000}
+          backgroundColor={props.context.theme.background.raised.base}
+          paddingLeft={1}
+          paddingRight={1}
+        >
+          <MicButton
+            context={props.context}
+            voice={props.voice}
+            sessionID={active().sessionID === "global" ? undefined : active().sessionID}
+          />
+        </box>
+      )}
+    </Show>
   )
 }
 

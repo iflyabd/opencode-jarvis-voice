@@ -13,6 +13,8 @@
  *
  * UI buttons (all follow the host theme, clickable with the mouse):
  *   `prompt.footer`         bottom-right of the prompt box: the mic / PTT button
+ *   `app`                   the same mic at the bottom-right of a question or
+ *                           wizard form, which replaces the prompt box
  *   `session.composer.top`  the toolbar above the text box: auto-read,
  *                           auto-send, master play/pause, and live
  *   under each answer       a read / pause / resume button for that message
@@ -39,7 +41,7 @@
 import { Plugin } from "@opencode/plugin/tui"
 import { createVoiceController } from "./controller"
 import { createMessageButtons } from "./message-buttons"
-import { ComposerLiveButton, MicButton, PromptFooterLive } from "./ui"
+import { ComposerLiveButton, FormMic, MicButton, PromptFooterLive } from "./ui"
 
 export default Plugin.define({
   id: "jarvis-voice.cli",
@@ -71,6 +73,13 @@ export default Plugin.define({
           }
           return <MicButton context={context} voice={voice} sessionID={input.sessionID} />
         },
+      })
+      // A question or wizard replaces the prompt box, taking the footer slot
+      // (and the mic) with it. Keep a copy at the form's bottom-right so the
+      // control does not disappear exactly when the user needs to answer.
+      context.ui.slot({
+        append: "app",
+        render: () => <FormMic context={context} voice={voice} />,
       })
     }
 

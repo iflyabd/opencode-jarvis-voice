@@ -8,10 +8,12 @@ optional Fish Audio voice or speech-to-text.
 Press one key, talk, pause, and your words land in the prompt. The reply is
 spoken back in a JARVIS-style voice while it types.
 
-Mouse controls do the same: a **🎙 mic** at the bottom-right of the prompt box,
-a **🔊 read / ⏸ pause / ▶ resume** control under every answer, and a compact
-toolbar above the text box with **auto-read**, **auto-send**, **play/pause**, and
-**◉ live** for a hands-free voice conversation that behaves like a phone call -
+Mouse controls do the same: a **🎙 mic** at the bottom-right of the prompt box
+(and at the bottom-right of question and wizard forms, which replace the prompt
+box), a **🔊 read / ⏸ pause / ▶ resume** control under every answer, and a
+compact toolbar above the text box with **auto-read**, **auto-send**,
+**play/pause**, and **◉ live** for a hands-free voice conversation that behaves
+like a phone call -
 a 450 ms pause ends your turn, the words appear as you speak, and the answer
 starts playing while it is still being written.
 
